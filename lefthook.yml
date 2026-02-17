@@ -1,0 +1,90 @@
+# Install: brew install lefthook && lefthook install
+
+output:
+  - meta
+  - summary
+  - success
+
+pre-commit:
+  parallel: true
+  commands:
+    trailing-whitespace:
+      run: |
+        if git diff --cached --check 2>/dev/null | grep -q "trailing whitespace"; then
+          git diff --cached --check
+          exit 1
+        fi
+      fail_text: "Remove trailing whitespace before committing"
+
+    no-secrets:
+      run: |
+        staged=$(git diff --cached --name-only --diff-filter=ACM)
+        if echo "$staged" | grep -qE '\.(env|pem|key|credentials|secret)$'; then
+          echo "Blocked: potential secret file staged"
+          echo "$staged" | grep -E '\.(env|pem|key|credentials|secret)$'
+          exit 1
+        fi
+        for f in $staged; do
+          case "$f" in lefthook.yml|lefthook-local.yml) continue ;; esac
+          if git diff --cached -- "$f" | grep -qiE '(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48}|-----BEGIN.*PRIVATE KEY-----)'; then
+            echo "Blocked: potential secret detected in $f"
+            exit 1
+          fi
+        done
+      fail_text: "Do not commit secrets or credentials"
+
+    large-files:
+      run: |
+        max_size=1048576
+        for f in $(git diff --cached --name-only --diff-filter=ACM); do
+          size=$(wc -c < "$f" 2>/dev/null || echo 0)
+          if [ "$size" -gt "$max_size" ]; then
+            echo "Blocked: $f is $(( size / 1024 ))KB (max 1MB)"
+            exit 1
+          fi
+        done
+      fail_text: "Do not commit files larger than 1MB"
+
+    kotlin-format:
+      glob: "**/*.{kt,kts}"
+      run: |
+        if command -v java &> /dev/null; then
+          ./gradlew spotlessCheck --quiet 2>&1
+        else
+          echo "Skipping: java not found"
+        fi
+      fail_text: "Run './gradlew spotlessApply' to fix formatting"
+
+    workflow-lint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: |
+        if command -v actionlint &> /dev/null; then
+          actionlint {staged_files}
+        else
+          echo "Skipping: actionlint not installed (brew install actionlint)"
+        fi
+      fail_text: "Fix GitHub Actions workflow lint errors"
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: |
+        commit_msg=$(head -n1 {1})
+        if ! echo "$commit_msg" | grep -qE "^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+$"; then
+          echo "Error: Commit message does not follow conventional commits format."
+          echo "Expected: <type>(<scope>): <description>"
+          echo "Example:  feat(core): add JSON-RPC codec"
+          echo "Got:      $commit_msg"
+          exit 1
+        fi
+      fail_text: "Use conventional commit format: type(scope): description"
+
+    msg-length:
+      run: |
+        first_line=$(head -n1 {1})
+        len=${#first_line}
+        if [ "$len" -gt 72 ]; then
+          echo "Error: Commit message first line is $len chars (max 72)"
+          exit 1
+        fi
+      fail_text: "Keep commit message first line under 72 characters"

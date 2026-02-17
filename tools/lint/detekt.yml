@@ -1,0 +1,199 @@
+build:
+  maxIssues: 0
+  excludeCorrectable: false
+config:
+  validation: true
+  warningsAsErrors: true
+complexity:
+  active: true
+  CyclomaticComplexMethod:
+    active: true
+    threshold: 15
+  LongMethod:
+    active: true
+    threshold: 60
+    excludes:
+    - '**/test/**'
+    - '**/*Test/**'
+  LongParameterList:
+    active: true
+    functionThreshold: 6
+    constructorThreshold: 7
+    ignoreDefaultParameters: false
+    ignoreDataClasses: true
+  LargeClass:
+    active: true
+    threshold: 600
+    excludes:
+    - '**/test/**'
+    - '**/*Test/**'
+  TooManyFunctions:
+    active: true
+    excludes:
+    - '**/test/**'
+    - '**/*Test/**'
+    thresholdInFiles: 20
+    thresholdInClasses: 18
+    thresholdInInterfaces: 13
+    thresholdInObjects: 13
+    thresholdInEnums: 5
+coroutines:
+  active: true
+  SleepInsteadOfDelay:
+    active: true
+empty-blocks:
+  active: true
+  EmptyCatchBlock:
+    active: true
+    allowedExceptionNameRegex: _|(ignore|expected).*
+  EmptyFunctionBlock:
+    active: true
+exceptions:
+  active: true
+  TooGenericExceptionCaught:
+    active: true
+    excludes:
+    - '**/test/**'
+    # Transport must catch generic I/O exceptions at platform boundaries.
+    - '**/transport/**'
+    # JSON-RPC dispatch catches Exception at protocol boundaries to
+    # convert handler failures into ResponseError messages (SEC-001).
+    - '**/core/**'
+    exceptionNames:
+    - ArrayIndexOutOfBoundsException
+    - Error
+    - IllegalMonitorStateException
+    - NullPointerException
+    - IndexOutOfBoundsException
+    - Throwable
+  SwallowedException:
+    active: true
+    excludes:
+    # Transport and core modules legitimately catch and convert
+    # exceptions at protocol boundaries rather than re-throwing.
+    - '**/transport/**'
+    - '**/core/**'
+    ignoredExceptionTypes:
+    - InterruptedException
+    - NumberFormatException
+    - ParseException
+    - MalformedURLException
+    allowedExceptionNameRegex: _|(ignore|expected).*
+formatting:
+  # Disabled - using spotless/ktlint for formatting instead
+  active: false
+naming:
+  active: true
+  ClassNaming:
+    active: true
+    classPattern: "[A-Z][a-zA-Z0-9]*"
+  FunctionNaming:
+    active: true
+    excludes:
+    - '**/test/**'
+    functionPattern: "^([a-z][a-zA-Z0-9]*)|(`.*`)$"
+  PackageNaming:
+    active: true
+    packagePattern: "[a-z]+(\\.[a-z][A-Za-z0-9]*)*"
+  VariableNaming:
+    active: true
+    variablePattern: "[a-z][A-Za-z0-9]*"
+performance:
+  active: true
+  ForEachOnRange:
+    active: true
+    excludes:
+    - '**/test/**'
+  SpreadOperator:
+    active: true
+    excludes:
+    - '**/test/**'
+potential-bugs:
+  active: true
+  EqualsAlwaysReturnsTrueOrFalse:
+    active: true
+  IteratorHasNextCallsNextMethod:
+    active: true
+  IteratorNotThrowingNoSuchElementException:
+    active: true
+  UnnecessaryNotNullOperator:
+    active: true
+  UnnecessarySafeCall:
+    active: true
+  UnreachableCode:
+    active: true
+  UnsafeCallOnNullableType:
+    active: true
+  UnsafeCast:
+    active: true
+style:
+  active: true
+  ForbiddenMethodCall:
+    active: true
+    # Forbid println/print in main source code - use logging instead
+    methods:
+      - 'kotlin.io.println'
+      - 'kotlin.io.print'
+    excludes:
+      - '**/test/**'
+  ForbiddenComment:
+    active: true
+    comments:
+    - "STOPSHIP:"
+    - "XXX:"
+  LoopWithTooManyJumpStatements:
+    active: true
+    excludes:
+    - '**/transport/**'
+  MaxLineLength:
+    # Disabled - using spotless/ktlint for line length instead
+    active: false
+  MagicNumber:
+    active: true
+    excludes:
+    - '**/test/**'
+    - '**/*Test.kt'
+    - '**/*Test/**'
+    ignoreNumbers:
+    - '-1'
+    - '0'
+    - '1'
+    - '2'
+    - '3'
+    - '4'
+    ignoreHashCodeFunction: true
+    ignorePropertyDeclaration: false
+    ignoreLocalVariableDeclaration: false
+    ignoreConstantDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+    ignoreAnnotation: false
+    ignoreNamedArgument: true
+    ignoreEnums: true
+    ignoreRanges: false
+    ignoreExtensionFunctions: true
+  ReturnCount:
+    active: true
+    max: 4
+    excludedFunctions:
+    - equals
+    excludeLabeled: false
+    excludeReturnFromLambda: true
+    excludeGuardClauses: true
+  UnusedImports:
+    active: true
+  UnusedParameter:
+    active: true
+    allowedNames: ignored|_
+  UnusedPrivateClass:
+    active: true
+  UnusedPrivateMember:
+    active: true
+  UseCheckNotNull:
+    active: true
+  UseRequire:
+    active: true
+  UseRequireNotNull:
+    active: true
+  # Enforce no star imports everywhere, including tests
+  WildcardImport:
+    active: true
