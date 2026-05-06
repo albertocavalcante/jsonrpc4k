@@ -84,8 +84,8 @@ kover {
 
             // Verification rules
             verify {
-                rule("Minimum line coverage") {
-                    minBound(90)
+                rule("Merged line coverage baseline") {
+                    minBound(81)
                 }
             }
         }

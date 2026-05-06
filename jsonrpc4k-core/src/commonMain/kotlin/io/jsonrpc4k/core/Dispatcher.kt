@@ -4,6 +4,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -102,22 +103,37 @@ public class Dispatcher(
         method: String,
         crossinline handler: suspend (P) -> R,
     ) {
+        onRequest(
+            method = method,
+            paramSerializer = serializer<P>(),
+            resultSerializer = serializer<R>(),
+            acceptsNullParams = null is P,
+        ) { params ->
+            handler(params)
+        }
+    }
+
+    @PublishedApi
+    internal suspend fun <P, R> onRequest(
+        method: String,
+        paramSerializer: KSerializer<P>,
+        resultSerializer: KSerializer<R>,
+        acceptsNullParams: Boolean,
+        handler: suspend (P) -> R,
+    ) {
         onRequest(method) { params ->
             val typedParams: P =
                 if (params != null) {
-                    json.decodeFromJsonElement(serializer(), params)
+                    json.decodeFromJsonElement(paramSerializer, params)
+                } else if (acceptsNullParams) {
+                    @Suppress("UNCHECKED_CAST")
+                    null as P
                 } else {
-                    // Check if P is a nullable type - if not, reject null params
-                    if (null is P) {
-                        @Suppress("UNCHECKED_CAST")
-                        null as P
-                    } else {
-                        throw JsonRpcException(ResponseError.INVALID_PARAMS, "Missing required params for method")
-                    }
+                    throw JsonRpcException(ResponseError.INVALID_PARAMS, "Missing required params for method")
                 }
             val result = handler(typedParams)
             if (result != null) {
-                json.encodeToJsonElement(serializer<R>(), result)
+                json.encodeToJsonElement(resultSerializer, result)
             } else {
                 null
             }
@@ -131,18 +147,31 @@ public class Dispatcher(
         method: String,
         crossinline handler: suspend (P) -> Unit,
     ) {
+        onNotification(
+            method = method,
+            paramSerializer = serializer<P>(),
+            acceptsNullParams = null is P,
+        ) { params ->
+            handler(params)
+        }
+    }
+
+    @PublishedApi
+    internal suspend fun <P> onNotification(
+        method: String,
+        paramSerializer: KSerializer<P>,
+        acceptsNullParams: Boolean,
+        handler: suspend (P) -> Unit,
+    ) {
         onNotification(method) { params ->
             val typedParams: P =
                 if (params != null) {
-                    json.decodeFromJsonElement(serializer(), params)
+                    json.decodeFromJsonElement(paramSerializer, params)
+                } else if (acceptsNullParams) {
+                    @Suppress("UNCHECKED_CAST")
+                    null as P
                 } else {
-                    // Check if P is a nullable type - if not, reject null params
-                    if (null is P) {
-                        @Suppress("UNCHECKED_CAST")
-                        null as P
-                    } else {
-                        throw JsonRpcException(ResponseError.INVALID_PARAMS, "Missing required params for notification")
-                    }
+                    throw JsonRpcException(ResponseError.INVALID_PARAMS, "Missing required params for notification")
                 }
             handler(typedParams)
         }

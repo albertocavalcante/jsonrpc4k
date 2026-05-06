@@ -127,9 +127,9 @@ class CodecTest {
         val jsonStr = """{"jsonrpc":"2.0","id":1,"method":"test"}"""
         val message = codec.decodeFromJson(jsonStr)
 
-        message.shouldBeInstanceOf<RequestMessage>()
-        (message as RequestMessage).id shouldBe RequestId.of(1)
-        message.method shouldBe "test"
+        val request = message.shouldBeInstanceOf<RequestMessage>()
+        request.id shouldBe RequestId.of(1)
+        request.method shouldBe "test"
     }
 
     @Test
@@ -137,8 +137,8 @@ class CodecTest {
         val jsonStr = """{"jsonrpc":"2.0","method":"initialized"}"""
         val message = codec.decodeFromJson(jsonStr)
 
-        message.shouldBeInstanceOf<NotificationMessage>()
-        (message as NotificationMessage).method shouldBe "initialized"
+        val notification = message.shouldBeInstanceOf<NotificationMessage>()
+        notification.method shouldBe "initialized"
     }
 
     @Test
@@ -146,8 +146,8 @@ class CodecTest {
         val jsonStr = """{"jsonrpc":"2.0","id":1,"result":"ok"}"""
         val message = codec.decodeFromJson(jsonStr)
 
-        message.shouldBeInstanceOf<ResponseMessage>()
-        (message as ResponseMessage).result shouldBe JsonPrimitive("ok")
+        val response = message.shouldBeInstanceOf<ResponseMessage>()
+        response.result shouldBe JsonPrimitive("ok")
     }
 
     // ===== JsonRpcCodec.parseContentLength Tests =====

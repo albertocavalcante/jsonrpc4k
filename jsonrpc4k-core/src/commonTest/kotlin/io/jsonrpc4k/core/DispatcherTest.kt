@@ -13,6 +13,23 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
+@Serializable
+private data class DispatcherTestParams(
+    val name: String,
+    val value: Int,
+)
+
+@Serializable
+private data class DispatcherTestResult(
+    val message: String,
+    val success: Boolean,
+)
+
+@Serializable
+private data class DispatcherNotifyParams(
+    val message: String,
+)
+
 class DispatcherTest {
     private val dispatcher = Dispatcher()
 
@@ -86,10 +103,9 @@ class DispatcherTest {
             val request = RequestMessage(id = RequestId.of(1), method = "unknown/method")
             val response = dispatcher.dispatch(request)
 
-            response shouldNotBe null
-            response!!.error shouldNotBe null
-            response.error!!.code shouldBe ResponseError.METHOD_NOT_FOUND
-            response.error!!.message shouldBe "Method not found: unknown/method"
+            val error = response?.error ?: error("Expected method-not-found error")
+            error.code shouldBe ResponseError.METHOD_NOT_FOUND
+            error.message shouldBe "Method not found: unknown/method"
         }
 
     @Test
@@ -103,10 +119,9 @@ class DispatcherTest {
             val request = RequestMessage(id = RequestId.of(1), method = "test/error")
             val response = dispatcher.dispatch(request)
 
-            response shouldNotBe null
-            response!!.error shouldNotBe null
-            response.error!!.code shouldBe ResponseError.INTERNAL_ERROR
-            response.error!!.message shouldBe "Internal error"
+            val error = response?.error ?: error("Expected internal error")
+            error.code shouldBe ResponseError.INTERNAL_ERROR
+            error.message shouldBe "Internal error"
         }
 
     @Test
@@ -119,10 +134,9 @@ class DispatcherTest {
             val request = RequestMessage(id = RequestId.of(1), method = "test/jsonrpc-error")
             val response = dispatcher.dispatch(request)
 
-            response shouldNotBe null
-            response!!.error shouldNotBe null
-            response.error!!.code shouldBe ResponseError.INVALID_PARAMS
-            response.error!!.message shouldBe "Invalid parameters provided"
+            val error = response?.error ?: error("Expected invalid params error")
+            error.code shouldBe ResponseError.INVALID_PARAMS
+            error.message shouldBe "Invalid parameters provided"
         }
 
     @Test
@@ -159,23 +173,11 @@ class DispatcherTest {
 
     // ===== Typed Request Handler Tests =====
 
-    @Serializable
-    data class TestParams(
-        val name: String,
-        val value: Int,
-    )
-
-    @Serializable
-    data class TestResult(
-        val message: String,
-        val success: Boolean,
-    )
-
     @Test
     fun `typed onRequest deserializes params and serializes result`() =
         runTest {
-            dispatcher.onRequest<TestParams, TestResult>("test/typed") { params ->
-                TestResult(message = "Hello ${params.name}", success = params.value > 0)
+            dispatcher.onRequest<DispatcherTestParams, DispatcherTestResult>("test/typed") { params ->
+                DispatcherTestResult(message = "Hello ${params.name}", success = params.value > 0)
             }
 
             val params =
@@ -196,8 +198,8 @@ class DispatcherTest {
     @Test
     fun `typed onRequest handles null params when nullable`() =
         runTest {
-            dispatcher.onRequest<TestParams?, TestResult>("test/nullable") { params ->
-                TestResult(
+            dispatcher.onRequest<DispatcherTestParams?, DispatcherTestResult>("test/nullable") { params ->
+                DispatcherTestResult(
                     message = params?.name ?: "default",
                     success = true,
                 )
@@ -215,7 +217,7 @@ class DispatcherTest {
     @Test
     fun `typed onRequest handles null result`() =
         runTest {
-            dispatcher.onRequest<TestParams, TestResult?>("test/null-result") { _ ->
+            dispatcher.onRequest<DispatcherTestParams, DispatcherTestResult?>("test/null-result") { _ ->
                 null
             }
 
@@ -299,16 +301,11 @@ class DispatcherTest {
 
     // ===== Typed Notification Handler Tests =====
 
-    @Serializable
-    data class NotifyParams(
-        val message: String,
-    )
-
     @Test
     fun `typed onNotification deserializes params`() =
         runTest {
             var receivedMessage: String? = null
-            dispatcher.onNotification<NotifyParams>("test/typed-notify") { params ->
+            dispatcher.onNotification<DispatcherNotifyParams>("test/typed-notify") { params ->
                 receivedMessage = params.message
             }
 
@@ -323,7 +320,7 @@ class DispatcherTest {
     fun `typed onNotification handles null params when nullable`() =
         runTest {
             var handlerCalled = false
-            dispatcher.onNotification<NotifyParams?>("test/nullable-notify") { params ->
+            dispatcher.onNotification<DispatcherNotifyParams?>("test/nullable-notify") { params ->
                 handlerCalled = true
                 params shouldBe null
             }
@@ -337,17 +334,16 @@ class DispatcherTest {
     @Test
     fun `typed onRequest returns error for null params when non-nullable`() =
         runTest {
-            dispatcher.onRequest<TestParams, TestResult>("test/non-nullable") { params ->
-                TestResult(message = params.name, success = true)
+            dispatcher.onRequest<DispatcherTestParams, DispatcherTestResult>("test/non-nullable") { params ->
+                DispatcherTestResult(message = params.name, success = true)
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/non-nullable", params = null)
             val response = dispatcher.dispatch(request)
 
-            response shouldNotBe null
-            response!!.error shouldNotBe null
-            response.error!!.code shouldBe ResponseError.INVALID_PARAMS
-            response.error!!.message shouldBe "Missing required params for method"
+            val error = response?.error ?: error("Expected invalid params error")
+            error.code shouldBe ResponseError.INVALID_PARAMS
+            error.message shouldBe "Missing required params for method"
         }
 
     @Test

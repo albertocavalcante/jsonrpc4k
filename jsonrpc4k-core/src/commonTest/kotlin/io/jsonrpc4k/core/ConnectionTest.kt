@@ -19,6 +19,33 @@ import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.milliseconds
 
+@Serializable
+private data class ConnectionEchoParams(
+    val message: String,
+)
+
+@Serializable
+private data class ConnectionEchoResult(
+    val echo: String,
+)
+
+@Serializable
+private data class ConnectionLogParams(
+    val level: String,
+    val message: String,
+)
+
+@Serializable
+private data class ConnectionAddParams(
+    val a: Int,
+    val b: Int,
+)
+
+@Serializable
+private data class ConnectionAddResult(
+    val sum: Int,
+)
+
 class ConnectionTest {
     // ===== Request Handler Registration Tests =====
 
@@ -67,22 +94,12 @@ class ConnectionTest {
 
     // ===== Typed Request Handler Tests =====
 
-    @Serializable
-    data class EchoParams(
-        val message: String,
-    )
-
-    @Serializable
-    data class EchoResult(
-        val echo: String,
-    )
-
     @Test
     fun `typed onRequest handler works with serializable types`() =
         runTest {
             val connection = Connection()
-            connection.onRequest<EchoParams, EchoResult>("echo") { params ->
-                EchoResult(echo = "Echo: ${params.message}")
+            connection.onRequest<ConnectionEchoParams, ConnectionEchoResult>("echo") { params ->
+                ConnectionEchoResult(echo = "Echo: ${params.message}")
             }
 
             val requestContent = """{"jsonrpc":"2.0","id":1,"method":"echo","params":{"message":"Hello"}}"""
@@ -100,18 +117,12 @@ class ConnectionTest {
 
     // ===== Typed Notification Handler Tests =====
 
-    @Serializable
-    data class LogParams(
-        val level: String,
-        val message: String,
-    )
-
     @Test
     fun `typed onNotification handler works with serializable types`() =
         runTest {
             val connection = Connection()
-            var receivedLog: LogParams? = null
-            connection.onNotification<LogParams>("log") { params ->
+            var receivedLog: ConnectionLogParams? = null
+            connection.onNotification<ConnectionLogParams>("log") { params ->
                 receivedLog = params
             }
 
@@ -119,9 +130,9 @@ class ConnectionTest {
             val input = "Content-Length: ${notificationContent.length}\r\n\r\n$notificationContent"
             connection.receive(input)
 
-            receivedLog shouldNotBe null
-            receivedLog!!.level shouldBe "info"
-            receivedLog!!.message shouldBe "Test"
+            val log = receivedLog ?: error("Expected log notification")
+            log.level shouldBe "info"
+            log.message shouldBe "Test"
 
             connection.close()
         }
@@ -259,17 +270,6 @@ class ConnectionTest {
 
     // ===== Typed Request Tests =====
 
-    @Serializable
-    data class AddParams(
-        val a: Int,
-        val b: Int,
-    )
-
-    @Serializable
-    data class AddResult(
-        val sum: Int,
-    )
-
     @Test
     fun `typed request sends serialized params`() =
         runTest {
@@ -285,7 +285,13 @@ class ConnectionTest {
                 connection.receive(responseInput)
             }
 
-            val result = async { connection.request<AddParams, AddResult>("add", AddParams(a = 20, b = 22)) }
+            val result =
+                async {
+                    connection.request<ConnectionAddParams, ConnectionAddResult>(
+                        "add",
+                        ConnectionAddParams(a = 20, b = 22),
+                    )
+                }
 
             val requestStr = outgoingJob.await().decodeToString()
             requestStr shouldContain "\"a\":20"
@@ -325,7 +331,7 @@ class ConnectionTest {
 
             val outgoingJob = async { connection.outgoing.first() }
 
-            connection.notify("log", LogParams(level = "error", message = "Something failed"))
+            connection.notify("log", ConnectionLogParams(level = "error", message = "Something failed"))
 
             val notificationStr = outgoingJob.await().decodeToString()
             notificationStr shouldContain "\"level\":\"error\""
@@ -571,8 +577,8 @@ class ConnectionTest {
             val clientConnection = Connection()
 
             // Set up server handler
-            serverConnection.onRequest<AddParams, AddResult>("add") { params ->
-                AddResult(sum = params.a + params.b)
+            serverConnection.onRequest<ConnectionAddParams, ConnectionAddResult>("add") { params ->
+                ConnectionAddResult(sum = params.a + params.b)
             }
 
             // Simulate network: forward client outgoing to server incoming
@@ -590,7 +596,11 @@ class ConnectionTest {
             }
 
             // Client makes request
-            val result = clientConnection.request<AddParams, AddResult>("add", AddParams(a = 10, b = 32))
+            val result =
+                clientConnection.request<ConnectionAddParams, ConnectionAddResult>(
+                    "add",
+                    ConnectionAddParams(a = 10, b = 32),
+                )
 
             result shouldNotBe null
             result!!.sum shouldBe 42
