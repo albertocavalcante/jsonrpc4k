@@ -1,5 +1,6 @@
 plugins {
     id("jsonrpc4k.multiplatform")
+    id("publishing-convention")
 }
 
 kotlin {
