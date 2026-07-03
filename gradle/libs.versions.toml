@@ -12,8 +12,8 @@ spotless = "8.1.0"
 kover = "0.8.3"
 
 # Testing
-kotest = "6.0.0.M1"
-junit = "5.11.4"
+kotest = "6.2.1"
+junit = "6.1.1"
 
 [libraries]
 # Kotlin
