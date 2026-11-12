@@ -167,9 +167,8 @@ internal class BoundedOutgoing(
                 if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
                 old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
             } else {
-                if (old.ordinaryCount == limits.maxOutstandingFrames ||
-                    bytes > limits.maxRetainedWireBytes - old.ordinaryBytes
-                ) return null
+                if (old.ordinaryCount == limits.maxOutstandingFrames) return null
+                if (bytes > limits.maxRetainedWireBytes - old.ordinaryBytes) return null
                 old.copy(ordinaryCount = old.ordinaryCount + 1, ordinaryBytes = old.ordinaryBytes + bytes)
             }
             if (state.compareAndSet(old, next)) {
@@ -186,7 +185,11 @@ internal class BoundedOutgoing(
     private suspend fun reserveOrdinary(bytes: Int): Lease {
         while (true) {
             reserve(bytes, false)?.let { return it }
-            state.first { s -> s.failure != null || s.terminalClaim != null || (!s.deliveryLost && s.ordinaryCount < limits.maxOutstandingFrames && bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes) }
+            state.first { s ->
+                val hasSlot = s.ordinaryCount < limits.maxOutstandingFrames
+                val hasBytes = bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes
+                s.failure != null || s.terminalClaim != null || (!s.deliveryLost && hasSlot && hasBytes)
+            }
         }
     }
 
