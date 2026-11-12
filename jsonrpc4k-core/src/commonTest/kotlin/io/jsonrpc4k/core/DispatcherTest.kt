@@ -33,6 +33,29 @@ private data class DispatcherNotifyParams(
 class DispatcherTest {
     private val dispatcher = Dispatcher()
 
+    @Test
+    fun `incoming numeric cancellation does not cancel an outbound waiter`() =
+        runTest {
+            assertRemoteCancellationDoesNotCancelWaiter(RequestId.of(7), JsonPrimitive(7))
+        }
+
+    @Test
+    fun `incoming string cancellation does not cancel an outbound waiter`() =
+        runTest {
+            assertRemoteCancellationDoesNotCancelWaiter(RequestId.of("same"), JsonPrimitive("same"))
+        }
+
+    private suspend fun assertRemoteCancellationDoesNotCancelWaiter(
+        id: RequestId,
+        wireId: JsonPrimitive,
+    ) {
+        val deferred = dispatcher.registerPendingRequest(id)
+        dispatcher.dispatch(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", wireId) }))
+        deferred.isActive shouldBe true
+        dispatcher.dispatch(ResponseMessage.success(id, JsonPrimitive("completed")))
+        deferred.await() shouldBe JsonPrimitive("completed")
+    }
+
     // ===== Request Handler Registration Tests =====
 
     @Test

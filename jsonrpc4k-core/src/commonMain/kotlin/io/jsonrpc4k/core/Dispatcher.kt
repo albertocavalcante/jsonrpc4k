@@ -10,8 +10,6 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.serializer
 import kotlin.coroutines.cancellation.CancellationException
@@ -293,9 +291,9 @@ public class Dispatcher(
     }
 
     private suspend fun handleNotification(notification: NotificationMessage) {
-        // Handle cancellation specially
         if (notification.method == CANCEL_REQUEST_METHOD) {
-            handleCancelRequest(notification.params)
+            // TODO(#49): Cancel inbound handler jobs when their directional registry is available.
+            // Until then, remote cancellation is best-effort and must not affect outbound waiters.
             return
         }
         val handler =
@@ -309,19 +307,6 @@ public class Dispatcher(
         } catch (e: Exception) {
             notificationErrorHandler?.onError(notification.method, e)
         }
-    }
-
-    private suspend fun handleCancelRequest(params: JsonElement?) {
-        val idElement = (params as? JsonObject)?.get("id") ?: return
-        val requestId =
-            when {
-                idElement is JsonPrimitive && idElement.isString ->
-                    RequestId.of(idElement.content)
-                idElement is JsonPrimitive ->
-                    RequestId.of(idElement.content.toLongOrNull() ?: return)
-                else -> return
-            }
-        cancelPendingRequest(requestId)
     }
 
     private suspend fun handleResponse(response: ResponseMessage) {
@@ -342,7 +327,7 @@ public class Dispatcher(
     }
 
     public companion object {
-        /** Standard cancellation method name for JSON-RPC base protocol. */
+        /** Cancellation notification method used by LSP. */
         public const val CANCEL_REQUEST_METHOD: String = "$/cancelRequest"
     }
 }
