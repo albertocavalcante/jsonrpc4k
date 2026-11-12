@@ -204,6 +204,9 @@ public class Connection(
                             outgoingDrain.fail(cause)
                             if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
                                 boundedPump?.outputInterrupted(cause)
+                            } else {
+                                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                                bounded.close(IllegalStateException("Connection closed"))
                             }
                             throw cause
                         } finally {
