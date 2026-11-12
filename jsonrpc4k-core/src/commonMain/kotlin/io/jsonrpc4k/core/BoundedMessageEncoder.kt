@@ -17,6 +17,12 @@ import kotlinx.serialization.json.JsonPrimitive
  * can fail or produce a mixed view; this API does not provide a coherent concurrent snapshot.
  * Source collection operations must terminate and must not themselves allocate without bound.
  * Raw unquoted JSON literals retain their existing semantics and are not validated as JSON.
+ * Node accounting treats each raw literal as one primitive; it does not count nodes encoded
+ * inside the raw text. The emitted nesting limit is still checked on the resulting bytes.
+ *
+ * @param maxWireBytes Maximum complete framed bytes and snapshot lower-bound budget, up to 100 MiB.
+ * @param maxNodes Maximum charged snapshot nodes, from 1 to 1,000,000.
+ * @param maxJsonNesting Maximum emitted object/array nesting, from 1 to 256.
  */
 public class BoundedMessageEncoder(
     private val maxWireBytes: Int,
