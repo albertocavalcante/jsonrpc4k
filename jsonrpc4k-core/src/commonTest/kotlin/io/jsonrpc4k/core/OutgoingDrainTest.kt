@@ -13,12 +13,14 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class OutgoingDrainTest {
@@ -27,7 +29,7 @@ class OutgoingDrainTest {
         runTest {
             val connection = Connection(scope = backgroundScope)
             backgroundScope.launch { connection.outgoing.collect {} }
-            connection.flushOutgoing()
+            withTimeout(1.seconds) { connection.flushOutgoing() }
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
@@ -55,7 +57,7 @@ class OutgoingDrainTest {
             runCurrent()
             assertFalse(flush.isCompleted)
             release.complete(Unit)
-            flush.await()
+            withTimeout(1.seconds) { flush.await() }
             assertEquals(2, received.size)
             assertTrue(received[0].contains("\"first\""))
             assertTrue(received[1].contains("\"second\""))
@@ -85,10 +87,10 @@ class OutgoingDrainTest {
             runCurrent()
             assertFalse(flush.isCompleted)
             release.complete(Unit)
-            val first = flush.await().exceptionOrNull()
+            val first = withTimeout(1.seconds) { flush.await() }.exceptionOrNull()
             assertTrue(first is IllegalStateException)
             assertSame(failure, first.cause)
-            val later = assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            val later = withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             assertSame(failure, later.cause)
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
@@ -130,7 +132,7 @@ class OutgoingDrainTest {
             runCurrent()
             assertFalse(flush.isCompleted)
             release.complete(Unit)
-            val error = flush.await().exceptionOrNull()
+            val error = withTimeout(1.seconds) { flush.await() }.exceptionOrNull()
             assertTrue(error is IllegalStateException)
             assertSame(failure, error.cause)
             assertEquals(0, connection.pendingFlushCount)
@@ -145,7 +147,7 @@ class OutgoingDrainTest {
             runCurrent()
             assertEquals(1, connection.pendingFlushCount)
             connection.close()
-            assertTrue(flush.await().isFailure)
+            assertTrue(withTimeout(1.seconds) { flush.await() }.isFailure)
             assertEquals(0, connection.pendingFlushCount)
         }
 
@@ -158,7 +160,7 @@ class OutgoingDrainTest {
             runCurrent()
             assertEquals(1, connection.pendingFlushCount)
             connection.close()
-            assertTrue(flush.await().isFailure)
+            assertTrue(withTimeout(1.seconds) { flush.await() }.isFailure)
             assertEquals(0, connection.pendingFlushCount)
         }
 
@@ -171,7 +173,7 @@ class OutgoingDrainTest {
             abandoned.cancelAndJoin()
             assertEquals(0, connection.pendingFlushCount)
             backgroundScope.launch { connection.outgoing.collect {} }
-            connection.flushOutgoing()
+            withTimeout(1.seconds) { connection.flushOutgoing() }
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
@@ -182,12 +184,12 @@ class OutgoingDrainTest {
             val connection = Connection(scope = backgroundScope)
             val first = backgroundScope.async { connection.outgoing.first() }
             runCurrent()
-            assertFailsWith<IllegalStateException> { connection.outgoing.first() }
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.outgoing.first() } }
             connection.notify("first", null)
             assertTrue(first.await().decodeToString().contains("\"first\""))
             connection.notify("second", null)
             assertTrue(connection.outgoing.first().decodeToString().contains("\"second\""))
-            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             connection.close()
         }
 
@@ -201,7 +203,7 @@ class OutgoingDrainTest {
             oldCollector.cancelAndJoin()
             backgroundScope.launch { connection.outgoing.collect {} }
             runCurrent()
-            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
@@ -215,7 +217,7 @@ class OutgoingDrainTest {
             val flush = async(start = CoroutineStart.UNDISPATCHED) { runCatching { connection.flushOutgoing() } }
             assertEquals(1, connection.pendingFlushCount)
             collector.cancelAndJoin()
-            assertTrue(flush.await().isFailure)
+            assertTrue(withTimeout(1.seconds) { flush.await() }.isFailure)
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
@@ -227,7 +229,7 @@ class OutgoingDrainTest {
             val collector = backgroundScope.launch { connection.outgoing.collect {} }
             runCurrent()
             collector.cancelAndJoin()
-            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             connection.close()
         }
 
@@ -239,7 +241,7 @@ class OutgoingDrainTest {
             connection.notify("first", null)
             connection.notify("second", null)
             assertEquals(2, frames.await().size)
-            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             connection.close()
         }
 
@@ -252,7 +254,7 @@ class OutgoingDrainTest {
             runCurrent()
             assertEquals(1, connection.pendingFlushCount)
             parent.cancel()
-            assertTrue(flush.await().isFailure)
+            assertTrue(withTimeout(1.seconds) { flush.await() }.isFailure)
             assertEquals(0, connection.pendingFlushCount)
         }
 }
