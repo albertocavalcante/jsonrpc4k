@@ -43,7 +43,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", null)
-        entered.await()
+        withTimeout(1000) { entered.await() }
         val second = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("second", null) }
         val third = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("third", null) }
         assertFalse(second.isCompleted)
@@ -71,7 +71,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", JsonPrimitive("payload"))
-        entered.await()
+        withTimeout(1000) { entered.await() }
         val waiters = (1..4).map { n ->
             backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
                 runCatching { connection.notify("waiter$n", null) }
@@ -96,7 +96,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", null)
-        entered.await()
+        withTimeout(1000) { entered.await() }
         val cancelled = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("cancelled", null) }
         val next = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("next", null) }
         val flush = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.flushOutgoing() }
@@ -240,7 +240,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", null)
-        entered.await()
+        withTimeout(1000) { entered.await() }
         val waiters = (1..4).map { n ->
             backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
                 runCatching { connection.notify("waiter$n", null) }
@@ -350,7 +350,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", null)
-        entered.await()
+        withTimeout(1000) { entered.await() }
         val flush = backgroundScope.async(Dispatchers.Unconfined) {
             try {
                 runCatching { connection.flushOutgoing() }
@@ -488,7 +488,7 @@ class OutboundBackpressureTest {
             }
         }
         connection.notify("first", null)
-        entered.await()
+        withTimeout(1000) { entered.await() }
         parent.cancel()
         failWriter.complete(Unit)
         withTimeout(1000) { writer.await() }
