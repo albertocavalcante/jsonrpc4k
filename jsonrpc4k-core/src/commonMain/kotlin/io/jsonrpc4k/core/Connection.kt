@@ -88,12 +88,17 @@ public class Connection(
                 scope = CoroutineScope(scope.coroutineContext + connectionJob),
                 output =
                     object : DispatchOutput {
-                        override suspend fun send(response: ResponseMessage, onDequeued: () -> Unit) {
+                        override suspend fun send(
+                            response: ResponseMessage,
+                            onDequeued: () -> Unit,
+                        ) {
                             outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
                         }
 
-                        override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean =
-                            outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
+                        override fun offer(
+                            response: ResponseMessage,
+                            onDequeued: (() -> Unit)?,
+                        ): Boolean = outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
 
                         override fun fail(cause: Throwable) {
                             if (scope.coroutineContext[Job]?.isActive == false) {
@@ -412,5 +417,4 @@ public class Connection(
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
-
 }

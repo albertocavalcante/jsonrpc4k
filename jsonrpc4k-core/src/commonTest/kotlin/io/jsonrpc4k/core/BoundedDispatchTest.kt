@@ -93,9 +93,10 @@ class BoundedDispatchTest {
             val connection = Connection(policy, scope = backgroundScope)
             val writer = backgroundScope.launch { connection.outgoing.collect {} }
             runCurrent()
-            val outbound = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
-                runCatching { connection.request<JsonElement>("outbound", null) }
-            }
+            val outbound =
+                backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { connection.request<JsonElement>("outbound", null) }
+                }
             writer.cancel()
             withTimeout(1.seconds) { writer.join() }
             assertIs<ConnectionState.Failed>(connection.state.value)
@@ -149,9 +150,10 @@ class BoundedDispatchTest {
     fun `malformed frame is terminal and retains the framing failure`() =
         runTest {
             val connection = Connection(policy, scope = backgroundScope)
-            val failure = assertFailsWith<JsonRpcProtocolException> {
-                connection.receive("Content-Length: -1\r\n\r\n")
-            }
+            val failure =
+                assertFailsWith<JsonRpcProtocolException> {
+                    connection.receive("Content-Length: -1\r\n\r\n")
+                }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
             assertTrue(generateSequence<Throwable>(failure) { it.cause }.take(8).any { it === terminal.cause })
             connection.close()
@@ -185,7 +187,11 @@ class BoundedDispatchTest {
             val connection = Connection(scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); release.await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
             val received = backgroundScope.async { connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait"))) }
             entered.await()
             assertFalse(received.isCompleted)
@@ -209,7 +215,10 @@ class BoundedDispatchTest {
                 null
             }
             connection.onNotification("changed") { _: JsonElement? -> order.add("changed") }
-            connection.onRequest("second") { _: JsonElement? -> order.add("second"); null }
+            connection.onRequest("second") { _: JsonElement? ->
+                order.add("second")
+                null
+            }
             val frames = Channel<ByteArray>(Channel.UNLIMITED)
             backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "first")))
@@ -231,7 +240,11 @@ class BoundedDispatchTest {
             val frames = Channel<ByteArray>(Channel.UNLIMITED)
             backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("incoming") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("incoming") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             val outbound = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("outbound", null) }
             val sentRequest = decode(withTimeout(1.seconds) { frames.receive() })
             assertIs<RequestMessage>(sentRequest)
@@ -256,8 +269,15 @@ class BoundedDispatchTest {
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
             var secondStarted = false
-            connection.onRequest("first") { _: JsonElement? -> entered.complete(Unit); release.await(); null }
-            connection.onRequest("second") { _: JsonElement? -> secondStarted = true; null }
+            connection.onRequest("first") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
+            connection.onRequest("second") { _: JsonElement? ->
+                secondStarted = true
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "first")))
             entered.await()
             connection.receive(codec.encode(RequestMessage(RequestId.of(2), "second")))
@@ -308,7 +328,11 @@ class BoundedDispatchTest {
             backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
             val entered = CompletableDeferred<Unit>()
             val notificationDone = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.onNotification("barrier") { _: JsonElement? ->
                 connection.flushOutgoing()
                 val response = assertIs<ResponseMessage>(decode(frames.tryReceive().getOrThrow()))
@@ -338,7 +362,10 @@ class BoundedDispatchTest {
                     CompletableDeferred<Unit>().await()
                     null
                 } finally {
-                    withContext(NonCancellable) { cleaning.complete(Unit); release.await() }
+                    withContext(NonCancellable) {
+                        cleaning.complete(Unit)
+                        release.await()
+                    }
                 }
             }
             connection.onRequest("new") { _: JsonElement? -> JsonPrimitive("new") }
@@ -367,17 +394,27 @@ class BoundedDispatchTest {
             val release = CompletableDeferred<Unit>()
             val notification = CompletableDeferred<Unit>()
             val offered = mutableListOf<ResponseMessage>()
-            dispatcher.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); release.await(); null }
+            dispatcher.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
             dispatcher.onNotification("barrier") { _: JsonElement? -> notification.complete(Unit) }
             val drive = { runCurrent() }
             val output =
                 object : DispatchOutput {
-                    override suspend fun send(response: ResponseMessage, onDequeued: () -> Unit) {
+                    override suspend fun send(
+                        response: ResponseMessage,
+                        onDequeued: () -> Unit,
+                    ) {
                         onDequeued()
                         offered.add(response)
                     }
 
-                    override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean {
+                    override fun offer(
+                        response: ResponseMessage,
+                        onDequeued: (() -> Unit)?,
+                    ): Boolean {
                         release.complete(Unit)
                         drive()
                         assertFalse(notification.isCompleted)
@@ -413,7 +450,10 @@ class BoundedDispatchTest {
             dispatcher.onRequest("second") { _: JsonElement? -> JsonPrimitive("second") }
             val output =
                 object : DispatchOutput {
-                    override suspend fun send(response: ResponseMessage, onDequeued: () -> Unit) {
+                    override suspend fun send(
+                        response: ResponseMessage,
+                        onDequeued: () -> Unit,
+                    ) {
                         onDequeued()
                         if (response.result == JsonPrimitive("first")) {
                             pump.receive(codec.encode(RequestMessage(RequestId.of(1), "second")))
@@ -423,8 +463,10 @@ class BoundedDispatchTest {
                         }
                     }
 
-                    override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean =
-                        error("Unexpected control response: $response")
+                    override fun offer(
+                        response: ResponseMessage,
+                        onDequeued: (() -> Unit)?,
+                    ): Boolean = error("Unexpected control response: $response")
 
                     override fun fail(cause: Throwable) {
                         terminal = cause
@@ -452,7 +494,10 @@ class BoundedDispatchTest {
                     CompletableDeferred<Unit>().await()
                     null
                 } finally {
-                    withContext(NonCancellable) { cleaning.complete(Unit); release.await() }
+                    withContext(NonCancellable) {
+                        cleaning.complete(Unit)
+                        release.await()
+                    }
                 }
             }
             val outbound = backgroundScope.async { runCatching { connection.request<JsonElement>("outbound", null) } }
@@ -472,14 +517,22 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(policy, scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of("same"), "wait")))
             entered.await()
             assertFailsWith<JsonRpcProtocolException> {
                 connection.receive(codec.encode(RequestMessage(RequestId.of("same"), "wait")))
             }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
-            assertTrue(terminal.cause.message.orEmpty().contains("Duplicate"))
+            assertTrue(
+                terminal.cause.message
+                    .orEmpty()
+                    .contains("Duplicate"),
+            )
             connection.close()
             assertEquals(terminal, connection.state.value)
         }
@@ -489,14 +542,21 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(policy, scope = backgroundScope)
             val handled = CompletableDeferred<Unit>()
-            connection.onRequest("done") { _: JsonElement? -> handled.complete(Unit); JsonPrimitive("done") }
+            connection.onRequest("done") { _: JsonElement? ->
+                handled.complete(Unit)
+                JsonPrimitive("done")
+            }
             val id = RequestId.of(9)
             connection.receive(codec.encode(RequestMessage(id, "done")))
             withTimeout(1.seconds) { handled.await() }
             runCurrent()
             assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(RequestMessage(id, "done"))) }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
-            assertTrue(terminal.cause.message.orEmpty().contains("Duplicate"))
+            assertTrue(
+                terminal.cause.message
+                    .orEmpty()
+                    .contains("Duplicate"),
+            )
         }
 
     @Test
@@ -525,7 +585,11 @@ class BoundedDispatchTest {
             backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
-            connection.onRequest("first") { _: JsonElement? -> entered.complete(Unit); release.await(); null }
+            connection.onRequest("first") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
             connection.onRequest("second") { _: JsonElement? -> null }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "first")))
             withTimeout(1.seconds) { entered.await() }
@@ -546,7 +610,11 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
@@ -554,7 +622,11 @@ class BoundedDispatchTest {
             connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait")))
             assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait"))) }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
-            assertTrue(terminal.cause.message.orEmpty().contains("Duplicate"))
+            assertTrue(
+                terminal.cause.message
+                    .orEmpty()
+                    .contains("Duplicate"),
+            )
         }
 
     @Test
@@ -562,7 +634,11 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
@@ -584,7 +660,11 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             val outbound = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("outbound", null) }
             connection.receive(codec.encode(RequestMessage(RequestId.of(10), "wait")))
             withTimeout(1.seconds) { entered.await() }
@@ -602,10 +682,16 @@ class BoundedDispatchTest {
             val frames = Channel<ByteArray>(Channel.UNLIMITED)
             backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of("same"), "wait")))
             withTimeout(1.seconds) { entered.await() }
-            connection.receive(codec.encode(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", JsonPrimitive(true)) })))
+            connection.receive(
+                codec.encode(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", JsonPrimitive(true)) })),
+            )
             connection.receive(codec.encode(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD)))
             runCurrent()
             assertTrue(frames.isEmpty)
@@ -621,14 +707,22 @@ class BoundedDispatchTest {
         runTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
             runCurrent()
             assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(NotificationMessage("overflow"))) }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
-            assertTrue(terminal.cause.message.orEmpty().contains("queue is full"))
+            assertTrue(
+                terminal.cause.message
+                    .orEmpty()
+                    .contains("queue is full"),
+            )
             assertTrue(backgroundScope.coroutineContext[kotlinx.coroutines.Job]!!.isActive)
         }
 
@@ -638,23 +732,32 @@ class BoundedDispatchTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
             val entered = CompletableDeferred<Unit>()
             repeat(64) { connection.notify("fill", null) }
-            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<Unit>().await()
+                null
+            }
             connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
             runCurrent()
             assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait"))) }
             val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
-            assertTrue(terminal.cause.message.orEmpty().contains("Outgoing response queue is full"))
+            assertTrue(
+                terminal.cause.message
+                    .orEmpty()
+                    .contains("Outgoing response queue is full"),
+            )
         }
 
     private fun decode(frame: ByteArray): Message = JsonRpcMessageDecoder(codec).feed(frame).single()
 
     private fun cancel(id: RequestId): NotificationMessage {
-        val wireId = when (id) {
-            is RequestId.NumberId -> JsonPrimitive(id.value)
-            is RequestId.StringId -> JsonPrimitive(id.value)
-        }
+        val wireId =
+            when (id) {
+                is RequestId.NumberId -> JsonPrimitive(id.value)
+                is RequestId.StringId -> JsonPrimitive(id.value)
+            }
         return NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", wireId) })
     }
 }

@@ -40,5 +40,7 @@ public sealed interface ConnectionState {
     public data object Closed : ConnectionState
 
     /** The connection failed; [cause] retains the original failure. */
-    public data class Failed(val cause: Throwable) : ConnectionState
+    public data class Failed(
+        val cause: Throwable,
+    ) : ConnectionState
 }

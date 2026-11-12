@@ -19,9 +19,15 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 internal interface DispatchOutput {
-    suspend fun send(response: ResponseMessage, onDequeued: () -> Unit)
+    suspend fun send(
+        response: ResponseMessage,
+        onDequeued: () -> Unit,
+    )
 
-    fun offer(response: ResponseMessage, onDequeued: (() -> Unit)? = null): Boolean
+    fun offer(
+        response: ResponseMessage,
+        onDequeued: (() -> Unit)? = null,
+    ): Boolean
 
     fun fail(cause: Throwable)
 }
@@ -56,10 +62,14 @@ internal class BoundedDispatchPump(
             val replyDone: CompletableDeferred<Unit>,
         ) : Event
 
-        data class Notification(val message: NotificationMessage) : Event
+        data class Notification(
+            val message: NotificationMessage,
+        ) : Event
     }
 
-    private data class Running(val finalized: CompletableDeferred<Unit>)
+    private data class Running(
+        val finalized: CompletableDeferred<Unit>,
+    )
 
     private val admission = Mutex()
     private val connectionJob = checkNotNull(scope.coroutineContext[Job])
@@ -95,8 +105,10 @@ internal class BoundedDispatchPump(
                     offset = end
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: Throwable) {
-            if (failure !is CancellationException) output.fail(failure)
+            output.fail(failure)
             throw failure
         }
     }
@@ -154,9 +166,10 @@ internal class BoundedDispatchPump(
                 return
             }
             if (!claimReply(message.id, token)) return
-            val offered = output.offer(ResponseMessage.error(message.id, ResponseError(SERVER_BUSY, "Server busy"))) {
-                remove(message.id, token)
-            }
+            val offered =
+                output.offer(ResponseMessage.error(message.id, ResponseError(SERVER_BUSY, "Server busy"))) {
+                    remove(message.id, token)
+                }
             if (!offered) {
                 throw JsonRpcProtocolException("Outgoing response queue is full")
             }
@@ -201,10 +214,11 @@ internal class BoundedDispatchPump(
     }
 
     private suspend fun startRequest(event: Event.Request): Running? {
-        val acquired = select<Boolean> {
-            permits.onReceive { true }
-            event.cancellation.onAwait { false }
-        }
+        val acquired =
+            select<Boolean> {
+                permits.onReceive { true }
+                event.cancellation.onAwait { false }
+            }
         queueSlots.release()
         if (!acquired) return null
         val finalized = CompletableDeferred<Unit>()
@@ -234,11 +248,16 @@ internal class BoundedDispatchPump(
         }
     }
 
-    private fun finishRequest(event: Event.Request, cause: Throwable?, finalized: CompletableDeferred<Unit>) {
+    private fun finishRequest(
+        event: Event.Request,
+        cause: Throwable?,
+        finalized: CompletableDeferred<Unit>,
+    ) {
         if (cause is CancellationException && connectionJob.isActive && claimReply(event.message.id, event.token)) {
-            val offered = output.offer(ResponseMessage.error(event.message.id, ResponseError.requestCancelled())) {
-                remove(event.message.id, event.token)
-            }
+            val offered =
+                output.offer(ResponseMessage.error(event.message.id, ResponseError.requestCancelled())) {
+                    remove(event.message.id, event.token)
+                }
             if (!offered) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
             event.replyDone.complete(Unit)
         } else if (cause != null && cause !is CancellationException && connectionJob.isActive) {
@@ -253,7 +272,10 @@ internal class BoundedDispatchPump(
         }
     }
 
-    private fun claimReply(id: RequestId, token: Any): Boolean {
+    private fun claimReply(
+        id: RequestId,
+        token: Any,
+    ): Boolean {
         while (true) {
             val current = incoming.value
             val entry = current.requests[id] ?: return false
@@ -263,7 +285,11 @@ internal class BoundedDispatchPump(
         }
     }
 
-    private fun attach(id: RequestId, token: Any, job: Job): Boolean {
+    private fun attach(
+        id: RequestId,
+        token: Any,
+        job: Job,
+    ): Boolean {
         while (true) {
             val current = incoming.value
             val entry = current.requests[id] ?: return false
@@ -273,7 +299,10 @@ internal class BoundedDispatchPump(
         }
     }
 
-    private fun remove(id: RequestId, token: Any) {
+    private fun remove(
+        id: RequestId,
+        token: Any,
+    ) {
         while (true) {
             val current = incoming.value
             if (current.requests[id]?.token !== token) return
