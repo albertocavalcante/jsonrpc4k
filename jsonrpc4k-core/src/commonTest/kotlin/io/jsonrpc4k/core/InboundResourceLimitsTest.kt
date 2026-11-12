@@ -51,6 +51,32 @@ class InboundResourceLimitsTest {
     }
 
     @Test
+    fun `large shallow multibyte frames pass exact byte ceiling when fragmented and coalesced`() =
+        runTest {
+            val payload = JsonPrimitive("世界🌍\\\"".repeat(4_096))
+            val message = NotificationMessage("large", payload)
+            val bodyBytes = codec.encodeToJson(message).encodeToByteArray().size
+            assertTrue(bodyBytes in 32 * 1024..64 * 1024)
+            val frame = codec.encode(message)
+            val connection =
+                Connection(BoundedDispatchPolicy(1, 2), InboundResourceLimits(bodyBytes, 2, bodyBytes * 2), scope = backgroundScope)
+            val delivered = Channel<JsonElement?>(Channel.UNLIMITED)
+            connection.onNotification("large") { value: JsonElement? -> delivered.send(value) }
+            var offset = 0
+            while (offset < frame.size) {
+                val end = minOf(offset + 2_047, frame.size)
+                connection.receive(frame.copyOfRange(offset, end))
+                offset = end
+            }
+            assertEquals(payload, withTimeout(1.seconds) { delivered.receive() })
+            runCurrent()
+            assertEquals(0, connection.retainedApplicationBytes)
+            connection.receive(frame + frame)
+            repeat(2) { assertEquals(payload, withTimeout(1.seconds) { delivered.receive() }) }
+            connection.close()
+        }
+
+    @Test
     fun `depth scanner skips enabled comments but not unquoted slash sequences`() {
         val commentsCodec =
             JsonRpcCodec(
