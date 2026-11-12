@@ -421,4 +421,49 @@ class OutboundBackpressureTest {
         connection.close()
     }
 
+
+    @Test
+    fun `parent first control failure resolves as normal close`() = runTest {
+        var active = true
+        var reported: Throwable? = null
+        var selected: Throwable? = IllegalStateException("not closed")
+        lateinit var queue: BoundedOutgoing
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        queue = BoundedOutgoing(
+            limits,
+            parentActive = { active },
+            parentInactive = { selected = queue.closeNormally() },
+            fail = { reported = it },
+        )
+        val response = ResponseMessage.error(RequestId.of(11), ResponseError.requestCancelled())
+        assertEquals(OfferResult.ACCEPTED, queue.offer(response, null))
+        active = false
+        assertEquals(OfferResult.TERMINAL_TRANSITION, queue.offer(response, null))
+        assertEquals(null, selected)
+        assertEquals(null, reported)
+        assertEquals(0, queue.outstandingCount)
+    }
+
+    @Test
+    fun `control failure first survives later parent cancellation`() = runTest {
+        var active = true
+        var selected: Throwable? = null
+        var reported: Throwable? = null
+        lateinit var queue: BoundedOutgoing
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        queue = BoundedOutgoing(
+            limits,
+            haltIngress = { active = false; selected = queue.closeNormally() },
+            parentActive = { active },
+            parentInactive = { queue.closeNormally() },
+            fail = { reported = it },
+        )
+        val response = ResponseMessage.error(RequestId.of(12), ResponseError.requestCancelled())
+        assertEquals(OfferResult.ACCEPTED, queue.offer(response, null))
+        assertEquals(OfferResult.REJECTED, queue.offer(response, null))
+        assertTrue(selected is IllegalStateException)
+        assertSame(selected, reported)
+        assertEquals(0, queue.outstandingCount)
+    }
+
 }

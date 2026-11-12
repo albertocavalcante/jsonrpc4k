@@ -11,7 +11,8 @@ package io.jsonrpc4k.core
  * waiting ordinary producer or flush; a flush covers frames already accepted before its marker,
  * not concurrent sends that have not yet been accepted. At most [maxPendingProducers] ordinary
  * producers may wait for admission; additional callers fail immediately. A concurrent control
- * encoder or exhausted control reserve terminates the connection rather than waiting.
+ * encoder or exhausted control reserve terminates the connection rather than waiting. A failure
+ * racing parent cancellation is resolved by the first observed terminal claim.
  */
 public data class OutboundResourceLimits(
     val maxFrameWireBytes: Int,

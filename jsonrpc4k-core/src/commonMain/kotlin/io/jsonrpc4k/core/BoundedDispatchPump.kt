@@ -24,6 +24,8 @@ import kotlinx.serialization.json.JsonPrimitive
 internal enum class OfferResult { ACCEPTED, TERMINAL_TRANSITION, REJECTED }
 
 internal interface DispatchOutput {
+    val isTerminating: Boolean get() = false
+
     suspend fun send(
         response: ResponseMessage,
         onDequeued: () -> Unit,
@@ -177,6 +179,7 @@ internal class BoundedDispatchPump(
         message: Message,
         bodyBytes: Int,
     ) {
+        if (output.isTerminating) throw CancellationException("Connection is terminating")
         when (message) {
             is ResponseMessage -> dispatcher.dispatch(message)
             is RequestMessage -> admitRequest(message, bodyBytes)

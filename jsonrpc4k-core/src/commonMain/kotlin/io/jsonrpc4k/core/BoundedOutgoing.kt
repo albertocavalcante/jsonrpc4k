@@ -11,6 +11,8 @@ import kotlinx.coroutines.sync.Mutex
 internal class BoundedOutgoing(
     private val limits: OutboundResourceLimits,
     private val haltIngress: () -> Unit = {},
+    private val parentActive: () -> Boolean = { true },
+    private val parentInactive: () -> Unit = {},
     private val fail: (Throwable) -> Unit,
 ) {
     private data class State(
@@ -88,6 +90,7 @@ internal class BoundedOutgoing(
         }
     }
 
+    val isTerminating: Boolean get() = state.value.let { it.deliveryLost || it.terminalClaim != null || it.failure != null }
     internal val outstandingCount: Int get() = state.value.ordinaryCount + state.value.controlCount
     internal val outstandingBytes: Int get() = state.value.ordinaryBytes + state.value.controlBytes
 
@@ -109,6 +112,10 @@ internal class BoundedOutgoing(
 
     private fun claimControlFailure(cause: Throwable): Boolean {
         while (true) {
+            if (!parentActive()) {
+                parentInactive()
+                return false
+            }
             val old = state.value
             if (old.deliveryLost) return false
             if (old.failure != null || old.terminalClaim != null) return false

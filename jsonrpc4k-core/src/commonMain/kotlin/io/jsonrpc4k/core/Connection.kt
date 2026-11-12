@@ -114,6 +114,8 @@ public class Connection(
             outboundLimits,
             fail = { cause -> boundedPump?.outputInterrupted(cause) },
             haltIngress = { boundedPump?.close(); dispatcher.pending.close() },
+            parentActive = { scope.coroutineContext[Job]?.isActive != false },
+            parentInactive = { transitionClosed() },
         )
         installBoundedPump(policy, scope, inboundLimits)
         if (!connectionJob.isActive) {
@@ -136,6 +138,8 @@ public class Connection(
                 limits = limits,
                 output =
                     object : DispatchOutput {
+                        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
+
                         override suspend fun send(
                             response: ResponseMessage,
                             onDequeued: () -> Unit,
@@ -156,11 +160,11 @@ public class Connection(
                             }
 
                         override fun fail(cause: Throwable) {
-                            if (boundedOutgoing?.claimFailure(cause) == false) return
                             if (scope.coroutineContext[Job]?.isActive == false) {
                                 transitionClosed()
                                 return
                             }
+                            if (boundedOutgoing?.claimFailure(cause) == false) return
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
                                 outgoingDrain.fail(cause)
                                 boundedPump?.close()
