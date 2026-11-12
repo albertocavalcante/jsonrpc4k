@@ -42,7 +42,14 @@ internal class BoundedDispatchPump(
     private val dispatcher: Dispatcher,
     private val scope: CoroutineScope,
     private val output: DispatchOutput,
+    private val limits: InboundResourceLimits? = null,
 ) {
+    private class Reservation(private val releaseBytes: () -> Unit) {
+        private val released = MutableStateFlow(false)
+        fun release() {
+            if (released.compareAndSet(false, true)) releaseBytes()
+        }
+    }
     private data class Incoming(
         val token: Any,
         val cancellation: CompletableDeferred<Unit>,
@@ -58,15 +65,19 @@ internal class BoundedDispatchPump(
     )
 
     private sealed interface Event {
+        val reservation: Reservation?
+
         data class Request(
             val message: RequestMessage,
             val token: Any,
             val cancellation: CompletableDeferred<Unit>,
             val replyDone: CompletableDeferred<Unit>,
+            override val reservation: Reservation?,
         ) : Event
 
         data class Notification(
             val message: NotificationMessage,
+            override val reservation: Reservation?,
         ) : Event
     }
 
@@ -76,7 +87,10 @@ internal class BoundedDispatchPump(
 
     private val admission = Mutex()
     private val connectionJob = checkNotNull(scope.coroutineContext[Job])
-    private val queued = Channel<Event>(policy.maxQueuedMessages)
+    private val queued = Channel<Event>(policy.maxQueuedMessages, onUndeliveredElement = { it.reservation?.release() })
+    private val retainedBytes = MutableStateFlow(0)
+    private val unlimitedReservation = Reservation {}
+    internal val retainedApplicationBytes: Int get() = retainedBytes.value
     private val queueSlots = Semaphore(policy.maxQueuedMessages)
     private val incoming = MutableStateFlow(IncomingState())
     private val permits = Channel<Unit>(policy.maxConcurrentRequests)
@@ -104,9 +118,9 @@ internal class BoundedDispatchPump(
                 var offset = 0
                 while (offset < data.size) {
                     val end = minOf(data.size, offset + minOf(data.size - offset, INPUT_SLICE_SIZE))
-                    for (message in decoder.feed(data.copyOfRange(offset, end))) {
+                    decoder.feedEach(data.copyOfRange(offset, end)) { message, bodyBytes ->
                         currentCoroutineContext().ensureActive()
-                        admit(message)
+                        admit(message, bodyBytes)
                     }
                     offset = end
                     if (offset < data.size) yield()
@@ -137,17 +151,38 @@ internal class BoundedDispatchPump(
 
     fun outputInterrupted(cause: Throwable) = output.fail(cause)
 
-    private suspend fun admit(message: Message) {
+    private fun reserve(bytes: Int): Reservation? {
+        val maximum = limits?.maxApplicationBodyBytes ?: return unlimitedReservation
+        while (true) {
+            val current = retainedBytes.value
+            if (bytes > maximum - current) return null
+            if (retainedBytes.compareAndSet(current, current + bytes)) {
+                return Reservation {
+                    while (true) {
+                        val before = retainedBytes.value
+                        if (retainedBytes.compareAndSet(before, before - bytes)) break
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun admit(message: Message, bodyBytes: Int) {
         when (message) {
             is ResponseMessage -> dispatcher.dispatch(message)
-            is RequestMessage -> admitRequest(message)
+            is RequestMessage -> admitRequest(message, bodyBytes)
             is NotificationMessage -> {
                 if (message.method == Dispatcher.CANCEL_REQUEST_METHOD) {
                     cancel(message)
                 } else {
-                    if (!queueSlots.tryAcquire()) throw JsonRpcProtocolException("Incoming notification queue is full")
-                    if (!queued.trySend(Event.Notification(message)).isSuccess) {
+                    val reservation = reserve(bodyBytes) ?: throw JsonRpcProtocolException("Incoming application byte budget is full")
+                    if (!queueSlots.tryAcquire()) {
+                        reservation.release()
+                        throw JsonRpcProtocolException("Incoming notification queue is full")
+                    }
+                    if (!queued.trySend(Event.Notification(message, reservation)).isSuccess) {
                         queueSlots.release()
+                        reservation.release()
                         throw JsonRpcProtocolException("Incoming notification queue is closed")
                     }
                 }
@@ -155,7 +190,7 @@ internal class BoundedDispatchPump(
         }
     }
 
-    private fun admitRequest(message: RequestMessage) {
+    private fun admitRequest(message: RequestMessage, bodyBytes: Int) {
         val token = Any()
         val cancellation = CompletableDeferred<Unit>()
         val replyDone = CompletableDeferred<Unit>()
@@ -166,17 +201,20 @@ internal class BoundedDispatchPump(
             val requests = current.requests.put(message.id, Incoming(token, cancellation, replyDone))
             if (incoming.compareAndSet(current, current.copy(requests = requests))) break
         }
-        val admitted = queueSlots.tryAcquire()
-        if (!admitted || !queued.trySend(Event.Request(message, token, cancellation, replyDone)).isSuccess) {
+        val reservation = reserve(bodyBytes)
+        val admitted = reservation != null && queueSlots.tryAcquire()
+        if (!admitted || !queued.trySend(Event.Request(message, token, cancellation, replyDone, reservation)).isSuccess) {
             if (admitted) queueSlots.release()
+            reservation?.release()
             if (!connectionJob.isActive) {
                 remove(message.id, token)
                 return
             }
             if (!claimReply(message.id, token)) return
+            val id = message.id
             val offered =
-                output.offer(ResponseMessage.error(message.id, ResponseError(SERVER_BUSY, "Server busy"))) {
-                    remove(message.id, token)
+                output.offer(ResponseMessage.error(id, ResponseError(SERVER_BUSY, "Server busy"))) {
+                    remove(id, token)
                 }
             if (!offered) {
                 throw JsonRpcProtocolException("Outgoing response queue is full")
@@ -209,10 +247,14 @@ internal class BoundedDispatchPump(
             running.removeAll { it.finalized.isCompleted }
             when (event) {
                 is Event.Notification -> {
-                    running.map { it.finalized }.joinAll()
-                    running.clear()
-                    queueSlots.release()
-                    dispatcher.dispatch(event.message)
+                    try {
+                        running.map { it.finalized }.joinAll()
+                        running.clear()
+                        queueSlots.release()
+                        dispatcher.dispatch(event.message)
+                    } finally {
+                        event.reservation?.release()
+                    }
                 }
                 is Event.Request -> {
                     startRequest(event)?.let(running::add)
@@ -223,12 +265,20 @@ internal class BoundedDispatchPump(
 
     private suspend fun startRequest(event: Event.Request): Running? {
         val acquired =
+            try {
             select<Boolean> {
                 permits.onReceive { true }
                 event.cancellation.onAwait { false }
             }
+            } catch (failure: Throwable) {
+                event.reservation?.release()
+                throw failure
+            }
         queueSlots.release()
-        if (!acquired) return null
+        if (!acquired) {
+            event.reservation?.release()
+            return null
+        }
         val finalized = CompletableDeferred<Unit>()
         val worker = scope.launch(start = CoroutineStart.LAZY) { runRequest(event) }
         worker.invokeOnCompletion { cause -> finishRequest(event, cause, finalized) }
@@ -239,9 +289,11 @@ internal class BoundedDispatchPump(
     private suspend fun runRequest(event: Event.Request) {
         try {
             val response = checkNotNull(dispatcher.dispatch(event.message))
-            if (claimReply(event.message.id, event.token)) {
+            val id = event.message.id
+            val token = event.token
+            if (claimReply(id, token)) {
                 try {
-                    output.send(response) { remove(event.message.id, event.token) }
+                    output.send(response) { remove(id, token) }
                 } finally {
                     event.replyDone.complete(Unit)
                 }
@@ -261,10 +313,14 @@ internal class BoundedDispatchPump(
         cause: Throwable?,
         finalized: CompletableDeferred<Unit>,
     ) {
+        detach(event.message.id, event.token)
+        event.reservation?.release()
         if (cause is CancellationException && connectionJob.isActive && claimReply(event.message.id, event.token)) {
+            val id = event.message.id
+            val token = event.token
             val offered =
-                output.offer(ResponseMessage.error(event.message.id, ResponseError.requestCancelled())) {
-                    remove(event.message.id, event.token)
+                output.offer(ResponseMessage.error(id, ResponseError.requestCancelled())) {
+                    remove(id, token)
                 }
             if (!offered) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
             event.replyDone.complete(Unit)
@@ -277,6 +333,15 @@ internal class BoundedDispatchPump(
         event.replyDone.invokeOnCompletion {
             permits.trySend(Unit)
             finalized.complete(Unit)
+        }
+    }
+
+    private fun detach(id: RequestId, token: Any) {
+        while (true) {
+            val current = incoming.value
+            val entry = current.requests[id] ?: return
+            if (entry.token !== token || entry.job == null) return
+            if (incoming.compareAndSet(current, current.copy(requests = current.requests.put(id, entry.copy(job = null))))) return
         }
     }
 

@@ -58,9 +58,10 @@ public class Connection(
     private val outgoingMessages = Channel<OutgoingItem>(Channel.BUFFERED)
     private val outgoingDrain = OutgoingDrain()
     internal val pendingFlushCount: Int get() = outgoingDrain.pendingCount
-    private val decoder = JsonRpcMessageDecoder(codec)
+    private var decoder = JsonRpcMessageDecoder(codec)
     private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
     private var boundedPump: BoundedDispatchPump? = null
+    internal val retainedApplicationBytes: Int get() = boundedPump?.retainedApplicationBytes ?: 0
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
 
@@ -80,12 +81,30 @@ public class Connection(
         scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(codec, json, scope, notificationErrorHandler) {
+        installBoundedPump(policy, scope, null)
+    }
+
+    /** Creates a bounded connection with additional framed-input and application-byte limits. */
+    public constructor(
+        policy: BoundedDispatchPolicy,
+        limits: InboundResourceLimits,
+        codec: JsonRpcCodec = JsonRpcCodec.Default,
+        json: Json = JsonRpcCodec.defaultJson,
+        scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
+        notificationErrorHandler: NotificationErrorHandler? = null,
+    ) : this(codec, json, scope, notificationErrorHandler) {
+        decoder = JsonRpcMessageDecoder(codec, limits)
+        installBoundedPump(policy, scope, limits)
+    }
+
+    private fun installBoundedPump(policy: BoundedDispatchPolicy, scope: CoroutineScope, limits: InboundResourceLimits?) {
         boundedPump =
             BoundedDispatchPump(
                 policy = policy,
                 decoder = decoder,
                 dispatcher = dispatcher,
                 scope = CoroutineScope(scope.coroutineContext + connectionJob),
+                limits = limits,
                 output =
                     object : DispatchOutput {
                         override suspend fun send(
