@@ -40,7 +40,8 @@ tasks.register("verifyJava16Rejected") {
             val failure = runCatching { configuration.resolve() }.exceptionOrNull()
                 ?: error("A Java 16 consumer unexpectedly resolved $module")
             val details = failure.stackTraceToString()
-            check("No matching variant" in details && module in details && "16" in details) {
+            val requested = "io.github.albertocavalcante:$module:${System.getenv("FIXTURE_VERSION")}"
+            check("No matching variant of $requested" in details && "Java 16" in details && "Java 17" in details) {
                 "Java 16 probe failed for an unrelated reason: $details"
             }
         }
