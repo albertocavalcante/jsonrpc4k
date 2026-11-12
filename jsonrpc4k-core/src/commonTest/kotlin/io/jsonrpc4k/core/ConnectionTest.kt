@@ -165,6 +165,26 @@ class ConnectionTest {
         }
 
     @Test
+    fun `already cancelled parent starts a closed connection`() =
+        runTest {
+            val parent = Job()
+            parent.cancel()
+            val connection = Connection(scope = CoroutineScope(parent))
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+            connection.close()
+        }
+
+    @Test
+    fun `request timeout cleans the waiter`() =
+        runTest {
+            val connection = Connection()
+            val error = assertFailsWith<JsonRpcException> { connection.request<JsonPrimitive>("never", null, 10.milliseconds) }
+            error.code shouldBe ResponseError.REQUEST_CANCELLED
+            connection.dispatcher.pendingCount shouldBe 0
+            connection.close()
+        }
+
+    @Test
     fun `caller timeout remains cancellation rather than request timeout error`() =
         runTest {
             val connection = Connection()
