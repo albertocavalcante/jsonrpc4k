@@ -6,8 +6,11 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
@@ -51,6 +54,81 @@ private data class ConnectionAddResult(
 )
 
 class ConnectionTest {
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cancelled caller removes a registered waiter`() =
+        runTest {
+            val connection = Connection()
+            val request = launch { connection.request<JsonPrimitive>("never", null) }
+            runCurrent()
+            connection.dispatcher.pendingCount shouldBe 1
+            request.cancelAndJoin()
+            connection.dispatcher.pendingCount shouldBe 0
+            connection.close()
+        }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `close cleans up a request suspended while sending`() =
+        runTest {
+            val connection = Connection()
+            repeat(64) { connection.notify("fill", null) }
+            val request = launch { runCatching { connection.request<JsonPrimitive>("never", null) } }
+            runCurrent()
+            connection.dispatcher.pendingCount shouldBe 1
+            connection.close()
+            request.join()
+            connection.dispatcher.pendingCount shouldBe 0
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+        }
+
+    @Test
+    fun `cancel all remains reusable while close seals the registry`() =
+        runTest {
+            val dispatcher = Dispatcher()
+            val id = RequestId.of(1)
+            val first = dispatcher.registerPendingRequest(id)
+            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
+            dispatcher.cancelAllPendingRequests()
+            first.isCancelled shouldBe true
+            val second = dispatcher.registerPendingRequest(id)
+            dispatcher.cancelRegisteredRequest(id, first)
+            dispatcher.pendingCount shouldBe 1
+            dispatcher.closePendingRequests()
+            second.isCancelled shouldBe true
+            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
+        }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `parent cancellation cancels pending requests and seals connection`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            val request = launch { connection.request<JsonPrimitive>("never", null) }
+            runCurrent()
+            connection.dispatcher.pendingCount shouldBe 1
+            parent.cancel()
+            request.join()
+            connection.dispatcher.pendingCount shouldBe 0
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+        }
+
+    @Test
+    fun `concurrent registration and close leave no pending waiters`() =
+        runTest {
+            repeat(100) {
+                val dispatcher = Dispatcher()
+                val registration = async(Dispatchers.Default) { runCatching { dispatcher.registerPendingRequest(RequestId.of(1)) } }
+                val close = async(Dispatchers.Default) { dispatcher.closePendingRequests() }
+                val deferred = registration.await().getOrNull()
+                close.await()
+                dispatcher.pendingCount shouldBe 0
+                if (deferred != null) deferred.isCancelled shouldBe true
+                assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(RequestId.of(2)) }
+            }
+        }
+
     @Test
     fun `closing a connection preserves its caller scope`() =
         runTest {
@@ -70,6 +148,7 @@ class ConnectionTest {
                     connection.request<JsonPrimitive>("never", null)
                 }
             }
+            connection.dispatcher.pendingCount shouldBe 0
             connection.close()
         }
 

@@ -2,15 +2,15 @@ package io.jsonrpc4k.core
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -39,6 +39,16 @@ public class Connection(
     private val requestIdMutex = Mutex()
     private val outgoingMessages = Channel<Message>(Channel.BUFFERED)
     private val decoder = JsonRpcMessageDecoder(codec)
+    private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
+
+    init {
+        connectionJob.invokeOnCompletion {
+            dispatcher.closePendingRequests()
+            outgoingMessages.cancel()
+        }
+    }
+
+    private data class CompletedResponse(val value: JsonElement?)
 
     /**
      * Flow of outgoing messages that need to be sent over the transport.
@@ -147,13 +157,15 @@ public class Connection(
         val request = RequestMessage(id = id, method = method, params = params)
 
         val deferred = dispatcher.registerPendingRequest(id)
-        outgoingMessages.send(request)
-
         return try {
-            deferred.awaitWithTimeout(timeout)
-        } catch (e: TimeoutCancellationException) {
-            dispatcher.cancelPendingRequest(id)
-            throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+            outgoingMessages.send(request)
+            val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
+            if (result == null) {
+                throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+            }
+            result.value
+        } finally {
+            dispatcher.cancelRegisteredRequest(id, deferred)
         }
     }
 
@@ -240,6 +252,7 @@ public class Connection(
      * This will decode messages and dispatch them to handlers.
      */
     public suspend fun receive(data: ByteArray) {
+        // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
         val messages = decoder.feed(data)
         for (message in messages) {
             val response = dispatcher.dispatch(message)
@@ -260,8 +273,8 @@ public class Connection(
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
-        dispatcher.cancelAllPendingRequests()
-        outgoingMessages.close()
-        scope.cancel()
+        dispatcher.closePendingRequests()
+        outgoingMessages.cancel()
+        connectionJob.cancel()
     }
 }

@@ -1,6 +1,7 @@
 package io.jsonrpc4k.core
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -70,7 +71,13 @@ public class Dispatcher(
     private val mutex = Mutex()
     private val requestHandlers = mutableMapOf<String, RequestHandler>()
     private val notificationHandlers = mutableMapOf<String, NotificationHandler>()
-    private val pendingRequests = mutableMapOf<RequestId, CompletableDeferred<JsonElement?>>()
+    private data class PendingState(
+        val closed: Boolean = false,
+        val requests: Map<RequestId, CompletableDeferred<JsonElement?>> = emptyMap(),
+    )
+
+    private val pending = MutableStateFlow(PendingState())
+    internal val pendingCount: Int get() = pending.value.requests.size
 
     /**
      * Register a request handler for a method.
@@ -200,28 +207,55 @@ public class Dispatcher(
      */
     public suspend fun registerPendingRequest(id: RequestId): CompletableDeferred<JsonElement?> {
         val deferred = CompletableDeferred<JsonElement?>()
-        mutex.withLock {
-            pendingRequests[id] = deferred
+        while (true) {
+            val state = pending.value
+            check(!state.closed) { "Connection is closed" }
+            check(id !in state.requests) { "Request ID is already pending: $id" }
+            if (pending.compareAndSet(state, state.copy(requests = state.requests + (id to deferred)))) return deferred
         }
-        return deferred
     }
 
     /**
      * Cancel all pending requests. Called during connection shutdown.
      */
     public fun cancelAllPendingRequests() {
-        pendingRequests.values.forEach { it.cancel() }
-        pendingRequests.clear()
+        drainPendingRequests(close = false)
+    }
+
+    internal fun closePendingRequests() = drainPendingRequests(close = true)
+
+    private fun drainPendingRequests(close: Boolean) {
+        while (true) {
+            val state = pending.value
+            val next = PendingState(closed = state.closed || close)
+            if (pending.compareAndSet(state, next)) {
+                state.requests.values.forEach { it.cancel() }
+                return
+            }
+        }
+    }
+
+    private fun removePendingRequest(
+        id: RequestId,
+        expected: CompletableDeferred<JsonElement?>? = null,
+    ): CompletableDeferred<JsonElement?>? {
+        while (true) {
+            val state = pending.value
+            val deferred = state.requests[id] ?: return null
+            if (expected != null && deferred !== expected) return null
+            if (pending.compareAndSet(state, state.copy(requests = state.requests - id))) return deferred
+        }
+    }
+
+    internal fun cancelRegisteredRequest(id: RequestId, expected: CompletableDeferred<JsonElement?>) {
+        removePendingRequest(id, expected)?.cancel()
     }
 
     /**
      * Cancel a pending request.
      */
     public suspend fun cancelPendingRequest(id: RequestId) {
-        mutex
-            .withLock {
-                pendingRequests.remove(id)
-            }?.cancel()
+        removePendingRequest(id)?.cancel()
     }
 
     private suspend fun handleRequest(request: RequestMessage): ResponseMessage {
@@ -280,10 +314,7 @@ public class Dispatcher(
 
     private suspend fun handleResponse(response: ResponseMessage) {
         val id = response.id ?: return
-        val deferred =
-            mutex.withLock {
-                pendingRequests.remove(id)
-            } ?: return
+        val deferred = removePendingRequest(id) ?: return
 
         if (response.error != null) {
             deferred.completeExceptionally(
