@@ -1,18 +1,30 @@
 package io.jsonrpc4k.transport
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 class StreamCleanupTest {
     @Test
@@ -90,6 +102,55 @@ class StreamCleanupTest {
             assertTrue(fatal.suppressed.any { it === ordinary })
             assertEquals(1, input.closes.get())
             assertEquals(1, output.closes.get())
+        }
+
+    @Test
+    fun `concurrent close waits for cleanup and disposes each stream once`() =
+        runBlocking {
+            val entered = CompletableDeferred<Unit>()
+            val release = CountDownLatch(1)
+            val input = CloseInput {
+                entered.complete(Unit)
+                check(release.await(10, TimeUnit.SECONDS)) { "Close gate was not released" }
+            }
+            val output = CloseOutput()
+            val transport = StreamTransport(input, output)
+            try {
+                val first = async { transport.close() }
+                withTimeout(5.seconds) { entered.await() }
+                val second = async(start = CoroutineStart.UNDISPATCHED) { transport.close() }
+                assertFalse(second.isCompleted)
+                release.countDown()
+                withTimeout(5.seconds) {
+                    first.await()
+                    second.await()
+                }
+                assertEquals(1, input.closes.get())
+                assertEquals(1, output.closes.get())
+            } finally {
+                release.countDown()
+            }
+        }
+
+    @Test
+    fun `socket disposal after EOF closes the actual connection`() =
+        runBlocking {
+            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { listener ->
+                val accepted = async(Dispatchers.IO) { listener.accept() }
+                val transport = SocketTransport.connect("127.0.0.1", listener.localPort)
+                try {
+                    withTimeout(5.seconds) { accepted.await() }.use { peer ->
+                        peer.soTimeout = 5_000
+                        peer.shutdownOutput()
+                        assertTrue(withTimeout(5.seconds) { transport.incoming.toList() }.isEmpty())
+                        transport.close()
+                        assertFalse(transport.isConnected)
+                        assertEquals(-1, withContext(Dispatchers.IO) { peer.getInputStream().read() })
+                    }
+                } finally {
+                    transport.close()
+                }
+            }
         }
 
     private fun Throwable.hasCause(original: Throwable): Boolean =
