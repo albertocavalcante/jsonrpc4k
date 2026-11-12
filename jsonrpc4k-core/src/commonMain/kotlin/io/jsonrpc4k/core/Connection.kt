@@ -375,6 +375,9 @@ public class Connection(
     /**
      * Feed incoming data from the transport.
      * This will decode messages and dispatch them to handlers.
+     * In bounded mode, cancellation after admission starts fails the connection because the
+     * remainder of the supplied data cannot safely be replayed. Cancellation while waiting
+     * for admission does not consume data or fail the connection.
      */
     public suspend fun receive(data: ByteArray): Unit =
         coroutineScope {

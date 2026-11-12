@@ -57,6 +57,39 @@ class BoundedDispatchTest {
         }
 
     @Test
+    fun `caller cancellation after admission fails connection to prevent stream corruption`() =
+        runTest {
+            val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
+            val connection = Connection(policy, scope = CoroutineScope(backgroundScope.coroutineContext + parent))
+            val frame = codec.encode(ResponseMessage.success(RequestId.of(42), JsonPrimitive("ok")))
+            val batch = ByteArray(frame.size * 1000) { frame[it % frame.size] }
+            val receive = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.receive(batch) }
+            assertFalse(receive.isCompleted)
+            receive.cancel()
+            withTimeout(1.seconds) { receive.join() }
+            assertIs<ConnectionState.Failed>(connection.state.value)
+            assertFailsWith<kotlinx.coroutines.CancellationException> { connection.receive(frame) }
+            assertTrue(parent.isActive)
+            parent.cancel()
+        }
+
+    @Test
+    fun `caller cancellation while awaiting admission leaves connection open`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val frame = codec.encode(ResponseMessage.success(RequestId.of(42), JsonPrimitive("ok")))
+            val batch = ByteArray(frame.size * 1000) { frame[it % frame.size] }
+            val first = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.receive(batch) }
+            val waiting = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.receive(frame) }
+            assertFalse(waiting.isCompleted)
+            waiting.cancel()
+            withTimeout(1.seconds) { waiting.join() }
+            withTimeout(1.seconds) { first.await() }
+            assertEquals(ConnectionState.Open, connection.state.value)
+            connection.close()
+        }
+
+    @Test
     fun `close cancels owned handlers without cancelling parent or sibling`() =
         runTest {
             val parent = SupervisorJob(backgroundScope.coroutineContext[Job])

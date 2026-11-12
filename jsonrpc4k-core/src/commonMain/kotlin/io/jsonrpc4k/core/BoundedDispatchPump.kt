@@ -8,6 +8,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -15,6 +17,7 @@ import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
@@ -96,16 +99,23 @@ internal class BoundedDispatchPump(
     }
 
     suspend fun receive(data: ByteArray) {
+        var admitted = false
         try {
             admission.withLock {
+                admitted = true
                 var offset = 0
                 while (offset < data.size) {
                     val end = minOf(data.size, offset + minOf(data.size - offset, INPUT_SLICE_SIZE))
-                    for (message in decoder.feed(data.copyOfRange(offset, end))) admit(message)
+                    for (message in decoder.feed(data.copyOfRange(offset, end))) {
+                        currentCoroutineContext().ensureActive()
+                        admit(message)
+                    }
                     offset = end
+                    if (offset < data.size) yield()
                 }
             }
         } catch (cancelled: CancellationException) {
+            if (admitted && connectionJob.isActive) output.fail(cancelled)
             throw cancelled
         } catch (failure: Throwable) {
             output.fail(failure)
