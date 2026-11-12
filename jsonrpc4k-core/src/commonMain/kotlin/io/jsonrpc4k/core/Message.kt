@@ -13,7 +13,11 @@ import kotlinx.serialization.json.JsonContentPolymorphicSerializer
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -117,7 +121,7 @@ public data class RequestMessage(
  * A JSON-RPC 2.0 response message.
  */
 @OptIn(ExperimentalSerializationApi::class)
-@Serializable
+@Serializable(with = ResponseMessageSerializer::class)
 public data class ResponseMessage(
     /**
      * The request id.
@@ -158,6 +162,49 @@ public data class ResponseMessage(
             id: RequestId?,
             error: ResponseError,
         ): ResponseMessage = ResponseMessage(id = id, error = error)
+    }
+}
+
+@Serializable
+private data class ResponseFields(
+    val id: RequestId?,
+    val result: JsonElement? = null,
+    val error: ResponseError? = null,
+    val jsonrpc: String = JSONRPC_VERSION,
+)
+
+/** Serializes the mutually exclusive success and error response shapes. */
+public object ResponseMessageSerializer : KSerializer<ResponseMessage> {
+    override val descriptor: SerialDescriptor = ResponseFields.serializer().descriptor
+
+    override fun serialize(
+        encoder: Encoder,
+        value: ResponseMessage,
+    ) {
+        require(value.error == null || value.result == null) { "Response cannot have both result and error" }
+        val jsonEncoder = encoder as JsonEncoder
+        val fields = mutableMapOf<String, JsonElement>()
+        fields["jsonrpc"] = JsonPrimitive(value.jsonrpc)
+        fields["id"] = value.id?.let { jsonEncoder.json.encodeToJsonElement(RequestIdSerializer, it) } ?: JsonNull
+        if (value.error == null) {
+            fields["result"] = value.result ?: JsonNull
+        } else {
+            fields["error"] = jsonEncoder.json.encodeToJsonElement(ResponseError.serializer(), value.error)
+        }
+        jsonEncoder.encodeJsonElement(JsonObject(fields))
+    }
+
+    override fun deserialize(decoder: Decoder): ResponseMessage {
+        val jsonDecoder = decoder as JsonDecoder
+        val element = jsonDecoder.decodeJsonElement()
+        val obj = element.jsonObject
+        require("id" in obj) { "Response must have an id" }
+        require(("result" in obj) xor ("error" in obj)) { "Response must have exactly one of result and error" }
+        require(obj["error"] != JsonNull) { "Response error cannot be null" }
+        require("method" !in obj) { "Response cannot have a method" }
+        require(obj["jsonrpc"] == JsonPrimitive(JSONRPC_VERSION)) { "Invalid or missing jsonrpc version" }
+        val fields = jsonDecoder.json.decodeFromJsonElement(ResponseFields.serializer(), element)
+        return ResponseMessage(fields.id, fields.result, fields.error, fields.jsonrpc)
     }
 }
 
@@ -311,9 +358,12 @@ public object MessageSerializer : JsonContentPolymorphicSerializer<Message>(Mess
         require(jsonrpcVersion != null) { "Missing required jsonrpc field" }
         require(jsonrpcVersion == JSONRPC_VERSION) { "Invalid jsonrpc version: $jsonrpcVersion (expected $JSONRPC_VERSION)" }
 
-        // Validate that response doesn't have both result and error
+        // Validate response members before selecting the request or response serializer.
         require(!("result" in jsonObject && "error" in jsonObject)) {
             "Response cannot have both result and error"
+        }
+        require(!("method" in jsonObject && ("result" in jsonObject || "error" in jsonObject))) {
+            "Request cannot have response members"
         }
 
         return when {

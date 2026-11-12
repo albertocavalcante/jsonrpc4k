@@ -249,6 +249,57 @@ class MessageTest {
     // ===== ResponseMessage Tests =====
 
     @Test
+    fun `response envelopes match independent wire fixtures`() {
+        val codec = JsonRpcCodec.Default
+        val fixtures =
+            listOf(
+                ResponseMessage.success(RequestId.of(1), null) to """{"jsonrpc":"2.0","id":1,"result":null}""",
+                ResponseMessage.success(RequestId.of("a"), JsonPrimitive(42)) to
+                    """{"jsonrpc":"2.0","id":"a","result":42}""",
+                ResponseMessage.error(null, ResponseError.parseError("Parse error")) to
+                    """{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}""",
+            )
+        fixtures.forEach { (message, fixture) ->
+            json.parseToJsonElement(codec.encodeToJson(message)) shouldBe json.parseToJsonElement(fixture)
+            codec.decodeFromJson(fixture).shouldBeInstanceOf<ResponseMessage>()
+        }
+    }
+
+    @Test
+    fun `malformed response envelopes are rejected`() {
+        val fixtures =
+            listOf(
+                """{"jsonrpc":"2.0","id":1}""",
+                """{"jsonrpc":"2.0","result":1}""",
+                """{"jsonrpc":"2.0","id":1,"result":1,"error":{"code":-32603,"message":"error"}}""",
+                """{"jsonrpc":"2.0","id":1,"error":null}""",
+                """{"jsonrpc":"2.0","id":1,"method":"test","result":1}""",
+            )
+        fixtures.forEach { fixture ->
+            assertFailsWith<Exception>(fixture) { JsonRpcCodec.Default.decodeFromJson(fixture) }
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `response shape is preserved with alternate JSON settings and direct serializer`() {
+        val configured =
+            Json {
+                encodeDefaults = true
+                explicitNulls = false
+            }
+        val success = ResponseMessage.success(RequestId.of(1), null)
+        val error = ResponseMessage.error(null, ResponseError.parseError("Parse error"))
+        configured.parseToJsonElement(configured.encodeToString(ResponseMessage.serializer(), success)) shouldBe
+            json.parseToJsonElement("""{"jsonrpc":"2.0","id":1,"result":null}""")
+        configured.parseToJsonElement(configured.encodeToString(ResponseMessage.serializer(), error)) shouldBe
+            json.parseToJsonElement("""{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}""")
+        assertFailsWith<Exception> {
+            configured.decodeFromString(ResponseMessage.serializer(), """{"jsonrpc":"2.0","id":1}""")
+        }
+    }
+
+    @Test
     fun `ResponseMessage with result`() {
         val response =
             ResponseMessage.success(
