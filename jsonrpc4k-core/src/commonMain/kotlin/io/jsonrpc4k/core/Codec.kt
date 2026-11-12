@@ -1,5 +1,6 @@
 package io.jsonrpc4k.core
 
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 
 /**
@@ -15,6 +16,9 @@ import kotlinx.serialization.json.Json
 public class JsonRpcCodec(
     private val json: Json = defaultJson,
 ) {
+    @OptIn(ExperimentalSerializationApi::class)
+    internal val allowsComments: Boolean get() = json.configuration.allowComments
+
     /**
      * Encode a message to wire format with Content-Length header.
      */
@@ -92,6 +96,13 @@ public class JsonRpcCodec(
 public class JsonRpcMessageDecoder(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
 ) {
+    private var limits: InboundResourceLimits? = null
+    private var lastDecodedLength = 0
+
+    internal constructor(codec: JsonRpcCodec, limits: InboundResourceLimits) : this(codec) {
+        this.limits = limits
+    }
+
     private var byteBuffer = ByteArray(0)
     private var byteBufferSize = 0
     private var expectedContentLength: Int? = null
@@ -120,6 +131,28 @@ public class JsonRpcMessageDecoder(
                 drainMessages(messages)
             }
             return messages
+        } catch (cause: Exception) {
+            reset()
+            failure = cause
+            throw cause
+        }
+    }
+
+    /** Processes each completed frame before decoding the next one. */
+    internal suspend fun feedEach(
+        data: ByteArray,
+        accept: suspend (Message, Int) -> Unit,
+    ) {
+        failure?.let { throw it }
+        try {
+            var offset = 0
+            while (offset < data.size) {
+                offset += appendChunk(data, offset)
+                while (true) {
+                    val message = tryDecodeOne() ?: break
+                    accept(message, lastDecodedLength)
+                }
+            }
         } catch (cause: Exception) {
             reset()
             failure = cause
@@ -200,12 +233,14 @@ public class JsonRpcMessageDecoder(
 
         // Extract and decode the message
         val jsonContentBytes = byteBuffer.copyOfRange(0, contentLength)
+        limits?.let { JsonNestingGuard(it.maxJsonNesting, codec.allowsComments).check(jsonContentBytes) }
         val jsonContent = jsonContentBytes.decodeToString()
         consumeFromFront(contentLength)
 
         // Reset state for next message
         expectedContentLength = null
         headersParsed = false
+        lastDecodedLength = contentLength
 
         return codec.decodeFromJson(jsonContent)
     }
@@ -224,6 +259,11 @@ public class JsonRpcMessageDecoder(
 
         val headerSection = byteBuffer.copyOfRange(0, headerEndIndex).decodeToString()
         expectedContentLength = parseHeaderLength(headerSection)
+        limits?.let {
+            if (checkNotNull(expectedContentLength) > it.maxFrameBodyBytes) {
+                throw JsonRpcProtocolException("Frame body exceeds ${it.maxFrameBodyBytes} bytes")
+            }
+        }
         consumeFromFront(headerEndIndex + delimiterBytes.size)
         headersParsed = true
         return true
