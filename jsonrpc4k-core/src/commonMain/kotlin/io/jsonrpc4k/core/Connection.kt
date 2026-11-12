@@ -60,6 +60,7 @@ public class Connection(
     private var decoder = JsonRpcMessageDecoder(codec)
     private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
     private var boundedPump: BoundedDispatchPump? = null
+    private var boundedOutgoing: BoundedOutgoing? = null
     internal val retainedApplicationBytes: Int get() = boundedPump?.retainedApplicationBytes ?: 0
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
@@ -96,6 +97,37 @@ public class Connection(
         installBoundedPump(policy, scope, limits)
     }
 
+    /**
+     * Creates a bounded connection with fixed compact default JSON and outbound limits.
+     * No custom codec is accepted by this overload. See [OutboundResourceLimits] for the
+     * retained-byte boundary and the direct-collector reentrancy restriction.
+     */
+    public constructor(
+        policy: BoundedDispatchPolicy,
+        inboundLimits: InboundResourceLimits,
+        outboundLimits: OutboundResourceLimits,
+        scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
+        notificationErrorHandler: NotificationErrorHandler? = null,
+    ) : this(JsonRpcCodec.Default, JsonRpcCodec.defaultJson, scope, notificationErrorHandler) {
+        decoder = JsonRpcMessageDecoder(JsonRpcCodec.Default, inboundLimits)
+        boundedOutgoing =
+            BoundedOutgoing(
+                outboundLimits,
+                fail = { cause -> boundedPump?.outputInterrupted(cause) },
+                haltIngress = {
+                    boundedPump?.close()
+                    dispatcher.pending.close()
+                },
+                parentActive = { scope.coroutineContext[Job]?.isActive != false },
+                parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
+            )
+        installBoundedPump(policy, scope, inboundLimits)
+        if (!connectionJob.isActive) {
+            boundedPump?.close()
+            boundedOutgoing?.close(IllegalStateException("Connection closed"))
+        }
+    }
+
     private fun installBoundedPump(
         policy: BoundedDispatchPolicy,
         scope: CoroutineScope,
@@ -110,26 +142,42 @@ public class Connection(
                 limits = limits,
                 output =
                     object : DispatchOutput {
+                        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
+
                         override suspend fun send(
                             response: ResponseMessage,
                             onDequeued: () -> Unit,
                         ) {
-                            outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                            val bounded = boundedOutgoing
+                            if (bounded != null) {
+                                bounded.send(response, onDequeued)
+                            } else {
+                                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                            }
                         }
 
                         override fun offer(
                             response: ResponseMessage,
                             onDequeued: (() -> Unit)?,
-                        ): Boolean = outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
+                        ): OfferResult =
+                            boundedOutgoing?.offer(response, onDequeued)
+                                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
+                                    OfferResult.ACCEPTED
+                                } else {
+                                    OfferResult.REJECTED
+                                }
 
                         override fun fail(cause: Throwable) {
                             if (scope.coroutineContext[Job]?.isActive == false) {
-                                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                                 return
                             }
+                            if (boundedOutgoing?.claimFailure(cause) == false) return
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
+                                outgoingDrain.fail(cause)
                                 boundedPump?.close()
                                 dispatcher.pending.close()
+                                boundedOutgoing?.close(cause)
                                 outgoingMessages.cancel()
                                 connectionJob.cancel()
                             }
@@ -141,7 +189,7 @@ public class Connection(
     init {
         cancellationSignal.invokeOnCompletion {
             if (!connectionJob.isActive) {
-                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                 boundedPump?.close()
                 dispatcher.pending.close()
                 outgoingMessages.cancel()
@@ -161,6 +209,36 @@ public class Connection(
         flow {
             outgoingDrain.acquireCollector()
             try {
+                val bounded = boundedOutgoing
+                if (bounded != null) {
+                    for (item in bounded.items) {
+                        try {
+                            when (item) {
+                                is BoundedOutgoing.Item.Frame -> {
+                                    item.onDequeued?.invoke()
+                                    emit(item.bytes)
+                                }
+                                is BoundedOutgoing.Item.Barrier -> item.completion.complete(Unit)
+                            }
+                        } catch (cause: Throwable) {
+                            // Fail admission before releasing this frame's capacity.
+                            if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                                bounded.resolveCollectorLoss(cause)
+                                boundedPump?.outputInterrupted(cause)
+                            } else {
+                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
+                            }
+                            val observed = mutableState.value
+                            if (observed !is ConnectionState.Open) {
+                                outgoingDrain.fail((observed as? ConnectionState.Failed)?.cause ?: cause)
+                            }
+                            throw cause
+                        } finally {
+                            item.lease.release()
+                        }
+                    }
+                    return@flow
+                }
                 for (item in outgoingMessages) {
                     when (item) {
                         is OutgoingItem.Frame -> {
@@ -172,9 +250,15 @@ public class Connection(
                 }
             } catch (cause: Throwable) {
                 // Cancellation can remove a queued item before control reaches the loop body.
-                outgoingDrain.fail(cause)
                 if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                    boundedOutgoing?.resolveCollectorLoss(cause)
                     boundedPump?.outputInterrupted(cause)
+                } else {
+                    transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
+                }
+                val observed = mutableState.value
+                if (boundedOutgoing == null || observed !is ConnectionState.Open) {
+                    outgoingDrain.fail((observed as? ConnectionState.Failed)?.cause ?: cause)
                 }
                 throw cause
             } finally {
@@ -193,10 +277,15 @@ public class Connection(
     public suspend fun flushOutgoing() {
         val completion = CompletableDeferred<Unit>(connectionJob)
         try {
-            outgoingDrain.register(completion)
-            select<Unit> {
-                outgoingMessages.onSend(OutgoingItem.Barrier(completion)) { }
-                completion.onAwait { }
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.barrier(completion, outgoingDrain)
+            } else {
+                outgoingDrain.register(completion)
+                select<Unit> {
+                    outgoingMessages.onSend(OutgoingItem.Barrier(completion)) { }
+                    completion.onAwait { }
+                }
             }
             completion.await()
         } finally {
@@ -291,23 +380,47 @@ public class Connection(
     }
 
     /**
-     * Send a request and await the response.
+     * Send a request and await the response. For an outbound-limited connection, the timeout
+     * includes waiting for outbound admission; legacy connections start it after enqueue.
      */
     public suspend fun <R> request(
         method: String,
         params: JsonElement?,
         timeout: Duration = 30.seconds,
     ): JsonElement? {
+        val bounded = boundedOutgoing
+        if (bounded != null) {
+            val result =
+                withTimeoutOrNull(timeout) {
+                    val (id, deferred) =
+                        bounded.withProducer {
+                            val requestId = RequestId.of(requestIds.next())
+                            val waiter = dispatcher.registerPendingRequest(requestId)
+                            try {
+                                bounded.sendRegistered(RequestMessage(id = requestId, method = method, params = params))
+                                requestId to waiter
+                            } catch (cause: Throwable) {
+                                dispatcher.pending.cancel(requestId, waiter)
+                                throw cause
+                            }
+                        }
+                    try {
+                        CompletedResponse(deferred.await())
+                    } finally {
+                        dispatcher.pending.cancel(id, deferred)
+                    }
+                }
+            if (result == null) requestTimedOut(method)
+            return result.value
+        }
+
         val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
-
         val deferred = dispatcher.registerPendingRequest(id)
         return try {
             outgoingMessages.send(OutgoingItem.Frame(request))
             val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
-            if (result == null) {
-                throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
-            }
+            if (result == null) requestTimedOut(method)
             result.value
         } finally {
             dispatcher.pending.cancel(id, deferred)
@@ -360,7 +473,8 @@ public class Connection(
         params: JsonElement?,
     ) {
         val notification = NotificationMessage(method = method, params = params)
-        outgoingMessages.send(OutgoingItem.Frame(notification))
+        val bounded = boundedOutgoing
+        if (bounded != null) bounded.send(notification) else outgoingMessages.send(OutgoingItem.Frame(notification))
     }
 
     /**
@@ -434,7 +548,7 @@ public class Connection(
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
-        mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+        transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
         boundedPump?.close()
         dispatcher.pending.close()
         outgoingMessages.cancel()
@@ -448,3 +562,15 @@ private class RequestIds {
 
     suspend fun next(): Long = mutex.withLock { ++value }
 }
+
+private fun transitionClosed(
+    state: MutableStateFlow<ConnectionState>,
+    outgoing: BoundedOutgoing?,
+    drain: OutgoingDrain,
+) {
+    val claimed = outgoing?.closeNormally()
+    val terminal = if (claimed == null) ConnectionState.Closed else ConnectionState.Failed(claimed)
+    if (state.compareAndSet(ConnectionState.Open, terminal) && claimed != null) drain.fail(claimed)
+}
+
+private fun requestTimedOut(method: String): Nothing = throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
