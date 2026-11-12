@@ -7,7 +7,7 @@ package io.jsonrpc4k.core
  * objects, typed conversion and downstream buffering are outside the retained-byte budget.
  * A direct collector must not await a reentrant send on this connection: its own frame can
  * hold the capacity needed by that send. Flush markers consume ordinary outstanding slots.
- * Ordinary producers are admitted in mutex-acquisition order. Control frames can bypass a
+ * Waiting ordinary producers use a FIFO admission queue, subject to cancellation. Control frames can bypass a
  * waiting ordinary producer or flush; a flush covers frames already accepted before its marker,
  * not concurrent sends that have not yet been accepted. At most [maxPendingProducers] ordinary
  * producers may wait for admission; additional callers fail immediately. Producer slots are

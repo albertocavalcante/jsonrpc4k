@@ -4,8 +4,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.selects.select
-import kotlinx.coroutines.sync.Mutex
 
 /** All accepted items own a slot until delivered or discarded, including in-flight emits. */
 internal class BoundedOutgoing(
@@ -42,7 +40,7 @@ internal class BoundedOutgoing(
 
     private val state = MutableStateFlow(State())
     private val ended = CompletableDeferred<Unit>()
-    private val admission = Mutex()
+    private val admission = OutboundAdmission(ended, fail)
     private val encoder = BoundedMessageEncoder(limits.maxFrameWireBytes, limits.maxNodes, limits.maxJsonNesting)
     val items = Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { item ->
         // A promptly-cancelled receive may lose its assigned item before the collector catches
@@ -145,16 +143,13 @@ internal class BoundedOutgoing(
     }
 
     private suspend fun <T> admitted(block: suspend () -> T): T {
-        select<Unit> {
-            admission.onLock { }
-            ended.onAwait { }
-        }
+        admission.acquire()
         try {
             val current = state.value
             (current.failure ?: current.terminalClaim)?.let { throw it }
             return block()
         } finally {
-            admission.unlock()
+            admission.release()
         }
     }
 
@@ -167,8 +162,9 @@ internal class BoundedOutgoing(
                 if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
                 old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
             } else {
-                if (old.ordinaryCount == limits.maxOutstandingFrames) return null
-                if (bytes > limits.maxRetainedWireBytes - old.ordinaryBytes) return null
+                val noSlot = old.ordinaryCount == limits.maxOutstandingFrames
+                val overBudget = bytes > limits.maxRetainedWireBytes - old.ordinaryBytes
+                if (noSlot || overBudget) return null
                 old.copy(ordinaryCount = old.ordinaryCount + 1, ordinaryBytes = old.ordinaryBytes + bytes)
             }
             if (state.compareAndSet(old, next)) {
