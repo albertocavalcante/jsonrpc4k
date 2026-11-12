@@ -9,28 +9,40 @@ plugins {
 
 kotlin { jvmToolchain(17) }
 
-val java16Probe = configurations.create("java16Probe") {
-    isCanBeConsumed = false
-    isCanBeResolved = true
-    attributes {
-        attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
-        attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
-        attribute(TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 16)
+val modules = listOf("jsonrpc4k-core", "jsonrpc4k-core-jvm", "jsonrpc4k-transport", "jsonrpc4k-transport-jvm")
+val java16Probes = modules.associateWith { module ->
+    configurations.create("java16-$module") {
+        isCanBeConsumed = false
+        isCanBeResolved = true
+        attributes {
+            attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
+            attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
+            attribute(TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 16)
+        }
     }
 }
 
 dependencies {
     implementation("io.github.albertocavalcante:jsonrpc4k-core:${System.getenv("FIXTURE_VERSION")}")
     implementation("io.github.albertocavalcante:jsonrpc4k-transport:${System.getenv("FIXTURE_VERSION")}")
-    add(java16Probe.name, "io.github.albertocavalcante:jsonrpc4k-core:${System.getenv("FIXTURE_VERSION")}")
+    implementation("io.github.albertocavalcante:jsonrpc4k-core-jvm:${System.getenv("FIXTURE_VERSION")}")
+    implementation("io.github.albertocavalcante:jsonrpc4k-transport-jvm:${System.getenv("FIXTURE_VERSION")}")
+    java16Probes.forEach { (module, configuration) ->
+        add(configuration.name, "io.github.albertocavalcante:$module:${System.getenv("FIXTURE_VERSION")}")
+    }
 }
 
 application { mainClass = "MainKt" }
 
 tasks.register("verifyJava16Rejected") {
     doLast {
-        check(runCatching { java16Probe.resolve() }.isFailure) {
-            "A Java 16 consumer unexpectedly resolved the Java 17 artifact"
+        java16Probes.forEach { (module, configuration) ->
+            val failure = runCatching { configuration.resolve() }.exceptionOrNull()
+                ?: error("A Java 16 consumer unexpectedly resolved $module")
+            val details = failure.stackTraceToString()
+            check("No matching variant" in details && module in details && "16" in details) {
+                "Java 16 probe failed for an unrelated reason: $details"
+            }
         }
     }
 }
