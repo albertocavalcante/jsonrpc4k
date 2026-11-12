@@ -158,7 +158,7 @@ public class Connection(
                         override fun fail(cause: Throwable) {
                             if (boundedOutgoing?.claimFailure(cause) == false) return
                             if (scope.coroutineContext[Job]?.isActive == false) {
-                                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                                transitionClosed()
                                 return
                             }
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
@@ -177,10 +177,9 @@ public class Connection(
     init {
         cancellationSignal.invokeOnCompletion {
             if (!connectionJob.isActive) {
-                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                transitionClosed()
                 boundedPump?.close()
                 dispatcher.pending.close()
-                boundedOutgoing?.close(IllegalStateException("Connection closed"))
                 outgoingMessages.cancel()
             }
         }
@@ -215,10 +214,12 @@ public class Connection(
                                 bounded.resolveCollectorLoss(cause)
                                 boundedPump?.outputInterrupted(cause)
                             } else {
-                                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
-                                bounded.close(IllegalStateException("Connection closed"))
+                                transitionClosed()
                             }
-                            outgoingDrain.fail(cause)
+                            val observed = mutableState.value
+                            if (observed !is ConnectionState.Open) {
+                                outgoingDrain.fail((observed as? ConnectionState.Failed)?.cause ?: cause)
+                            }
                             throw cause
                         } finally {
                             item.lease.release()
@@ -241,9 +242,12 @@ public class Connection(
                     boundedOutgoing?.resolveCollectorLoss(cause)
                     boundedPump?.outputInterrupted(cause)
                 } else {
-                    boundedOutgoing?.close(IllegalStateException("Connection closed"))
+                    transitionClosed()
                 }
-                outgoingDrain.fail(cause)
+                val observed = mutableState.value
+                if (boundedOutgoing == null || observed !is ConnectionState.Open) {
+                    outgoingDrain.fail((observed as? ConnectionState.Failed)?.cause ?: cause)
+                }
                 throw cause
             } finally {
                 outgoingDrain.releaseCollector()
@@ -372,24 +376,37 @@ public class Connection(
         params: JsonElement?,
         timeout: Duration = 30.seconds,
     ): JsonElement? {
+        val bounded = boundedOutgoing
+        if (bounded != null) {
+            val result = withTimeoutOrNull(timeout) {
+                val (id, deferred) = bounded.withProducer {
+                    val requestId = RequestId.of(requestIds.next())
+                    val waiter = dispatcher.registerPendingRequest(requestId)
+                    try {
+                        bounded.sendRegistered(RequestMessage(id = requestId, method = method, params = params))
+                        requestId to waiter
+                    } catch (cause: Throwable) {
+                        dispatcher.pending.cancel(requestId, waiter)
+                        throw cause
+                    }
+                }
+                try {
+                    CompletedResponse(deferred.await())
+                } finally {
+                    dispatcher.pending.cancel(id, deferred)
+                }
+            }
+            if (result == null) throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+            return result.value
+        }
+
         val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
-
         val deferred = dispatcher.registerPendingRequest(id)
         return try {
-            val bounded = boundedOutgoing
-            val result = if (bounded != null) {
-                withTimeoutOrNull(timeout) {
-                    bounded.send(request)
-                    CompletedResponse(deferred.await())
-                }
-            } else {
-                outgoingMessages.send(OutgoingItem.Frame(request))
-                withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
-            }
-            if (result == null) {
-                throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
-            }
+            outgoingMessages.send(OutgoingItem.Frame(request))
+            val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
+            if (result == null) throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
             result.value
         } finally {
             dispatcher.pending.cancel(id, deferred)
@@ -513,14 +530,21 @@ public class Connection(
         receive(data.encodeToByteArray())
     }
 
+    private fun transitionClosed() {
+        val claimed = boundedOutgoing?.closeNormally()
+        val terminal = if (claimed == null) ConnectionState.Closed else ConnectionState.Failed(claimed)
+        if (mutableState.compareAndSet(ConnectionState.Open, terminal) && claimed != null) {
+            outgoingDrain.fail(claimed)
+        }
+    }
+
     /**
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
-        mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+        transitionClosed()
         boundedPump?.close()
         dispatcher.pending.close()
-        boundedOutgoing?.close(IllegalStateException("Connection closed"))
         outgoingMessages.cancel()
         connectionJob.cancel()
     }

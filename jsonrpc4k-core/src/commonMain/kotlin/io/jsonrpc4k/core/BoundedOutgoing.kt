@@ -62,6 +62,20 @@ internal class BoundedOutgoing(
         }
     })
 
+    fun closeNormally(): Throwable? {
+        while (true) {
+            val old = state.value
+            if (old.failure != null) return old.terminalClaim
+            val cause = old.terminalClaim
+            val closed = cause ?: IllegalStateException("Connection closed")
+            if (state.compareAndSet(old, old.copy(failure = closed))) {
+                ended.completeExceptionally(closed)
+                items.cancel()
+                return cause
+            }
+        }
+    }
+
     fun close(cause: Throwable) {
         while (true) {
             val old = state.value
@@ -115,27 +129,34 @@ internal class BoundedOutgoing(
 
     private fun beginProducer() {
         mutate { s ->
-            s.failure?.let { throw it }
+            (s.failure ?: s.terminalClaim)?.let { throw it }
             check(s.producers < limits.maxPendingProducers) { "Outbound producer limit exceeded" }
             s.copy(producers = s.producers + 1)
         }
     }
 
-    private suspend fun <T> admitted(block: suspend () -> T): T {
+    suspend fun <T> withProducer(block: suspend () -> T): T {
         beginProducer()
         try {
-            select<Unit> {
-                admission.onLock { }
-                ended.onAwait { }
-            }
-            try {
-                state.value.failure?.let { throw it }
-                return block()
-            } finally {
-                admission.unlock()
-            }
+            val open = state.first { !it.deliveryLost || it.failure != null }
+            (open.failure ?: open.terminalClaim)?.let { throw it }
+            return block()
         } finally {
             mutate { it.copy(producers = it.producers - 1) }
+        }
+    }
+
+    private suspend fun <T> admitted(block: suspend () -> T): T {
+        select<Unit> {
+            admission.onLock { }
+            ended.onAwait { }
+        }
+        try {
+            val current = state.value
+            (current.failure ?: current.terminalClaim)?.let { throw it }
+            return block()
+        } finally {
+            admission.unlock()
         }
     }
 
@@ -178,14 +199,20 @@ internal class BoundedOutgoing(
         }
     }
 
-    suspend fun send(message: Message, onDequeued: (() -> Unit)? = null) = admitted {
+    suspend fun sendRegistered(message: Message, onDequeued: (() -> Unit)? = null) = admitted {
         val bytes = encoder.encode(message)
         transfer(Item.Frame(bytes, onDequeued, reserveOrdinary(bytes.size)))
     }
 
-    suspend fun barrier(completion: CompletableDeferred<Unit>, drain: OutgoingDrain) = admitted {
-        drain.register(completion)
-        transfer(Item.Barrier(completion, reserveOrdinary(0)))
+    suspend fun send(message: Message, onDequeued: (() -> Unit)? = null) = withProducer {
+        sendRegistered(message, onDequeued)
+    }
+
+    suspend fun barrier(completion: CompletableDeferred<Unit>, drain: OutgoingDrain) = withProducer {
+        admitted {
+            drain.register(completion)
+            transfer(Item.Barrier(completion, reserveOrdinary(0)))
+        }
     }
 
     private fun beginControl(): Boolean {

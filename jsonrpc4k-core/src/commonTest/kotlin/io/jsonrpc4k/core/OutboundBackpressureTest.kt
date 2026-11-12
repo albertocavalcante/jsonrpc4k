@@ -365,4 +365,60 @@ class OutboundBackpressureTest {
         assertSame(original, failed.cause)
     }
 
+
+    @Test
+    fun `reentrant close observes an already claimed control failure`() = runTest {
+        var selected: Throwable? = null
+        var reported: Throwable? = null
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        lateinit var queue: BoundedOutgoing
+        queue = BoundedOutgoing(
+            limits,
+            haltIngress = {
+                assertFalse(queue.claimFailure(IllegalStateException("later collector failure")))
+                selected = queue.closeNormally()
+            },
+            fail = { reported = it },
+        )
+        val response = ResponseMessage.error(RequestId.of(10), ResponseError.requestCancelled())
+        assertEquals(OfferResult.ACCEPTED, queue.offer(response, null))
+        assertEquals(OfferResult.REJECTED, queue.offer(response, null))
+        assertSame(reported, selected)
+        assertTrue(selected is IllegalStateException)
+        assertEquals(0, queue.outstandingCount)
+    }
+
+    @Test
+    fun `normal close resolves pending delivery loss without a failure claim`() = runTest {
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        val queue = BoundedOutgoing(limits) { throw it }
+        val receiver = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { queue.items.receive() }
+        queue.send(NotificationMessage("assigned"))
+        receiver.cancel()
+        runCurrent()
+        assertEquals(null, queue.closeNormally())
+        assertFalse(queue.claimFailure(IllegalStateException("late collector failure")))
+    }
+
+
+    @Test
+    fun `producer limit applies before pending request registration`() = runTest {
+        val connection = Connection(
+            BoundedDispatchPolicy(1, 2),
+            InboundResourceLimits(65536, 32, 65536),
+            OutboundResourceLimits(65536, 65536, 1, 1, 65536, 2, 10000, 32),
+        )
+        connection.notify("first", null)
+        val waiting = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            connection.request<JsonElement>("waiting", null)
+        }
+        assertEquals(1, connection.dispatcher.pending.count)
+        assertTrue(runCatching { connection.request<JsonElement>("excess", null) }.isFailure)
+        assertEquals(1, connection.dispatcher.pending.count)
+        waiting.cancel()
+        runCurrent()
+        assertEquals(0, connection.dispatcher.pending.count)
+        connection.close()
+    }
+
 }
