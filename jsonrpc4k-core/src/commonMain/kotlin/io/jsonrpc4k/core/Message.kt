@@ -177,7 +177,10 @@ private data class ResponseFields(
 public object ResponseMessageSerializer : KSerializer<ResponseMessage> {
     override val descriptor: SerialDescriptor = ResponseFields.serializer().descriptor
 
-    override fun serialize(encoder: Encoder, value: ResponseMessage) {
+    override fun serialize(
+        encoder: Encoder,
+        value: ResponseMessage,
+    ) {
         require(value.error == null || value.result == null) { "Response cannot have both result and error" }
         val jsonEncoder = encoder as JsonEncoder
         val fields = mutableMapOf<String, JsonElement>()
