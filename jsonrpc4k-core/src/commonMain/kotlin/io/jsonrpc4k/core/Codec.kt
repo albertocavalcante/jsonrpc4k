@@ -56,6 +56,9 @@ public class JsonRpcCodec(
     public companion object {
         public const val CONTENT_LENGTH_HEADER: String = "Content-Length:"
         public const val MAX_CONTENT_LENGTH: Int = 100 * 1024 * 1024 // 100 MB
+
+        /** Maximum header bytes, including the four-byte CRLF CRLF delimiter. */
+        public const val MAX_HEADER_LENGTH: Int = 16 * 1024
         public const val HEADER_DELIMITER: String = "\r\n\r\n"
         public const val LINE_DELIMITER: String = "\r\n"
 
@@ -83,6 +86,8 @@ public class JsonRpcCodec(
  *
  * Note: Content-Length specifies the number of bytes, not characters.
  * This decoder maintains a byte buffer to correctly handle multi-byte UTF-8 characters.
+ * Header and content limits apply per frame, including when a feed contains multiple frames.
+ * A framing or decoding failure is terminal until [reset] starts a new stream.
  */
 public class JsonRpcMessageDecoder(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
@@ -91,10 +96,13 @@ public class JsonRpcMessageDecoder(
     private var byteBufferSize = 0
     private var expectedContentLength: Int? = null
     private var headersParsed = false
+    private var headerSearchOffset = 0
+    private var failure: Exception? = null
 
     /**
      * Feed data into the decoder.
      * Returns a list of complete messages that were decoded.
+     * A framing or decoding failure is terminal until [reset] starts a new stream.
      */
     public fun feed(data: String): List<Message> = feed(data.encodeToByteArray())
 
@@ -103,25 +111,53 @@ public class JsonRpcMessageDecoder(
      * Returns a list of complete messages that were decoded.
      */
     public fun feed(data: ByteArray): List<Message> {
-        ensureCapacity(byteBufferSize + data.size)
-        data.copyInto(byteBuffer, byteBufferSize)
-        byteBufferSize += data.size
-        return drainMessages()
+        failure?.let { throw it }
+        try {
+            val messages = mutableListOf<Message>()
+            var offset = 0
+            while (offset < data.size) {
+                val remainingCapacity =
+                    if (headersParsed) {
+                        checkNotNull(expectedContentLength) - byteBufferSize
+                    } else {
+                        JsonRpcCodec.MAX_HEADER_LENGTH - byteBufferSize
+                    }
+                if (remainingCapacity <= 0) {
+                    throw JsonRpcProtocolException("Header exceeds ${JsonRpcCodec.MAX_HEADER_LENGTH} bytes")
+                }
+                val count = minOf(data.size - offset, remainingCapacity)
+                ensureCapacity(byteBufferSize + count)
+                data.copyInto(byteBuffer, byteBufferSize, offset, offset + count)
+                byteBufferSize += count
+                offset += count
+                drainMessages(messages)
+            }
+            return messages
+        } catch (cause: Exception) {
+            reset()
+            failure = cause
+            throw cause
+        }
     }
 
     /**
-     * Reset the decoder state.
+     * Reset the decoder state for a new stream.
+     * After failure, the caller must discard the old stream; this does not resynchronize it.
      */
     public fun reset() {
         byteBuffer = ByteArray(0)
         byteBufferSize = 0
         expectedContentLength = null
         headersParsed = false
+        headerSearchOffset = 0
+        failure = null
     }
 
     private fun ensureCapacity(minCapacity: Int) {
         if (minCapacity <= byteBuffer.size) return
-        val newCapacity = maxOf(minCapacity, byteBuffer.size * 2, DEFAULT_BUFFER_CAPACITY)
+        val newCapacity =
+            maxOf(minCapacity, byteBuffer.size * 2, DEFAULT_BUFFER_CAPACITY)
+                .coerceAtMost(JsonRpcCodec.MAX_CONTENT_LENGTH)
         val newBuffer = ByteArray(newCapacity)
         byteBuffer.copyInto(newBuffer, 0, 0, byteBufferSize)
         byteBuffer = newBuffer
@@ -129,6 +165,7 @@ public class JsonRpcMessageDecoder(
 
     private companion object {
         private const val DEFAULT_BUFFER_CAPACITY = 1024
+        private val headerDelimiterBytes = JsonRpcCodec.HEADER_DELIMITER.encodeToByteArray()
     }
 
     private fun consumeFromFront(count: Int) {
@@ -136,15 +173,11 @@ public class JsonRpcMessageDecoder(
         byteBufferSize -= count
     }
 
-    private fun drainMessages(): List<Message> {
-        val messages = mutableListOf<Message>()
-
+    private fun drainMessages(messages: MutableList<Message>) {
         while (true) {
             val message = tryDecodeOne() ?: break
             messages.add(message)
         }
-
-        return messages
     }
 
     private fun tryDecodeOne(): Message? {
@@ -171,21 +204,29 @@ public class JsonRpcMessageDecoder(
     }
 
     private fun tryParseHeaders(): Boolean {
-        val delimiterBytes = JsonRpcCodec.HEADER_DELIMITER.encodeToByteArray()
-        val headerEndIndex = byteBuffer.indexOf(delimiterBytes, byteBufferSize)
-        if (headerEndIndex < 0) return false
+        val delimiterBytes = headerDelimiterBytes
+        val headerEndIndex = byteBuffer.indexOf(delimiterBytes, byteBufferSize, headerSearchOffset)
+        if (headerEndIndex < 0) {
+            if (byteBufferSize >= JsonRpcCodec.MAX_HEADER_LENGTH) {
+                throw JsonRpcProtocolException("Header exceeds ${JsonRpcCodec.MAX_HEADER_LENGTH} bytes")
+            }
+            headerSearchOffset = maxOf(0, byteBufferSize - delimiterBytes.size + 1)
+            return false
+        }
+        headerSearchOffset = 0
 
         val headerSection = byteBuffer.copyOfRange(0, headerEndIndex).decodeToString()
         val lines = headerSection.split(JsonRpcCodec.LINE_DELIMITER)
 
         var foundContentLength = false
         for (line in lines) {
-            val contentLength = codec.parseContentLength(line)
-            if (contentLength != null) {
+            if (line.trim().startsWith(JsonRpcCodec.CONTENT_LENGTH_HEADER, ignoreCase = true)) {
                 if (foundContentLength) {
                     throw JsonRpcProtocolException("Duplicate Content-Length header")
                 }
-                expectedContentLength = contentLength
+                expectedContentLength =
+                    codec.parseContentLength(line)
+                        ?: throw JsonRpcProtocolException("Invalid Content-Length header")
                 foundContentLength = true
             }
         }
@@ -207,11 +248,12 @@ public class JsonRpcMessageDecoder(
     private fun ByteArray.indexOf(
         pattern: ByteArray,
         limit: Int,
+        start: Int,
     ): Int {
         if (pattern.isEmpty()) return 0
         if (pattern.size > limit) return -1
 
-        outer@ for (i in 0..(limit - pattern.size)) {
+        outer@ for (i in start..(limit - pattern.size)) {
             for (j in pattern.indices) {
                 if (this[i + j] != pattern[j]) continue@outer
             }
