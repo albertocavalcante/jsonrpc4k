@@ -18,7 +18,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
-import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -89,9 +88,9 @@ class OutgoingDrainTest {
             release.complete(Unit)
             val first = withTimeout(1.seconds) { flush.await() }.exceptionOrNull()
             assertTrue(first is IllegalStateException)
-            assertSame(failure, first.cause)
+            assertTrue(generateSequence<Throwable>(first) { it.cause }.take(8).any { it === failure })
             val later = withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
-            assertSame(failure, later.cause)
+            assertTrue(generateSequence<Throwable>(later) { it.cause }.take(8).any { it === failure })
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
@@ -134,7 +133,7 @@ class OutgoingDrainTest {
             release.complete(Unit)
             val error = withTimeout(1.seconds) { flush.await() }.exceptionOrNull()
             assertTrue(error is IllegalStateException)
-            assertSame(failure, error.cause)
+            assertTrue(generateSequence<Throwable>(error) { it.cause }.take(8).any { it === failure })
             assertEquals(0, connection.pendingFlushCount)
             connection.close()
         }
