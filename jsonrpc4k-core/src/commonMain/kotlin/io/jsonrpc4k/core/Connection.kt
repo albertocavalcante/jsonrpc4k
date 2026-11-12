@@ -60,6 +60,7 @@ public class Connection(
     private var decoder = JsonRpcMessageDecoder(codec)
     private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
     private var boundedPump: BoundedDispatchPump? = null
+    private var boundedOutgoing: BoundedOutgoing? = null
     internal val retainedApplicationBytes: Int get() = boundedPump?.retainedApplicationBytes ?: 0
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
@@ -96,6 +97,27 @@ public class Connection(
         installBoundedPump(policy, scope, limits)
     }
 
+    /**
+     * Creates a bounded connection with fixed compact default JSON and outbound limits.
+     * No custom codec is accepted by this overload. See [OutboundResourceLimits] for the
+     * retained-byte boundary and the direct-collector reentrancy restriction.
+     */
+    public constructor(
+        policy: BoundedDispatchPolicy,
+        inboundLimits: InboundResourceLimits,
+        outboundLimits: OutboundResourceLimits,
+        scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
+        notificationErrorHandler: NotificationErrorHandler? = null,
+    ) : this(JsonRpcCodec.Default, JsonRpcCodec.defaultJson, scope, notificationErrorHandler) {
+        decoder = JsonRpcMessageDecoder(JsonRpcCodec.Default, inboundLimits)
+        boundedOutgoing = BoundedOutgoing(outboundLimits) { cause -> boundedPump?.outputInterrupted(cause) }
+        installBoundedPump(policy, scope, inboundLimits)
+        if (!connectionJob.isActive) {
+            boundedPump?.close()
+            boundedOutgoing?.close(IllegalStateException("Connection closed"))
+        }
+    }
+
     private fun installBoundedPump(
         policy: BoundedDispatchPolicy,
         scope: CoroutineScope,
@@ -114,13 +136,16 @@ public class Connection(
                             response: ResponseMessage,
                             onDequeued: () -> Unit,
                         ) {
-                            outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                            val bounded = boundedOutgoing
+                            if (bounded != null) bounded.send(response, onDequeued)
+                            else outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
                         }
 
                         override fun offer(
                             response: ResponseMessage,
                             onDequeued: (() -> Unit)?,
-                        ): Boolean = outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
+                        ): Boolean = boundedOutgoing?.offer(response, onDequeued)
+                            ?: outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
 
                         override fun fail(cause: Throwable) {
                             if (scope.coroutineContext[Job]?.isActive == false) {
@@ -130,6 +155,7 @@ public class Connection(
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
                                 boundedPump?.close()
                                 dispatcher.pending.close()
+                                boundedOutgoing?.close(cause)
                                 outgoingMessages.cancel()
                                 connectionJob.cancel()
                             }
@@ -144,6 +170,7 @@ public class Connection(
                 mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
                 boundedPump?.close()
                 dispatcher.pending.close()
+                boundedOutgoing?.close(IllegalStateException("Connection closed"))
                 outgoingMessages.cancel()
             }
         }
@@ -161,6 +188,30 @@ public class Connection(
         flow {
             outgoingDrain.acquireCollector()
             try {
+                val bounded = boundedOutgoing
+                if (bounded != null) {
+                    for (item in bounded.items) {
+                        try {
+                            when (item) {
+                                is BoundedOutgoing.Item.Frame -> {
+                                    item.onDequeued?.invoke()
+                                    emit(item.bytes)
+                                }
+                                is BoundedOutgoing.Item.Barrier -> item.completion.complete(Unit)
+                            }
+                        } catch (cause: Throwable) {
+                            // Fail admission before releasing this frame's capacity.
+                            outgoingDrain.fail(cause)
+                            if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                                boundedPump?.outputInterrupted(cause)
+                            }
+                            throw cause
+                        } finally {
+                            item.lease.release()
+                        }
+                    }
+                    return@flow
+                }
                 for (item in outgoingMessages) {
                     when (item) {
                         is OutgoingItem.Frame -> {
@@ -193,10 +244,15 @@ public class Connection(
     public suspend fun flushOutgoing() {
         val completion = CompletableDeferred<Unit>(connectionJob)
         try {
-            outgoingDrain.register(completion)
-            select<Unit> {
-                outgoingMessages.onSend(OutgoingItem.Barrier(completion)) { }
-                completion.onAwait { }
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.barrier(completion, outgoingDrain)
+            } else {
+                outgoingDrain.register(completion)
+                select<Unit> {
+                    outgoingMessages.onSend(OutgoingItem.Barrier(completion)) { }
+                    completion.onAwait { }
+                }
             }
             completion.await()
         } finally {
@@ -291,7 +347,8 @@ public class Connection(
     }
 
     /**
-     * Send a request and await the response.
+     * Send a request and await the response. For an outbound-limited connection, the timeout
+     * includes waiting for outbound admission; legacy connections start it after enqueue.
      */
     public suspend fun <R> request(
         method: String,
@@ -303,8 +360,16 @@ public class Connection(
 
         val deferred = dispatcher.registerPendingRequest(id)
         return try {
-            outgoingMessages.send(OutgoingItem.Frame(request))
-            val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
+            val bounded = boundedOutgoing
+            val result = if (bounded != null) {
+                withTimeoutOrNull(timeout) {
+                    bounded.send(request)
+                    CompletedResponse(deferred.await())
+                }
+            } else {
+                outgoingMessages.send(OutgoingItem.Frame(request))
+                withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
+            }
             if (result == null) {
                 throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
             }
@@ -360,7 +425,8 @@ public class Connection(
         params: JsonElement?,
     ) {
         val notification = NotificationMessage(method = method, params = params)
-        outgoingMessages.send(OutgoingItem.Frame(notification))
+        val bounded = boundedOutgoing
+        if (bounded != null) bounded.send(notification) else outgoingMessages.send(OutgoingItem.Frame(notification))
     }
 
     /**
@@ -437,6 +503,7 @@ public class Connection(
         mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
         boundedPump?.close()
         dispatcher.pending.close()
+        boundedOutgoing?.close(IllegalStateException("Connection closed"))
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
