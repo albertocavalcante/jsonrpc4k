@@ -159,7 +159,9 @@ internal class BoundedOutgoing(
             (old.failure ?: old.terminalClaim)?.let { throw it }
             if (old.deliveryLost) return null
             val next = if (control) {
-                if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
+                val noSlot = old.controlCount == limits.controlReserveFrames
+                val overBudget = bytes > limits.controlReserveBytes - old.controlBytes
+                if (noSlot || overBudget) return null
                 old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
             } else {
                 val noSlot = old.ordinaryCount == limits.maxOutstandingFrames
