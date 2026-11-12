@@ -2,6 +2,7 @@ package io.jsonrpc4k.core
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
@@ -186,6 +187,46 @@ class OutgoingDrainTest {
             assertTrue(first.await().decodeToString().contains("\"first\""))
             connection.notify("second", null)
             assertTrue(connection.outgoing.first().decodeToString().contains("\"second\""))
+            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            connection.close()
+        }
+
+    @Test
+    fun `cancelled receiving collector cannot make a later flush succeed`() =
+        runTest {
+            val connection = Connection(scope = backgroundScope)
+            val oldCollector = backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            connection.notify("possibly-lost", null)
+            oldCollector.cancelAndJoin()
+            backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
+            assertEquals(0, connection.pendingFlushCount)
+            connection.close()
+        }
+
+    @Test
+    fun `cancelled receiving collector fails a barrier removed before dispatch`() =
+        runTest {
+            val connection = Connection(scope = backgroundScope)
+            val collector = backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            val flush = async(start = CoroutineStart.UNDISPATCHED) { runCatching { connection.flushOutgoing() } }
+            assertEquals(1, connection.pendingFlushCount)
+            collector.cancelAndJoin()
+            assertTrue(flush.await().isFailure)
+            assertEquals(0, connection.pendingFlushCount)
+            connection.close()
+        }
+
+    @Test
+    fun `cancelled idle collector conservatively disables flush`() =
+        runTest {
+            val connection = Connection(scope = backgroundScope)
+            val collector = backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            collector.cancelAndJoin()
             assertFailsWith<IllegalStateException> { connection.flushOutgoing() }
             connection.close()
         }

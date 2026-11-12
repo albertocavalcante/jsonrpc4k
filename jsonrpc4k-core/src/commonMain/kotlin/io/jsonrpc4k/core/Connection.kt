@@ -73,17 +73,14 @@ public class Connection(
             try {
                 for (item in outgoingMessages) {
                     when (item) {
-                        is OutgoingItem.Frame -> {
-                            try {
-                                emit(codec.encode(item.message))
-                            } catch (cause: Throwable) {
-                                outgoingDrain.fail(cause)
-                                throw cause
-                            }
-                        }
+                        is OutgoingItem.Frame -> emit(codec.encode(item.message))
                         is OutgoingItem.Barrier -> item.completion.complete(Unit)
                     }
                 }
+            } catch (cause: Throwable) {
+                // Cancellation can remove a queued item before control reaches the loop body.
+                outgoingDrain.fail(cause)
+                throw cause
             } finally {
                 outgoingDrain.releaseCollector()
             }
@@ -93,8 +90,9 @@ public class Connection(
      * Waits until preceding frames have returned from the sequential outgoing collector.
      *
      * The collector must send each frame directly, without downstream buffering. This confirms
-     * only that its call returned, not that a peer received the data. If delivery is interrupted,
-     * this and later flushes fail. A flush without a collector waits until one consumes it.
+     * only that its call returned, not that a peer received the data. If a collector is interrupted,
+     * this and later flushes fail, even if the collector was idle. A flush with no collector waits
+     * until one consumes it or the connection closes.
      */
     public suspend fun flushOutgoing() {
         val completion = CompletableDeferred<Unit>(connectionJob)
