@@ -723,7 +723,7 @@ class ConnectionTest {
     @Test
     fun `request handler can await a reverse request over framed transport`() =
         runTest {
-            val server = Connection(scope = backgroundScope)
+            val server = Connection(BoundedDispatchPolicy(1, 8), scope = backgroundScope)
             val client = Connection(scope = backgroundScope)
             client.onRequest("reverse") { _: kotlinx.serialization.json.JsonElement? -> JsonPrimitive("client") }
             server.onRequest("forward") { _: kotlinx.serialization.json.JsonElement? ->

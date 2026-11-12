@@ -9,6 +9,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
@@ -44,6 +47,7 @@ public class Connection(
     private sealed interface OutgoingItem {
         data class Frame(
             val message: Message,
+            val onDequeued: (() -> Unit)? = null,
         ) : OutgoingItem
 
         data class Barrier(
@@ -56,11 +60,58 @@ public class Connection(
     internal val pendingFlushCount: Int get() = outgoingDrain.pendingCount
     private val decoder = JsonRpcMessageDecoder(codec)
     private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
+    private var boundedPump: BoundedDispatchPump? = null
+    private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
+    private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
+
+    /** The first terminal event and its cause, if any. */
+    public val state: StateFlow<ConnectionState> = mutableState.asStateFlow()
+
+    /**
+     * Creates a connection with explicitly bounded asynchronous application dispatch.
+     * In this mode [receive] returns after admission, before application handlers finish.
+     */
+    public constructor(
+        policy: BoundedDispatchPolicy,
+        codec: JsonRpcCodec = JsonRpcCodec.Default,
+        json: Json = JsonRpcCodec.defaultJson,
+        scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
+        notificationErrorHandler: NotificationErrorHandler? = null,
+    ) : this(codec, json, scope, notificationErrorHandler) {
+        boundedPump =
+            BoundedDispatchPump(
+                policy = policy,
+                decoder = decoder,
+                dispatcher = dispatcher,
+                scope = CoroutineScope(scope.coroutineContext + connectionJob),
+                output =
+                    object : DispatchOutput {
+                        override suspend fun send(response: ResponseMessage, onDequeued: () -> Unit) {
+                            outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                        }
+
+                        override fun offer(response: ResponseMessage): Boolean = outgoingMessages.trySend(OutgoingItem.Frame(response)).isSuccess
+
+                        override fun fail(cause: Throwable) {
+                            if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
+                                boundedPump?.close()
+                                dispatcher.pending.close()
+                                outgoingMessages.cancel()
+                                connectionJob.cancel()
+                            }
+                        }
+                    },
+            )
+    }
 
     init {
-        connectionJob.invokeOnCompletion {
-            dispatcher.pending.close()
-            outgoingMessages.cancel()
+        cancellationSignal.invokeOnCompletion {
+            if (!connectionJob.isActive) {
+                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                boundedPump?.close()
+                dispatcher.pending.close()
+                outgoingMessages.cancel()
+            }
         }
     }
 
@@ -78,7 +129,10 @@ public class Connection(
             try {
                 for (item in outgoingMessages) {
                     when (item) {
-                        is OutgoingItem.Frame -> emit(codec.encode(item.message))
+                        is OutgoingItem.Frame -> {
+                            item.onDequeued?.invoke()
+                            emit(codec.encode(item.message))
+                        }
                         is OutgoingItem.Barrier -> item.completion.complete(Unit)
                     }
                 }
@@ -310,9 +364,14 @@ public class Connection(
     public suspend fun receive(data: ByteArray): Unit =
         coroutineScope {
             val receiveJob = coroutineContext[Job]!!
-            val completion = connectionJob.invokeOnCompletion { receiveJob.cancel() }
+            val completion = cancellationSignal.invokeOnCompletion { receiveJob.cancel() }
             try {
                 ensureActive()
+                val pump = boundedPump
+                if (pump != null) {
+                    pump.receive(data)
+                    return@coroutineScope
+                }
                 // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
                 val messages = decoder.feed(data)
                 for (message in messages) {
@@ -337,8 +396,11 @@ public class Connection(
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
+        mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+        boundedPump?.close()
         dispatcher.pending.close()
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
+
 }
