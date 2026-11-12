@@ -94,35 +94,26 @@ internal class BoundedOutgoing(
     internal val outstandingCount: Int get() = state.value.ordinaryCount + state.value.controlCount
     internal val outstandingBytes: Int get() = state.value.ordinaryBytes + state.value.controlBytes
 
-    fun claimFailure(cause: Throwable): Boolean {
+    fun claimFailure(cause: Throwable, control: Boolean = false): Boolean {
         while (true) {
+            if (control && !parentActive()) {
+                parentInactive()
+                return false
+            }
             val current = state.value
             if (current.deliveryLost || current.failure != null) return false
             val claimed = current.terminalClaim
-            if (claimed != null) return claimed === cause
-            if (state.compareAndSet(current, current.copy(terminalClaim = cause))) return true
+            if (claimed != null) return !control && claimed === cause
+            if (state.compareAndSet(current, current.copy(terminalClaim = cause))) {
+                if (control) haltIngress()
+                return true
+            }
         }
     }
 
     fun resolveCollectorLoss(cause: Throwable) {
         mutate { s ->
             if (s.deliveryLost && s.failure == null) s.copy(deliveryLost = false, terminalClaim = cause) else s
-        }
-    }
-
-    private fun claimControlFailure(cause: Throwable): Boolean {
-        while (true) {
-            if (!parentActive()) {
-                parentInactive()
-                return false
-            }
-            val old = state.value
-            if (old.deliveryLost) return false
-            if (old.failure != null || old.terminalClaim != null) return false
-            if (state.compareAndSet(old, old.copy(terminalClaim = cause))) {
-                haltIngress()
-                return true
-            }
         }
     }
 
@@ -176,7 +167,9 @@ internal class BoundedOutgoing(
                 if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
                 old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
             } else {
-                if (old.ordinaryCount == limits.maxOutstandingFrames || bytes > limits.maxRetainedWireBytes - old.ordinaryBytes) return null
+                if (old.ordinaryCount == limits.maxOutstandingFrames ||
+                    bytes > limits.maxRetainedWireBytes - old.ordinaryBytes
+                ) return null
                 old.copy(ordinaryCount = old.ordinaryCount + 1, ordinaryBytes = old.ordinaryBytes + bytes)
             }
             if (state.compareAndSet(old, next)) {
@@ -256,14 +249,14 @@ internal class BoundedOutgoing(
                 }
             }
         } catch (cause: Exception) {
-            if (claimControlFailure(cause)) {
+            if (claimFailure(cause, control = true)) {
                 fail(cause)
                 OfferResult.REJECTED
             } else {
                 OfferResult.TERMINAL_TRANSITION
             }
         } catch (fatal: Throwable) {
-            if (claimControlFailure(fatal)) fail(fatal)
+            if (claimFailure(fatal, control = true)) fail(fatal)
             throw fatal
         }
 }
