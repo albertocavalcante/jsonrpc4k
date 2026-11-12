@@ -600,7 +600,7 @@ class OutboundBackpressureTest {
         runTest {
             val connection =
                 Connection(
-                    BoundedDispatchPolicy(1, 1),
+                    BoundedDispatchPolicy(1, 2),
                     InboundResourceLimits(65536, 32, 65536),
                     OutboundResourceLimits(65536, 65536, 1, 8, 65536, 1, 10000, 32),
                     scope = backgroundScope,
