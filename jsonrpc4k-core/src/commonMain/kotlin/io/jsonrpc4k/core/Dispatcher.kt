@@ -247,7 +247,10 @@ public class Dispatcher(
         }
     }
 
-    internal fun cancelRegisteredRequest(id: RequestId, expected: CompletableDeferred<JsonElement?>) {
+    internal fun cancelRegisteredRequest(
+        id: RequestId,
+        expected: CompletableDeferred<JsonElement?>,
+    ) {
         removePendingRequest(id, expected)?.cancel()
     }
 
