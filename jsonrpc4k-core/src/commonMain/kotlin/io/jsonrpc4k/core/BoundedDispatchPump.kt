@@ -249,7 +249,11 @@ internal class BoundedDispatchPump(
             if (incoming.compareAndSet(current, current.copy(requests = requests))) {
                 val token = entry.token
                 val offered = output.offer(ResponseMessage.error(id, ResponseError.requestCancelled()), removalCallback(id, token))
-                if (offered == OfferResult.REJECTED && connectionJob.isActive) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
+                if (offered == OfferResult.REJECTED &&
+                    connectionJob.isActive
+                ) {
+                    output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
+                }
                 entry.replyDone.complete(Unit)
                 entry.cancellation.complete(Unit)
                 entry.job?.cancel()

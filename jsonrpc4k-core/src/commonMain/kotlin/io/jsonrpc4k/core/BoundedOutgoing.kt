@@ -27,12 +27,24 @@ internal class BoundedOutgoing(
 
     internal sealed interface Item {
         val lease: Lease
-        data class Frame(val bytes: ByteArray, val onDequeued: (() -> Unit)?, override val lease: Lease) : Item
-        data class Barrier(val completion: CompletableDeferred<Unit>, override val lease: Lease) : Item
+
+        data class Frame(
+            val bytes: ByteArray,
+            val onDequeued: (() -> Unit)?,
+            override val lease: Lease,
+        ) : Item
+
+        data class Barrier(
+            val completion: CompletableDeferred<Unit>,
+            override val lease: Lease,
+        ) : Item
     }
 
-    internal class Lease(private val release: () -> Unit) {
+    internal class Lease(
+        private val release: () -> Unit,
+    ) {
         private val released = MutableStateFlow(false)
+
         fun release() {
             if (released.compareAndSet(false, true)) release.invoke()
         }
@@ -42,25 +54,26 @@ internal class BoundedOutgoing(
     private val ended = CompletableDeferred<Unit>()
     private val admission = OutboundAdmission(ended, fail)
     private val encoder = BoundedMessageEncoder(limits.maxFrameWireBytes, limits.maxNodes, limits.maxJsonNesting)
-    val items = Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { item ->
-        // A promptly-cancelled receive may lose its assigned item before the collector catches
-        // cancellation. Block new reservations until that catch installs the terminal cause.
-        var won = false
-        mutate { s ->
-            if (s.failure == null && s.terminalClaim == null && !s.deliveryLost) {
-                won = true
-                s.copy(deliveryLost = true)
-            } else {
-                won = false
-                s
+    val items =
+        Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { item ->
+            // A promptly-cancelled receive may lose its assigned item before the collector catches
+            // cancellation. Block new reservations until that catch installs the terminal cause.
+            var won = false
+            mutate { s ->
+                if (s.failure == null && s.terminalClaim == null && !s.deliveryLost) {
+                    won = true
+                    s.copy(deliveryLost = true)
+                } else {
+                    won = false
+                    s
+                }
             }
-        }
-        try {
-            if (won) haltIngress()
-        } finally {
-            item.lease.release()
-        }
-    })
+            try {
+                if (won) haltIngress()
+            } finally {
+                item.lease.release()
+            }
+        })
 
     fun closeNormally(): Throwable? {
         while (true) {
@@ -92,7 +105,10 @@ internal class BoundedOutgoing(
     internal val outstandingCount: Int get() = state.value.ordinaryCount + state.value.controlCount
     internal val outstandingBytes: Int get() = state.value.ordinaryBytes + state.value.controlBytes
 
-    fun claimFailure(cause: Throwable, control: Boolean = false): Boolean {
+    fun claimFailure(
+        cause: Throwable,
+        control: Boolean = false,
+    ): Boolean {
         while (true) {
             if (control && !parentActive()) {
                 parentInactive()
@@ -153,27 +169,34 @@ internal class BoundedOutgoing(
         }
     }
 
-    private fun reserve(bytes: Int, control: Boolean): Lease? {
+    private fun reserve(
+        bytes: Int,
+        control: Boolean,
+    ): Lease? {
         while (true) {
             val old = state.value
             (old.failure ?: old.terminalClaim)?.let { throw it }
             if (old.deliveryLost) return null
-            val next = if (control) {
-                val noSlot = old.controlCount == limits.controlReserveFrames
-                val overBudget = bytes > limits.controlReserveBytes - old.controlBytes
-                if (noSlot || overBudget) return null
-                old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
-            } else {
-                val noSlot = old.ordinaryCount == limits.maxOutstandingFrames
-                val overBudget = bytes > limits.maxRetainedWireBytes - old.ordinaryBytes
-                if (noSlot || overBudget) return null
-                old.copy(ordinaryCount = old.ordinaryCount + 1, ordinaryBytes = old.ordinaryBytes + bytes)
-            }
+            val next =
+                if (control) {
+                    val noSlot = old.controlCount == limits.controlReserveFrames
+                    val overBudget = bytes > limits.controlReserveBytes - old.controlBytes
+                    if (noSlot || overBudget) return null
+                    old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
+                } else {
+                    val noSlot = old.ordinaryCount == limits.maxOutstandingFrames
+                    val overBudget = bytes > limits.maxRetainedWireBytes - old.ordinaryBytes
+                    if (noSlot || overBudget) return null
+                    old.copy(ordinaryCount = old.ordinaryCount + 1, ordinaryBytes = old.ordinaryBytes + bytes)
+                }
             if (state.compareAndSet(old, next)) {
                 return Lease {
                     mutate { s ->
-                        if (control) s.copy(controlCount = s.controlCount - 1, controlBytes = s.controlBytes - bytes)
-                        else s.copy(ordinaryCount = s.ordinaryCount - 1, ordinaryBytes = s.ordinaryBytes - bytes)
+                        if (control) {
+                            s.copy(controlCount = s.controlCount - 1, controlBytes = s.controlBytes - bytes)
+                        } else {
+                            s.copy(ordinaryCount = s.ordinaryCount - 1, ordinaryBytes = s.ordinaryBytes - bytes)
+                        }
                     }
                 }
             }
@@ -200,16 +223,25 @@ internal class BoundedOutgoing(
         }
     }
 
-    suspend fun sendRegistered(message: Message, onDequeued: (() -> Unit)? = null) = admitted {
+    suspend fun sendRegistered(
+        message: Message,
+        onDequeued: (() -> Unit)? = null,
+    ) = admitted {
         val bytes = encoder.encode(message)
         transfer(Item.Frame(bytes, onDequeued, reserveOrdinary(bytes.size)))
     }
 
-    suspend fun send(message: Message, onDequeued: (() -> Unit)? = null) = withProducer {
+    suspend fun send(
+        message: Message,
+        onDequeued: (() -> Unit)? = null,
+    ) = withProducer {
         sendRegistered(message, onDequeued)
     }
 
-    suspend fun barrier(completion: CompletableDeferred<Unit>, drain: OutgoingDrain) = withProducer {
+    suspend fun barrier(
+        completion: CompletableDeferred<Unit>,
+        drain: OutgoingDrain,
+    ) = withProducer {
         admitted {
             drain.register(completion)
             transfer(Item.Barrier(completion, reserveOrdinary(0)))
@@ -227,7 +259,10 @@ internal class BoundedOutgoing(
         }
     }
 
-    private fun encodeControl(message: Message, onDequeued: (() -> Unit)?): OfferResult {
+    private fun encodeControl(
+        message: Message,
+        onDequeued: (() -> Unit)?,
+    ): OfferResult {
         val bytes = encoder.encode(message)
         val lease = reserve(bytes.size, true)
         if (lease != null) {
@@ -238,7 +273,10 @@ internal class BoundedOutgoing(
         error("Outbound control capacity exceeded")
     }
 
-    fun offer(message: Message, onDequeued: (() -> Unit)?): OfferResult =
+    fun offer(
+        message: Message,
+        onDequeued: (() -> Unit)?,
+    ): OfferResult =
         try {
             if (!beginControl()) {
                 OfferResult.TERMINAL_TRANSITION

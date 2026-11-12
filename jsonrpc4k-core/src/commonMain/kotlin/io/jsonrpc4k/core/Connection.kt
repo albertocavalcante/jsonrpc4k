@@ -110,13 +110,17 @@ public class Connection(
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(JsonRpcCodec.Default, JsonRpcCodec.defaultJson, scope, notificationErrorHandler) {
         decoder = JsonRpcMessageDecoder(JsonRpcCodec.Default, inboundLimits)
-        boundedOutgoing = BoundedOutgoing(
-            outboundLimits,
-            fail = { cause -> boundedPump?.outputInterrupted(cause) },
-            haltIngress = { boundedPump?.close(); dispatcher.pending.close() },
-            parentActive = { scope.coroutineContext[Job]?.isActive != false },
-            parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
-        )
+        boundedOutgoing =
+            BoundedOutgoing(
+                outboundLimits,
+                fail = { cause -> boundedPump?.outputInterrupted(cause) },
+                haltIngress = {
+                    boundedPump?.close()
+                    dispatcher.pending.close()
+                },
+                parentActive = { scope.coroutineContext[Job]?.isActive != false },
+                parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
+            )
         installBoundedPump(policy, scope, inboundLimits)
         if (!connectionJob.isActive) {
             boundedPump?.close()
@@ -145,19 +149,23 @@ public class Connection(
                             onDequeued: () -> Unit,
                         ) {
                             val bounded = boundedOutgoing
-                            if (bounded != null) bounded.send(response, onDequeued)
-                            else outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                            if (bounded != null) {
+                                bounded.send(response, onDequeued)
+                            } else {
+                                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+                            }
                         }
 
                         override fun offer(
                             response: ResponseMessage,
                             onDequeued: (() -> Unit)?,
-                        ): OfferResult = boundedOutgoing?.offer(response, onDequeued)
-                            ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
-                                OfferResult.ACCEPTED
-                            } else {
-                                OfferResult.REJECTED
-                            }
+                        ): OfferResult =
+                            boundedOutgoing?.offer(response, onDequeued)
+                                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
+                                    OfferResult.ACCEPTED
+                                } else {
+                                    OfferResult.REJECTED
+                                }
 
                         override fun fail(cause: Throwable) {
                             if (scope.coroutineContext[Job]?.isActive == false) {
@@ -382,24 +390,26 @@ public class Connection(
     ): JsonElement? {
         val bounded = boundedOutgoing
         if (bounded != null) {
-            val result = withTimeoutOrNull(timeout) {
-                val (id, deferred) = bounded.withProducer {
-                    val requestId = RequestId.of(requestIds.next())
-                    val waiter = dispatcher.registerPendingRequest(requestId)
+            val result =
+                withTimeoutOrNull(timeout) {
+                    val (id, deferred) =
+                        bounded.withProducer {
+                            val requestId = RequestId.of(requestIds.next())
+                            val waiter = dispatcher.registerPendingRequest(requestId)
+                            try {
+                                bounded.sendRegistered(RequestMessage(id = requestId, method = method, params = params))
+                                requestId to waiter
+                            } catch (cause: Throwable) {
+                                dispatcher.pending.cancel(requestId, waiter)
+                                throw cause
+                            }
+                        }
                     try {
-                        bounded.sendRegistered(RequestMessage(id = requestId, method = method, params = params))
-                        requestId to waiter
-                    } catch (cause: Throwable) {
-                        dispatcher.pending.cancel(requestId, waiter)
-                        throw cause
+                        CompletedResponse(deferred.await())
+                    } finally {
+                        dispatcher.pending.cancel(id, deferred)
                     }
                 }
-                try {
-                    CompletedResponse(deferred.await())
-                } finally {
-                    dispatcher.pending.cancel(id, deferred)
-                }
-            }
             if (result == null) requestTimedOut(method)
             return result.value
         }
@@ -563,5 +573,4 @@ private fun transitionClosed(
     if (state.compareAndSet(ConnectionState.Open, terminal) && claimed != null) drain.fail(claimed)
 }
 
-private fun requestTimedOut(method: String): Nothing =
-    throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+private fun requestTimedOut(method: String): Nothing = throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
