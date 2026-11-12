@@ -99,10 +99,8 @@ internal class BoundedDispatchPump(
     }
 
     suspend fun receive(data: ByteArray) {
-        var admitted = false
-        try {
-            admission.withLock {
-                admitted = true
+        admission.withLock {
+            try {
                 var offset = 0
                 while (offset < data.size) {
                     val end = minOf(data.size, offset + minOf(data.size - offset, INPUT_SLICE_SIZE))
@@ -113,13 +111,13 @@ internal class BoundedDispatchPump(
                     offset = end
                     if (offset < data.size) yield()
                 }
+            } catch (cancelled: CancellationException) {
+                if (connectionJob.isActive) output.fail(cancelled)
+                throw cancelled
+            } catch (failure: Throwable) {
+                output.fail(failure)
+                throw failure
             }
-        } catch (cancelled: CancellationException) {
-            if (admitted && connectionJob.isActive) output.fail(cancelled)
-            throw cancelled
-        } catch (failure: Throwable) {
-            output.fail(failure)
-            throw failure
         }
     }
 

@@ -90,6 +90,32 @@ class BoundedDispatchTest {
         }
 
     @Test
+    fun `partial admission failure closes before a waiting receiver can dispatch`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val invoked = CompletableDeferred<Unit>()
+            connection.onRequest("later") { _: JsonElement? ->
+                invoked.complete(Unit)
+                null
+            }
+            val frame = codec.encode(ResponseMessage.success(RequestId.of(42), JsonPrimitive("ok")))
+            val batch = ByteArray(frame.size * 1000) { frame[it % frame.size] }
+            val first = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.receive(batch) }
+            val waiting =
+                backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+                    connection.receive(codec.encode(RequestMessage(RequestId.of(7), "later")))
+                }
+            first.cancel()
+            withTimeout(1.seconds) {
+                first.join()
+                waiting.join()
+            }
+            assertIs<ConnectionState.Failed>(connection.state.value)
+            assertTrue(waiting.isCancelled)
+            assertFalse(invoked.isCompleted)
+        }
+
+    @Test
     fun `close cancels owned handlers without cancelling parent or sibling`() =
         runTest {
             val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
