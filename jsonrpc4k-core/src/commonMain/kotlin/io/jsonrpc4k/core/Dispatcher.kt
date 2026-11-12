@@ -1,5 +1,7 @@
 package io.jsonrpc4k.core
 
+import kotlinx.collections.immutable.PersistentMap
+import kotlinx.collections.immutable.persistentHashMapOf
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -59,7 +61,7 @@ public fun interface NotificationErrorHandler {
 internal class PendingRequests {
     private data class State(
         val closed: Boolean = false,
-        val requests: Map<RequestId, CompletableDeferred<JsonElement?>> = emptyMap(),
+        val requests: PersistentMap<RequestId, CompletableDeferred<JsonElement?>> = persistentHashMapOf(),
     )
 
     private val state = MutableStateFlow(State())
@@ -71,7 +73,7 @@ internal class PendingRequests {
             val current = state.value
             check(!current.closed) { "Connection is closed" }
             check(id !in current.requests) { "Request ID is already pending: $id" }
-            if (state.compareAndSet(current, current.copy(requests = current.requests + (id to deferred)))) return deferred
+            if (state.compareAndSet(current, current.copy(requests = current.requests.put(id, deferred)))) return deferred
         }
     }
 
@@ -83,7 +85,7 @@ internal class PendingRequests {
             val current = state.value
             val deferred = current.requests[id] ?: return null
             if (expected != null && deferred !== expected) return null
-            if (state.compareAndSet(current, current.copy(requests = current.requests - id))) return deferred
+            if (state.compareAndSet(current, current.copy(requests = current.requests.remove(id)))) return deferred
         }
     }
 
