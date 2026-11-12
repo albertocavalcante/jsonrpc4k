@@ -249,6 +249,38 @@ class MessageTest {
     // ===== ResponseMessage Tests =====
 
     @Test
+    fun `response envelopes match independent wire fixtures`() {
+        val codec = JsonRpcCodec.Default
+        val fixtures =
+            listOf(
+                ResponseMessage.success(RequestId.of(1), null) to """{"jsonrpc":"2.0","id":1,"result":null}""",
+                ResponseMessage.success(RequestId.of("a"), JsonPrimitive(42)) to
+                    """{"jsonrpc":"2.0","id":"a","result":42}""",
+                ResponseMessage.error(null, ResponseError.parseError("Parse error")) to
+                    """{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}""",
+            )
+        fixtures.forEach { (message, fixture) ->
+            json.parseToJsonElement(codec.encodeToJson(message)) shouldBe json.parseToJsonElement(fixture)
+            codec.decodeFromJson(fixture).shouldBeInstanceOf<ResponseMessage>()
+        }
+    }
+
+    @Test
+    fun `malformed response envelopes are rejected`() {
+        val fixtures =
+            listOf(
+                """{"jsonrpc":"2.0","id":1}""",
+                """{"jsonrpc":"2.0","result":1}""",
+                """{"jsonrpc":"2.0","id":1,"result":1,"error":{"code":-32603,"message":"error"}}""",
+                """{"jsonrpc":"2.0","id":1,"error":null}""",
+                """{"jsonrpc":"2.0","id":1,"method":"test","result":1}""",
+            )
+        fixtures.forEach { fixture ->
+            assertFailsWith<Exception>(fixture) { JsonRpcCodec.Default.decodeFromJson(fixture) }
+        }
+    }
+
+    @Test
     fun `ResponseMessage with result`() {
         val response =
             ResponseMessage.success(
