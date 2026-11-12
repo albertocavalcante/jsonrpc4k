@@ -26,11 +26,17 @@ public data class OutboundResourceLimits(
     init {
         require(maxFrameWireBytes in 1..JsonRpcCodec.MAX_CONTENT_LENGTH)
         require(maxRetainedWireBytes in maxFrameWireBytes..JsonRpcCodec.MAX_CONTENT_LENGTH)
-        require(maxOutstandingFrames in 1..1024)
-        require(maxPendingProducers in 1..1024)
+        require(maxOutstandingFrames in 1..MAX_COUNT)
+        require(maxPendingProducers in 1..MAX_COUNT)
         require(controlReserveBytes in 1..JsonRpcCodec.MAX_CONTENT_LENGTH)
-        require(controlReserveFrames in 1..1024)
-        require(maxNodes in 1..1_000_000)
-        require(maxJsonNesting in 1..256)
+        require(controlReserveFrames in 1..MAX_COUNT)
+        require(maxNodes in 1..MAX_NODES)
+        require(maxJsonNesting in 1..MAX_DEPTH)
+    }
+
+    private companion object {
+        const val MAX_COUNT = 1024
+        const val MAX_NODES = 1_000_000
+        const val MAX_DEPTH = 256
     }
 }

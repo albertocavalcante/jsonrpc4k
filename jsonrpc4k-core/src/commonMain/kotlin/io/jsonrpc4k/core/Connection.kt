@@ -110,7 +110,11 @@ public class Connection(
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(JsonRpcCodec.Default, JsonRpcCodec.defaultJson, scope, notificationErrorHandler) {
         decoder = JsonRpcMessageDecoder(JsonRpcCodec.Default, inboundLimits)
-        boundedOutgoing = BoundedOutgoing(outboundLimits) { cause -> boundedPump?.outputInterrupted(cause) }
+        boundedOutgoing = BoundedOutgoing(
+            outboundLimits,
+            fail = { cause -> boundedPump?.outputInterrupted(cause) },
+            haltIngress = { boundedPump?.close(); dispatcher.pending.close() },
+        )
         installBoundedPump(policy, scope, inboundLimits)
         if (!connectionJob.isActive) {
             boundedPump?.close()
@@ -144,15 +148,21 @@ public class Connection(
                         override fun offer(
                             response: ResponseMessage,
                             onDequeued: (() -> Unit)?,
-                        ): Boolean = boundedOutgoing?.offer(response, onDequeued)
-                            ?: outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
+                        ): OfferResult = boundedOutgoing?.offer(response, onDequeued)
+                            ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
+                                OfferResult.ACCEPTED
+                            } else {
+                                OfferResult.REJECTED
+                            }
 
                         override fun fail(cause: Throwable) {
+                            if (boundedOutgoing?.claimFailure(cause) == false) return
                             if (scope.coroutineContext[Job]?.isActive == false) {
                                 mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
                                 return
                             }
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
+                                outgoingDrain.fail(cause)
                                 boundedPump?.close()
                                 dispatcher.pending.close()
                                 boundedOutgoing?.close(cause)
@@ -201,13 +211,14 @@ public class Connection(
                             }
                         } catch (cause: Throwable) {
                             // Fail admission before releasing this frame's capacity.
-                            outgoingDrain.fail(cause)
                             if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                                bounded.resolveCollectorLoss(cause)
                                 boundedPump?.outputInterrupted(cause)
                             } else {
                                 mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
                                 bounded.close(IllegalStateException("Connection closed"))
                             }
+                            outgoingDrain.fail(cause)
                             throw cause
                         } finally {
                             item.lease.release()
@@ -226,10 +237,13 @@ public class Connection(
                 }
             } catch (cause: Throwable) {
                 // Cancellation can remove a queued item before control reaches the loop body.
-                outgoingDrain.fail(cause)
                 if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                    boundedOutgoing?.resolveCollectorLoss(cause)
                     boundedPump?.outputInterrupted(cause)
+                } else {
+                    boundedOutgoing?.close(IllegalStateException("Connection closed"))
                 }
+                outgoingDrain.fail(cause)
                 throw cause
             } finally {
                 outgoingDrain.releaseCollector()

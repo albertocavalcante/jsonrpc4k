@@ -3,6 +3,7 @@ package io.jsonrpc4k.core
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
@@ -123,8 +124,8 @@ class OutboundBackpressureTest {
         val queue = BoundedOutgoing(limits) { failure = it }
         queue.send(NotificationMessage("ordinary"))
         val response = ResponseMessage.error(RequestId.of(1), ResponseError.requestCancelled())
-        assertTrue(queue.offer(response, null))
-        assertFalse(queue.offer(response, null))
+        assertEquals(OfferResult.ACCEPTED, queue.offer(response, null))
+        assertEquals(OfferResult.REJECTED, queue.offer(response, null))
         assertTrue(failure is IllegalStateException)
         val first = queue.items.receive()
         val second = queue.items.receive()
@@ -158,7 +159,7 @@ class OutboundBackpressureTest {
         val marker = CompletableDeferred<Unit>()
         val barrier = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { queue.barrier(marker, drain) }
         assertFalse(barrier.isCompleted)
-        assertTrue(queue.offer(ResponseMessage.error(RequestId.of(1), ResponseError.requestCancelled()), null))
+        assertEquals(OfferResult.ACCEPTED, queue.offer(ResponseMessage.error(RequestId.of(1), ResponseError.requestCancelled()), null))
         val first = queue.items.receive()
         first.lease.release()
         barrier.await()
@@ -265,8 +266,103 @@ class OutboundBackpressureTest {
         }
         runCurrent()
         assertFalse(waiter.isCompleted)
+        assertEquals(OfferResult.TERMINAL_TRANSITION, queue.offer(ResponseMessage.error(RequestId.of(7), ResponseError.requestCancelled()), null))
+        assertTrue(queue.items.tryReceive().isFailure)
         queue.close(IllegalStateException("collector interrupted"))
         assertTrue(withTimeout(1000) { waiter.await() }.isFailure)
+    }
+
+
+    @Test
+    fun `lost delivery wins control arbitration and preserves collector cause`() = runTest {
+        var halted = false
+        var failure: Throwable? = null
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        val queue = BoundedOutgoing(limits, haltIngress = { halted = true }, fail = { failure = it })
+        val receiver = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { queue.items.receive() }
+        queue.send(NotificationMessage("assigned"))
+        receiver.cancel()
+        runCurrent()
+        assertTrue(halted)
+        assertEquals(0, queue.outstandingCount)
+        assertEquals(0, queue.outstandingBytes)
+        assertEquals(OfferResult.TERMINAL_TRANSITION, queue.offer(ResponseMessage.error(RequestId.of(8), ResponseError.requestCancelled()), null))
+        assertEquals(null, failure)
+        val original = IllegalStateException("collector")
+        queue.resolveCollectorLoss(original)
+        assertTrue(queue.claimFailure(original))
+        assertFalse(queue.claimFailure(IllegalStateException("other")))
+        queue.close(original)
+    }
+
+    @Test
+    fun `control saturation wins before assigned receiver is cancelled`() = runTest {
+        var halted = false
+        var failure: Throwable? = null
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        val queue = BoundedOutgoing(limits, haltIngress = { halted = true }, fail = { failure = it })
+        val response = ResponseMessage.error(RequestId.of(9), ResponseError.requestCancelled())
+        val receiver = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { queue.items.receive() }
+        assertEquals(OfferResult.ACCEPTED, queue.offer(response, null))
+        assertEquals(OfferResult.REJECTED, queue.offer(response, null))
+        val winner = requireNotNull(failure)
+        assertTrue(halted)
+        halted = false
+        receiver.cancel()
+        runCurrent()
+        assertFalse(halted)
+        assertEquals(0, queue.outstandingCount)
+        assertEquals(0, queue.outstandingBytes)
+        assertTrue(queue.claimFailure(winner))
+        assertFalse(queue.claimFailure(IllegalStateException("collector")))
+        queue.close(winner)
+    }
+
+
+    @Test
+    fun `cancelled writer with assigned frame closes public connection`() = runTest {
+        val connection = connection()
+        val writer = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            connection.outgoing.collect { error("assigned frame must not be delivered") }
+        }
+        connection.notify("assigned", null)
+        writer.cancel()
+        runCurrent()
+        assertTrue(connection.state.value is ConnectionState.Failed)
+        assertTrue(runCatching { connection.notify("later", null) }.isFailure)
+        connection.close()
+    }
+
+
+    @Test
+    fun `flush waiter closing on failure cannot overwrite writer cause`() = runTest {
+        val connection = connection()
+        val entered = CompletableDeferred<Unit>()
+        val failWriter = CompletableDeferred<Unit>()
+        val original = IllegalStateException("writer failed")
+        val writer = backgroundScope.async {
+            runCatching {
+                connection.outgoing.collect {
+                    entered.complete(Unit)
+                    failWriter.await()
+                    throw original
+                }
+            }
+        }
+        connection.notify("first", null)
+        entered.await()
+        val flush = backgroundScope.async(Dispatchers.Unconfined) {
+            try {
+                runCatching { connection.flushOutgoing() }
+            } finally {
+                connection.close()
+            }
+        }
+        failWriter.complete(Unit)
+        withTimeout(1000) { writer.await(); flush.await() }
+        val failed = connection.state.value
+        assertTrue(failed is ConnectionState.Failed)
+        assertSame(original, failed.cause)
     }
 
 }

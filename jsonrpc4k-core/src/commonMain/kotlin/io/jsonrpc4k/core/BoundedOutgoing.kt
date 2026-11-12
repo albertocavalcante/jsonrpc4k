@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 /** All accepted items own a slot until delivered or discarded, including in-flight emits. */
 internal class BoundedOutgoing(
     private val limits: OutboundResourceLimits,
+    private val haltIngress: () -> Unit = {},
     private val fail: (Throwable) -> Unit,
 ) {
     private data class State(
@@ -20,6 +21,7 @@ internal class BoundedOutgoing(
         val producers: Int = 0,
         val controlEncoding: Boolean = false,
         val deliveryLost: Boolean = false,
+        val terminalClaim: Throwable? = null,
         val failure: Throwable? = null,
     )
 
@@ -43,8 +45,21 @@ internal class BoundedOutgoing(
     val items = Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { item ->
         // A promptly-cancelled receive may lose its assigned item before the collector catches
         // cancellation. Block new reservations until that catch installs the terminal cause.
-        mutate { s -> if (s.failure == null) s.copy(deliveryLost = true) else s }
-        item.lease.release()
+        var won = false
+        mutate { s ->
+            if (s.failure == null && s.terminalClaim == null && !s.deliveryLost) {
+                won = true
+                s.copy(deliveryLost = true)
+            } else {
+                won = false
+                s
+            }
+        }
+        try {
+            if (won) haltIngress()
+        } finally {
+            item.lease.release()
+        }
     })
 
     fun close(cause: Throwable) {
@@ -55,6 +70,37 @@ internal class BoundedOutgoing(
                 ended.completeExceptionally(cause)
                 items.cancel()
                 return
+            }
+        }
+    }
+
+    internal val outstandingCount: Int get() = state.value.ordinaryCount + state.value.controlCount
+    internal val outstandingBytes: Int get() = state.value.ordinaryBytes + state.value.controlBytes
+
+    fun claimFailure(cause: Throwable): Boolean {
+        while (true) {
+            val current = state.value
+            if (current.deliveryLost || current.failure != null) return false
+            val claimed = current.terminalClaim
+            if (claimed != null) return claimed === cause
+            if (state.compareAndSet(current, current.copy(terminalClaim = cause))) return true
+        }
+    }
+
+    fun resolveCollectorLoss(cause: Throwable) {
+        mutate { s ->
+            if (s.deliveryLost && s.failure == null) s.copy(deliveryLost = false, terminalClaim = cause) else s
+        }
+    }
+
+    private fun claimControlFailure(cause: Throwable): Boolean {
+        while (true) {
+            val old = state.value
+            if (old.deliveryLost) return false
+            if (old.failure != null || old.terminalClaim != null) return false
+            if (state.compareAndSet(old, old.copy(terminalClaim = cause))) {
+                haltIngress()
+                return true
             }
         }
     }
@@ -96,7 +142,7 @@ internal class BoundedOutgoing(
     private fun reserve(bytes: Int, control: Boolean): Lease? {
         while (true) {
             val old = state.value
-            old.failure?.let { throw it }
+            (old.failure ?: old.terminalClaim)?.let { throw it }
             if (old.deliveryLost) return null
             val next = if (control) {
                 if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
@@ -119,7 +165,7 @@ internal class BoundedOutgoing(
     private suspend fun reserveOrdinary(bytes: Int): Lease {
         while (true) {
             reserve(bytes, false)?.let { return it }
-            state.first { s -> s.failure != null || (!s.deliveryLost && s.ordinaryCount < limits.maxOutstandingFrames && bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes) }
+            state.first { s -> s.failure != null || s.terminalClaim != null || (!s.deliveryLost && s.ordinaryCount < limits.maxOutstandingFrames && bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes) }
         }
     }
 
@@ -127,7 +173,8 @@ internal class BoundedOutgoing(
         val result = items.trySend(item)
         if (result.isFailure) {
             item.lease.release()
-            throw state.value.failure ?: IllegalStateException("Outbound queue closed")
+            state.value.failure?.let { throw it }
+            error("Outbound queue closed")
         }
     }
 
@@ -141,26 +188,38 @@ internal class BoundedOutgoing(
         transfer(Item.Barrier(completion, reserveOrdinary(0)))
     }
 
-    fun offer(message: Message, onDequeued: (() -> Unit)?): Boolean {
+    private fun beginControl(): Boolean {
+        while (true) {
+            val old = state.value
+            (old.failure ?: old.terminalClaim)?.let { throw it }
+            // The collector is unwinding and owns the terminal cause.
+            if (old.deliveryLost) return false
+            check(!old.controlEncoding) { "Outbound control encoder busy" }
+            if (state.compareAndSet(old, old.copy(controlEncoding = true))) return true
+        }
+    }
+
+    fun offer(message: Message, onDequeued: (() -> Unit)?): OfferResult {
         try {
-            mutate { s ->
-                s.failure?.let { throw it }
-                check(!s.controlEncoding) { "Outbound control encoder busy" }
-                s.copy(controlEncoding = true)
-            }
+            if (!beginControl()) return OfferResult.TERMINAL_TRANSITION
             try {
                 val bytes = encoder.encode(message)
-                val lease = reserve(bytes.size, true) ?: error("Outbound control capacity exceeded")
+                val lease = reserve(bytes.size, true)
+                if (lease == null) {
+                    if (state.value.deliveryLost) return OfferResult.TERMINAL_TRANSITION
+                    error("Outbound control capacity exceeded")
+                }
                 transfer(Item.Frame(bytes, onDequeued, lease))
             } finally {
                 mutate { it.copy(controlEncoding = false) }
             }
-            return true
+            return OfferResult.ACCEPTED
         } catch (cause: Exception) {
+            if (!claimControlFailure(cause)) return OfferResult.TERMINAL_TRANSITION
             fail(cause)
-            return false
+            return OfferResult.REJECTED
         } catch (fatal: Throwable) {
-            fail(fatal)
+            if (claimControlFailure(fatal)) fail(fatal)
             throw fatal
         }
     }

@@ -21,6 +21,8 @@ import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
+internal enum class OfferResult { ACCEPTED, TERMINAL_TRANSITION, REJECTED }
+
 internal interface DispatchOutput {
     suspend fun send(
         response: ResponseMessage,
@@ -30,7 +32,7 @@ internal interface DispatchOutput {
     fun offer(
         response: ResponseMessage,
         onDequeued: (() -> Unit)? = null,
-    ): Boolean
+    ): OfferResult
 
     fun fail(cause: Throwable)
 }
@@ -227,7 +229,7 @@ internal class BoundedDispatchPump(
             if (!claimReply(message.id, token)) return
             val id = message.id
             val offered = output.offer(ResponseMessage.error(id, ResponseError(SERVER_BUSY, "Server busy")), removalCallback(id, token))
-            if (!offered) {
+            if (offered == OfferResult.REJECTED) {
                 throw JsonRpcProtocolException("Outgoing response queue is full")
             }
         }
@@ -244,7 +246,7 @@ internal class BoundedDispatchPump(
             if (incoming.compareAndSet(current, current.copy(requests = requests))) {
                 val token = entry.token
                 val offered = output.offer(ResponseMessage.error(id, ResponseError.requestCancelled()), removalCallback(id, token))
-                if (!offered && connectionJob.isActive) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
+                if (offered == OfferResult.REJECTED && connectionJob.isActive) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
                 entry.replyDone.complete(Unit)
                 entry.cancellation.complete(Unit)
                 entry.job?.cancel()
@@ -331,7 +333,7 @@ internal class BoundedDispatchPump(
             val id = event.message.id
             val token = event.token
             val offered = output.offer(ResponseMessage.error(id, ResponseError.requestCancelled()), removalCallback(id, token))
-            if (!offered) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
+            if (offered == OfferResult.REJECTED) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
             event.replyDone.complete(Unit)
         } else if (cause != null && cause !is CancellationException && connectionJob.isActive) {
             output.fail(cause)

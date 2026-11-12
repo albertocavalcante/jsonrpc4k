@@ -489,13 +489,13 @@ class BoundedDispatchTest {
                     override fun offer(
                         response: ResponseMessage,
                         onDequeued: (() -> Unit)?,
-                    ): Boolean {
+                    ): OfferResult {
                         release.complete(Unit)
                         drive()
                         assertFalse(notification.isCompleted)
                         offered.add(response)
                         onDequeued?.invoke()
-                        return true
+                        return OfferResult.ACCEPTED
                     }
 
                     override fun fail(cause: Throwable): Unit = throw cause
@@ -541,7 +541,7 @@ class BoundedDispatchTest {
                     override fun offer(
                         response: ResponseMessage,
                         onDequeued: (() -> Unit)?,
-                    ): Boolean = error("Unexpected control response: $response")
+                    ): OfferResult = error("Unexpected control response: $response")
 
                     override fun fail(cause: Throwable) {
                         terminal = cause
