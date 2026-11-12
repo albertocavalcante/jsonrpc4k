@@ -5,6 +5,10 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
@@ -47,6 +51,28 @@ private data class ConnectionAddResult(
 )
 
 class ConnectionTest {
+    @Test
+    fun `closing a connection preserves its caller scope`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            connection.close()
+            parent.isActive shouldBe true
+            parent.cancel()
+        }
+
+    @Test
+    fun `caller timeout remains cancellation rather than request timeout error`() =
+        runTest {
+            val connection = Connection()
+            assertFailsWith<TimeoutCancellationException> {
+                withTimeout(10.milliseconds) {
+                    connection.request<JsonPrimitive>("never", null)
+                }
+            }
+            connection.close()
+        }
+
     // ===== Request Handler Registration Tests =====
 
     @Test
