@@ -21,7 +21,7 @@ import kotlinx.serialization.json.JsonPrimitive
 internal interface DispatchOutput {
     suspend fun send(response: ResponseMessage, onDequeued: () -> Unit)
 
-    fun offer(response: ResponseMessage): Boolean
+    fun offer(response: ResponseMessage, onDequeued: (() -> Unit)? = null): Boolean
 
     fun fail(cause: Throwable)
 }
@@ -73,9 +73,14 @@ internal class BoundedDispatchPump(
         scope.launch {
             try {
                 schedule()
-            } catch (failure: Throwable) {
+            } catch (cancelled: CancellationException) {
+                if (connectionJob.isActive) output.fail(cancelled)
+                throw cancelled
+            } catch (failure: Exception) {
                 if (connectionJob.isActive) output.fail(failure)
-                if (failure !is Exception || failure is CancellationException) throw failure
+            } catch (fatal: Throwable) {
+                if (connectionJob.isActive) output.fail(fatal)
+                throw fatal
             }
         }
     }
@@ -95,6 +100,9 @@ internal class BoundedDispatchPump(
         } catch (failure: Exception) {
             output.fail(failure)
             throw failure
+        } catch (fatal: Throwable) {
+            output.fail(fatal)
+            throw fatal
         }
     }
 
@@ -111,6 +119,8 @@ internal class BoundedDispatchPump(
             }
         }
     }
+
+    fun outputInterrupted(cause: Throwable) = output.fail(cause)
 
     private suspend fun admit(message: Message) {
         when (message) {
@@ -144,8 +154,15 @@ internal class BoundedDispatchPump(
         val admitted = queueSlots.tryAcquire()
         if (!admitted || !queued.trySend(Event.Request(message, token, cancellation, replyDone)).isSuccess) {
             if (admitted) queueSlots.release()
-            remove(message.id, token)
-            if (connectionJob.isActive && !output.offer(ResponseMessage.error(message.id, ResponseError(-32000, "Server busy")))) {
+            if (!connectionJob.isActive) {
+                remove(message.id, token)
+                return
+            }
+            if (!claimReply(message.id, token)) return
+            val offered = output.offer(ResponseMessage.error(message.id, ResponseError(SERVER_BUSY, "Server busy"))) {
+                remove(message.id, token)
+            }
+            if (!offered) {
                 throw JsonRpcProtocolException("Outgoing response queue is full")
             }
         }
@@ -160,8 +177,7 @@ internal class BoundedDispatchPump(
             if (entry.replied) return
             val requests = current.requests.put(id, entry.copy(cancelled = true, replied = true))
             if (incoming.compareAndSet(current, current.copy(requests = requests))) {
-                val offered = output.offer(ResponseMessage.error(id, ResponseError.requestCancelled()))
-                if (offered) remove(id, entry.token)
+                val offered = output.offer(ResponseMessage.error(id, ResponseError.requestCancelled())) { remove(id, entry.token) }
                 if (!offered && connectionJob.isActive) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
                 entry.replyDone.complete(Unit)
                 entry.cancellation.complete(Unit)
@@ -183,54 +199,62 @@ internal class BoundedDispatchPump(
                     dispatcher.dispatch(event.message)
                 }
                 is Event.Request -> {
-                    val acquired = select<Boolean> {
-                        permits.onReceive { true }
-                        event.cancellation.onAwait { false }
-                    }
-                    queueSlots.release()
-                    if (!acquired) {
-                        remove(event.message.id, event.token)
-                        continue
-                    }
-                    val finalized = CompletableDeferred<Unit>()
-                    val worker = scope.launch(start = CoroutineStart.LAZY) {
-                        try {
-                            val response = checkNotNull(dispatcher.dispatch(event.message))
-                            if (claimReply(event.message.id, event.token)) {
-                                try {
-                                    output.send(response) { remove(event.message.id, event.token) }
-                                } finally {
-                                    event.replyDone.complete(Unit)
-                                }
-                            }
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (failure: Throwable) {
-                            if (connectionJob.isActive) output.fail(failure)
-                            if (failure !is Exception) throw failure
-                        }
-                    }
-                    worker.invokeOnCompletion { cause ->
-                        if (cause is CancellationException && connectionJob.isActive && claimReply(event.message.id, event.token)) {
-                            val offered = output.offer(ResponseMessage.error(event.message.id, ResponseError.requestCancelled()))
-                            if (!offered) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
-                            event.replyDone.complete(Unit)
-                        } else if (cause != null && cause !is CancellationException && connectionJob.isActive) {
-                            output.fail(cause)
-                            event.replyDone.complete(Unit)
-                        } else if (!connectionJob.isActive) {
-                            event.replyDone.complete(Unit)
-                        }
-                        event.replyDone.invokeOnCompletion {
-                            remove(event.message.id, event.token)
-                            permits.trySend(Unit)
-                            finalized.complete(Unit)
-                        }
-                    }
-                    running.add(Running(finalized))
-                    if (attach(event.message.id, event.token, worker)) worker.start() else worker.cancel()
+                    startRequest(event)?.let(running::add)
                 }
             }
+        }
+    }
+
+    private suspend fun startRequest(event: Event.Request): Running? {
+        val acquired = select<Boolean> {
+            permits.onReceive { true }
+            event.cancellation.onAwait { false }
+        }
+        queueSlots.release()
+        if (!acquired) return null
+        val finalized = CompletableDeferred<Unit>()
+        val worker = scope.launch(start = CoroutineStart.LAZY) { runRequest(event) }
+        worker.invokeOnCompletion { cause -> finishRequest(event, cause, finalized) }
+        if (attach(event.message.id, event.token, worker)) worker.start() else worker.cancel()
+        return Running(finalized)
+    }
+
+    private suspend fun runRequest(event: Event.Request) {
+        try {
+            val response = checkNotNull(dispatcher.dispatch(event.message))
+            if (claimReply(event.message.id, event.token)) {
+                try {
+                    output.send(response) { remove(event.message.id, event.token) }
+                } finally {
+                    event.replyDone.complete(Unit)
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            if (connectionJob.isActive) output.fail(failure)
+        } catch (fatal: Throwable) {
+            if (connectionJob.isActive) output.fail(fatal)
+            throw fatal
+        }
+    }
+
+    private fun finishRequest(event: Event.Request, cause: Throwable?, finalized: CompletableDeferred<Unit>) {
+        if (cause is CancellationException && connectionJob.isActive && claimReply(event.message.id, event.token)) {
+            val offered = output.offer(ResponseMessage.error(event.message.id, ResponseError.requestCancelled())) {
+                remove(event.message.id, event.token)
+            }
+            if (!offered) output.fail(JsonRpcProtocolException("Outgoing response queue is full"))
+            event.replyDone.complete(Unit)
+        } else if (cause != null && cause !is CancellationException && connectionJob.isActive) {
+            output.fail(cause)
+            event.replyDone.complete(Unit)
+        } else if (!connectionJob.isActive) {
+            event.replyDone.complete(Unit)
+        }
+        event.replyDone.invokeOnCompletion {
+            permits.trySend(Unit)
+            finalized.complete(Unit)
         }
     }
 
@@ -264,5 +288,6 @@ internal class BoundedDispatchPump(
 
     private companion object {
         const val INPUT_SLICE_SIZE = 16 * 1024
+        const val SERVER_BUSY = -32000
     }
 }

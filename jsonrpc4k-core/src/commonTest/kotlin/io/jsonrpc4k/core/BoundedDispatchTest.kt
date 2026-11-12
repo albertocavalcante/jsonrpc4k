@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -64,6 +65,70 @@ class BoundedDispatchTest {
             assertTrue(parent.isActive)
             assertTrue(sibling.isActive)
             parent.cancel()
+        }
+
+    @Test
+    fun `interrupted writer closes bounded connection and pending waiter without touching parent`() =
+        runTest {
+            val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
+            val sibling = Job(parent)
+            val connection = Connection(policy, scope = CoroutineScope(backgroundScope.coroutineContext + parent))
+            val writer = backgroundScope.launch { connection.outgoing.collect {} }
+            val outbound = backgroundScope.async { runCatching { connection.request<JsonElement>("outbound", null) } }
+            runCurrent()
+            assertFalse(outbound.isCompleted)
+            writer.cancel()
+            withTimeout(1.seconds) { writer.join() }
+            assertIs<ConnectionState.Failed>(connection.state.value)
+            assertTrue(withTimeout(1.seconds) { outbound.await() }.isFailure)
+            assertTrue(parent.isActive)
+            assertTrue(sibling.isActive)
+            parent.cancel()
+        }
+
+    @Test
+    fun `writer canceled after receiving a frame cannot strand its waiter`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val writer = backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            val outbound = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching { connection.request<JsonElement>("outbound", null) }
+            }
+            writer.cancel()
+            withTimeout(1.seconds) { writer.join() }
+            assertIs<ConnectionState.Failed>(connection.state.value)
+            assertTrue(withTimeout(1.seconds) { outbound.await() }.isFailure)
+        }
+
+    @Test
+    fun `rejected second writer does not terminate the active bounded writer`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val writer = backgroundScope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.outgoing.first() } }
+            assertEquals(ConnectionState.Open, connection.state.value)
+            connection.close()
+            withTimeout(1.seconds) { writer.join() }
+            assertEquals(ConnectionState.Closed, connection.state.value)
+        }
+
+    @Test
+    fun `first terminates opt in connection but leaves legacy connection open`() =
+        runTest {
+            val legacy = Connection(scope = backgroundScope)
+            val legacyFrame = backgroundScope.async { legacy.outgoing.first() }
+            legacy.notify("legacy", null)
+            withTimeout(1.seconds) { legacyFrame.await() }
+            assertEquals(ConnectionState.Open, legacy.state.value)
+            legacy.close()
+
+            val bounded = Connection(policy, scope = backgroundScope)
+            val boundedFrame = backgroundScope.async { bounded.outgoing.first() }
+            bounded.notify("bounded", null)
+            withTimeout(1.seconds) { boundedFrame.await() }
+            assertIs<ConnectionState.Failed>(bounded.state.value)
         }
 
     @Test
@@ -298,11 +363,12 @@ class BoundedDispatchTest {
                         offered.add(response)
                     }
 
-                    override fun offer(response: ResponseMessage): Boolean {
+                    override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean {
                         release.complete(Unit)
                         drive()
                         assertFalse(notification.isCompleted)
                         offered.add(response)
+                        onDequeued?.invoke()
                         return true
                     }
 
@@ -343,7 +409,8 @@ class BoundedDispatchTest {
                         }
                     }
 
-                    override fun offer(response: ResponseMessage): Boolean = true
+                    override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean =
+                        error("Unexpected control response: $response")
 
                     override fun fail(cause: Throwable) {
                         terminal = cause
@@ -404,6 +471,39 @@ class BoundedDispatchTest {
         }
 
     @Test
+    fun `buffered response keeps its ID active until dequeued`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val handled = CompletableDeferred<Unit>()
+            connection.onRequest("done") { _: JsonElement? -> handled.complete(Unit); JsonPrimitive("done") }
+            val id = RequestId.of(9)
+            connection.receive(codec.encode(RequestMessage(id, "done")))
+            withTimeout(1.seconds) { handled.await() }
+            runCurrent()
+            assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(RequestMessage(id, "done"))) }
+            val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
+            assertTrue(terminal.cause.message.orEmpty().contains("Duplicate"))
+        }
+
+    @Test
+    fun `response ID can be reused after the frame is dequeued`() =
+        runTest {
+            val connection = Connection(policy, scope = backgroundScope)
+            val frames = Channel<ByteArray>(Channel.UNLIMITED)
+            backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
+            connection.onRequest("done") { _: JsonElement? -> JsonPrimitive("done") }
+            val id = RequestId.of(9)
+            repeat(2) {
+                connection.receive(codec.encode(RequestMessage(id, "done")))
+                val response = assertIs<ResponseMessage>(decode(withTimeout(1.seconds) { frames.receive() }))
+                assertEquals(id, response.id)
+                assertEquals(JsonPrimitive("done"), response.result)
+            }
+            assertEquals(ConnectionState.Open, connection.state.value)
+            connection.close()
+        }
+
+    @Test
     fun `full queue rejects a request without blocking responses`() =
         runTest {
             val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
@@ -424,6 +524,44 @@ class BoundedDispatchTest {
             assertEquals(ConnectionState.Open, connection.state.value)
             release.complete(Unit)
             withTimeout(1.seconds) { repeat(2) { frames.receive() } }
+            connection.close()
+        }
+
+    @Test
+    fun `buffered busy response keeps its ID active until dequeued`() =
+        runTest {
+            val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
+            val entered = CompletableDeferred<Unit>()
+            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
+            withTimeout(1.seconds) { entered.await() }
+            connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
+            runCurrent()
+            connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait")))
+            assertFailsWith<JsonRpcProtocolException> { connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait"))) }
+            val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
+            assertTrue(terminal.cause.message.orEmpty().contains("Duplicate"))
+        }
+
+    @Test
+    fun `cancellation cannot add a second response to buffered busy rejection`() =
+        runTest {
+            val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
+            val entered = CompletableDeferred<Unit>()
+            connection.onRequest("wait") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<Unit>().await(); null }
+            connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
+            withTimeout(1.seconds) { entered.await() }
+            connection.receive(codec.encode(RequestMessage(RequestId.of(2), "wait")))
+            runCurrent()
+            connection.receive(codec.encode(RequestMessage(RequestId.of(3), "wait")))
+            connection.receive(codec.encode(cancel(RequestId.of(3))))
+            val frames = Channel<ByteArray>(Channel.UNLIMITED)
+            backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
+            val busy = assertIs<ResponseMessage>(decode(withTimeout(1.seconds) { frames.receive() }))
+            assertEquals(RequestId.of(3), busy.id)
+            assertEquals(-32000, busy.error?.code)
+            runCurrent()
+            assertTrue(frames.isEmpty)
             connection.close()
         }
 

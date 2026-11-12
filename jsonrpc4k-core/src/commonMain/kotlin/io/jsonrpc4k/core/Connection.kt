@@ -70,6 +70,8 @@ public class Connection(
     /**
      * Creates a connection with explicitly bounded asynchronous application dispatch.
      * In this mode [receive] returns after admission, before application handlers finish.
+     * The outgoing flow requires a dedicated continuous collector: interrupting it, including
+     * with `first` or `take`, terminates this opt-in connection with a failure.
      */
     public constructor(
         policy: BoundedDispatchPolicy,
@@ -90,7 +92,8 @@ public class Connection(
                             outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
                         }
 
-                        override fun offer(response: ResponseMessage): Boolean = outgoingMessages.trySend(OutgoingItem.Frame(response)).isSuccess
+                        override fun offer(response: ResponseMessage, onDequeued: (() -> Unit)?): Boolean =
+                            outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
 
                         override fun fail(cause: Throwable) {
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
@@ -139,6 +142,7 @@ public class Connection(
             } catch (cause: Throwable) {
                 // Cancellation can remove a queued item before control reaches the loop body.
                 outgoingDrain.fail(cause)
+                boundedPump?.outputInterrupted(cause)
                 throw cause
             } finally {
                 outgoingDrain.releaseCollector()

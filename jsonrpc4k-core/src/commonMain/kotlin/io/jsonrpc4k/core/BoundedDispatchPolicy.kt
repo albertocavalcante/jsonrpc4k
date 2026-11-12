@@ -19,8 +19,13 @@ public data class BoundedDispatchPolicy(
     val maxQueuedMessages: Int,
 ) {
     init {
-        require(maxConcurrentRequests in 1..64) { "maxConcurrentRequests must be between 1 and 64" }
-        require(maxQueuedMessages in 1..1024) { "maxQueuedMessages must be between 1 and 1024" }
+        require(maxConcurrentRequests in 1..MAX_CONCURRENT_REQUESTS) { "maxConcurrentRequests must be between 1 and 64" }
+        require(maxQueuedMessages in 1..MAX_QUEUED_MESSAGES) { "maxQueuedMessages must be between 1 and 1024" }
+    }
+
+    private companion object {
+        const val MAX_CONCURRENT_REQUESTS = 64
+        const val MAX_QUEUED_MESSAGES = 1024
     }
 }
 
