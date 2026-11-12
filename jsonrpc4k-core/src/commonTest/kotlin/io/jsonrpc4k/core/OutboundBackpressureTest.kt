@@ -14,6 +14,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -515,6 +516,33 @@ class OutboundBackpressureTest {
         val failed = connection.state.value
         assertTrue(failed is ConnectionState.Failed)
         assertSame(original, failed.cause)
+    }
+
+
+    @Test
+    fun `reentrant control encoding fails without waiting or accepting another frame`() = runTest {
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 2, 1000, 32)
+        var failure: Throwable? = null
+        var nested: OfferResult? = null
+        lateinit var queue: BoundedOutgoing
+        queue = BoundedOutgoing(limits) { cause ->
+            failure = cause
+            queue.close(cause)
+        }
+        val backing = mapOf<String, JsonElement>("value" to JsonPrimitive(1))
+        val reentrant = object : Map<String, JsonElement> by backing {
+            override val entries: Set<Map.Entry<String, JsonElement>>
+                get() {
+                    nested = queue.offer(ResponseMessage.error(RequestId.of(14), ResponseError.requestCancelled()), null)
+                    return backing.entries
+                }
+        }
+        val outer = ResponseMessage.error(RequestId.of(13), ResponseError(1, "error", JsonObject(reentrant)))
+        assertEquals(OfferResult.TERMINAL_TRANSITION, queue.offer(outer, null))
+        assertEquals(OfferResult.REJECTED, nested)
+        assertTrue(failure is IllegalStateException)
+        assertEquals(0, queue.outstandingCount)
+        assertEquals(0, queue.outstandingBytes)
     }
 
 }
