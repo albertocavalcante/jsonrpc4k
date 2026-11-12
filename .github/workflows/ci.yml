@@ -26,6 +26,8 @@ jobs:
     name: Linux Check
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -63,6 +65,8 @@ jobs:
     name: macOS Native Check
     runs-on: macos-15
     timeout-minutes: 20
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -96,6 +100,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: linux
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout

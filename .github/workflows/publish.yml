@@ -8,7 +8,10 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: jsonrpc4k-publication
+  cancel-in-progress: false
 
 env:
   JAVA_VERSION: '21'
@@ -19,6 +22,9 @@ jobs:
     name: Publish
     runs-on: macos-15
     timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout
@@ -42,8 +48,27 @@ jobs:
       - name: Check
         run: ./gradlew check
 
+      - name: Select tagged publication version
+        id: version
+        if: github.event_name == 'push'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z.+-]*$ || "$version" == *-SNAPSHOT ]]; then
+            echo "::error::Publication requires a non-snapshot version tag."
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
       - name: Publish
-        run: ./gradlew publishAllPublicationsToGitHubPackagesRepository
+        run: |
+          publication_args=()
+          if [[ -n "$RELEASE_VERSION" ]]; then
+            publication_args+=("-PVERSION_NAME=$RELEASE_VERSION")
+          fi
+          ./gradlew publishAllPublicationsToGitHubPackagesRepository "${publication_args[@]}"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
