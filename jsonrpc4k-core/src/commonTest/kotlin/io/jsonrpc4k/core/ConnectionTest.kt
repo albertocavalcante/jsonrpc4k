@@ -6,6 +6,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -54,6 +55,30 @@ private data class ConnectionAddResult(
 )
 
 class ConnectionTest {
+    @Test
+    fun `close cancels an active receiver without cancelling its parent`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            connection.onRequest("wait") { _: kotlinx.serialization.json.JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
+            val receive = launch { connection.receive(JsonRpcCodec.Default.encode(RequestMessage(RequestId.of(1), "wait"))) }
+            entered.await()
+            connection.close()
+            receive.join()
+            receive.isCancelled shouldBe true
+            parent.isActive shouldBe true
+            assertFailsWith<kotlinx.coroutines.CancellationException> {
+                connection.receive(JsonRpcCodec.Default.encode(NotificationMessage("ignored")))
+            }
+            parent.cancel()
+        }
+
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
     fun `cancelled caller removes a registered waiter`() =

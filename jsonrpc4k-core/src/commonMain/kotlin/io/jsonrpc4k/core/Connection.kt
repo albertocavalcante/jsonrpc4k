@@ -5,6 +5,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -251,14 +253,21 @@ public class Connection(
      * Feed incoming data from the transport.
      * This will decode messages and dispatch them to handlers.
      */
-    public suspend fun receive(data: ByteArray) {
-        // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
-        val messages = decoder.feed(data)
-        for (message in messages) {
-            val response = dispatcher.dispatch(message)
-            if (response != null) {
-                outgoingMessages.send(response)
+    public suspend fun receive(data: ByteArray): Unit = coroutineScope {
+        val receiveJob = coroutineContext[Job]!!
+        val completion = connectionJob.invokeOnCompletion { receiveJob.cancel() }
+        try {
+            ensureActive()
+            // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
+            val messages = decoder.feed(data)
+            for (message in messages) {
+                val response = dispatcher.dispatch(message)
+                if (response != null) {
+                    outgoingMessages.send(response)
+                }
             }
+        } finally {
+            completion.dispose()
         }
     }
 
