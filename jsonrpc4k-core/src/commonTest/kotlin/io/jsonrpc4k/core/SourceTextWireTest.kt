@@ -73,7 +73,10 @@ class SourceTextWireTest {
     private fun source(message: NotificationMessage): String =
         assertIs<JsonPrimitive>(assertIs<JsonObject>(message.params).getValue("text")).content
 
-    private fun assertUnits(vector: Vector, actual: String) {
+    private fun assertUnits(
+        vector: Vector,
+        actual: String,
+    ) {
         assertEquals(vector.text.map { it.code }, actual.map { it.code }, vector.name)
     }
 
