@@ -252,4 +252,21 @@ class OutboundBackpressureTest {
         assertSame(original, failed.cause)
     }
 
+
+    @Test
+    fun `cancelled assigned receive blocks new admission until terminal cause`() = runTest {
+        val limits = OutboundResourceLimits(1024, 1024, 1, 4, 1024, 1, 1000, 32)
+        val queue = BoundedOutgoing(limits) { throw it }
+        val receiver = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { queue.items.receive() }
+        queue.send(NotificationMessage("assigned"))
+        receiver.cancel()
+        val waiter = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { queue.send(NotificationMessage("later")) }
+        }
+        runCurrent()
+        assertFalse(waiter.isCompleted)
+        queue.close(IllegalStateException("collector interrupted"))
+        assertTrue(withTimeout(1000) { waiter.await() }.isFailure)
+    }
+
 }

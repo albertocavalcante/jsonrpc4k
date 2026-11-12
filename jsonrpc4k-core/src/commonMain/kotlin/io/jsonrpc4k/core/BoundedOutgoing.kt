@@ -19,6 +19,7 @@ internal class BoundedOutgoing(
         val controlCount: Int = 0,
         val producers: Int = 0,
         val controlEncoding: Boolean = false,
+        val deliveryLost: Boolean = false,
         val failure: Throwable? = null,
     )
 
@@ -39,7 +40,12 @@ internal class BoundedOutgoing(
     private val ended = CompletableDeferred<Unit>()
     private val admission = Mutex()
     private val encoder = BoundedMessageEncoder(limits.maxFrameWireBytes, limits.maxNodes, limits.maxJsonNesting)
-    val items = Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { it.lease.release() })
+    val items = Channel<Item>(limits.maxOutstandingFrames + limits.controlReserveFrames, onUndeliveredElement = { item ->
+        // A promptly-cancelled receive may lose its assigned item before the collector catches
+        // cancellation. Block new reservations until that catch installs the terminal cause.
+        mutate { s -> if (s.failure == null) s.copy(deliveryLost = true) else s }
+        item.lease.release()
+    })
 
     fun close(cause: Throwable) {
         while (true) {
@@ -91,6 +97,7 @@ internal class BoundedOutgoing(
         while (true) {
             val old = state.value
             old.failure?.let { throw it }
+            if (old.deliveryLost) return null
             val next = if (control) {
                 if (old.controlCount == limits.controlReserveFrames || bytes > limits.controlReserveBytes - old.controlBytes) return null
                 old.copy(controlCount = old.controlCount + 1, controlBytes = old.controlBytes + bytes)
@@ -112,7 +119,7 @@ internal class BoundedOutgoing(
     private suspend fun reserveOrdinary(bytes: Int): Lease {
         while (true) {
             reserve(bytes, false)?.let { return it }
-            state.first { s -> s.failure != null || (s.ordinaryCount < limits.maxOutstandingFrames && bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes) }
+            state.first { s -> s.failure != null || (!s.deliveryLost && s.ordinaryCount < limits.maxOutstandingFrames && bytes <= limits.maxRetainedWireBytes - s.ordinaryBytes) }
         }
     }
 
