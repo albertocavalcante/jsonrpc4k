@@ -116,20 +116,7 @@ public class JsonRpcMessageDecoder(
             val messages = mutableListOf<Message>()
             var offset = 0
             while (offset < data.size) {
-                val remainingCapacity =
-                    if (headersParsed) {
-                        checkNotNull(expectedContentLength) - byteBufferSize
-                    } else {
-                        JsonRpcCodec.MAX_HEADER_LENGTH - byteBufferSize
-                    }
-                if (remainingCapacity <= 0) {
-                    throw JsonRpcProtocolException("Header exceeds ${JsonRpcCodec.MAX_HEADER_LENGTH} bytes")
-                }
-                val count = minOf(data.size - offset, remainingCapacity)
-                ensureCapacity(byteBufferSize + count)
-                data.copyInto(byteBuffer, byteBufferSize, offset, offset + count)
-                byteBufferSize += count
-                offset += count
+                offset += appendChunk(data, offset)
                 drainMessages(messages)
             }
             return messages
@@ -138,6 +125,26 @@ public class JsonRpcMessageDecoder(
             failure = cause
             throw cause
         }
+    }
+
+    private fun appendChunk(
+        data: ByteArray,
+        offset: Int,
+    ): Int {
+        val remainingCapacity =
+            if (headersParsed) {
+                checkNotNull(expectedContentLength) - byteBufferSize
+            } else {
+                JsonRpcCodec.MAX_HEADER_LENGTH - byteBufferSize
+            }
+        if (remainingCapacity <= 0) {
+            throw JsonRpcProtocolException("Header exceeds ${JsonRpcCodec.MAX_HEADER_LENGTH} bytes")
+        }
+        val count = minOf(data.size - offset, remainingCapacity)
+        ensureCapacity(byteBufferSize + count)
+        data.copyInto(byteBuffer, byteBufferSize, offset, offset + count)
+        byteBufferSize += count
+        return count
     }
 
     /**
@@ -216,28 +223,23 @@ public class JsonRpcMessageDecoder(
         headerSearchOffset = 0
 
         val headerSection = byteBuffer.copyOfRange(0, headerEndIndex).decodeToString()
-        val lines = headerSection.split(JsonRpcCodec.LINE_DELIMITER)
-
-        var foundContentLength = false
-        for (line in lines) {
-            if (line.trim().startsWith(JsonRpcCodec.CONTENT_LENGTH_HEADER, ignoreCase = true)) {
-                if (foundContentLength) {
-                    throw JsonRpcProtocolException("Duplicate Content-Length header")
-                }
-                expectedContentLength =
-                    codec.parseContentLength(line)
-                        ?: throw JsonRpcProtocolException("Invalid Content-Length header")
-                foundContentLength = true
-            }
-        }
-
-        if (expectedContentLength == null) {
-            throw JsonRpcProtocolException("Missing Content-Length header")
-        }
-
+        expectedContentLength = parseHeaderLength(headerSection)
         consumeFromFront(headerEndIndex + delimiterBytes.size)
         headersParsed = true
         return true
+    }
+
+    private fun parseHeaderLength(headerSection: String): Int {
+        val lengthHeaders =
+            headerSection.split(JsonRpcCodec.LINE_DELIMITER).filter {
+                it.trim().startsWith(JsonRpcCodec.CONTENT_LENGTH_HEADER, ignoreCase = true)
+            }
+        if (lengthHeaders.size != 1) {
+            val message = if (lengthHeaders.isEmpty()) "Missing Content-Length header" else "Duplicate Content-Length header"
+            throw JsonRpcProtocolException(message)
+        }
+        return codec.parseContentLength(lengthHeaders.single())
+            ?: throw JsonRpcProtocolException("Invalid Content-Length header")
     }
 
     /**
