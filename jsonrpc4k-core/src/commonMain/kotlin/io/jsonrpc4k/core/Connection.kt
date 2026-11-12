@@ -64,7 +64,7 @@ public class Connection(
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
 
-    /** The first terminal event and its cause, if any. */
+    /** The first observed terminal transition and its cause, if any. */
     public val state: StateFlow<ConnectionState> = mutableState.asStateFlow()
 
     /**
@@ -96,6 +96,10 @@ public class Connection(
                             outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess
 
                         override fun fail(cause: Throwable) {
+                            if (scope.coroutineContext[Job]?.isActive == false) {
+                                mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Closed)
+                                return
+                            }
                             if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
                                 boundedPump?.close()
                                 dispatcher.pending.close()
@@ -142,7 +146,9 @@ public class Connection(
             } catch (cause: Throwable) {
                 // Cancellation can remove a queued item before control reaches the loop body.
                 outgoingDrain.fail(cause)
-                boundedPump?.outputInterrupted(cause)
+                if (connectionJob.isActive && scope.coroutineContext[Job]?.isActive != false) {
+                    boundedPump?.outputInterrupted(cause)
+                }
                 throw cause
             } finally {
                 outgoingDrain.releaseCollector()

@@ -79,11 +79,12 @@ class BoundedDispatchTest {
             assertFalse(outbound.isCompleted)
             writer.cancel()
             withTimeout(1.seconds) { writer.join() }
-            assertIs<ConnectionState.Failed>(connection.state.value)
+            val terminal = assertIs<ConnectionState.Failed>(connection.state.value)
             assertTrue(withTimeout(1.seconds) { outbound.await() }.isFailure)
             assertTrue(parent.isActive)
             assertTrue(sibling.isActive)
             parent.cancel()
+            assertEquals(terminal, connection.state.value)
         }
 
     @Test
@@ -110,6 +111,19 @@ class BoundedDispatchTest {
             withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.outgoing.first() } }
             assertEquals(ConnectionState.Open, connection.state.value)
             connection.close()
+            withTimeout(1.seconds) { writer.join() }
+            assertEquals(ConnectionState.Closed, connection.state.value)
+        }
+
+    @Test
+    fun `parent cancellation is not replaced by writer failure`() =
+        runTest {
+            val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
+            val scope = CoroutineScope(backgroundScope.coroutineContext + parent)
+            val connection = Connection(policy, scope = scope)
+            val writer = scope.launch { connection.outgoing.collect {} }
+            runCurrent()
+            parent.cancel()
             withTimeout(1.seconds) { writer.join() }
             assertEquals(ConnectionState.Closed, connection.state.value)
         }

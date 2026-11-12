@@ -6,10 +6,12 @@ package io.jsonrpc4k.core
  * Notifications are barriers: all earlier requests finish before a notification runs, and
  * later application messages wait for it. Responses and cancellation bypass that queue.
  * A request that awaits a chain of nested callbacks can still exhaust the concurrency limit.
- * A request admitted when the queue is full receives a server-busy error. A notification
+ * A request arriving when the queue is full receives a server-busy error. A notification
  * overflow, duplicate active incoming ID, or inability to enqueue an error closes the
  * connection with a [ConnectionState.Failed] cause. Malformed cancellation notifications
  * are ignored. Cancellation applies only to an accepted incoming request.
+ * An incoming ID remains active until its response is dequeued by the outgoing collector;
+ * this local handoff does not establish transport completion or peer receipt.
  *
  * @param maxConcurrentRequests Maximum concurrently running request handlers, from 1 to 64.
  * @param maxQueuedMessages Maximum queued requests and notifications, from 1 to 1024.
@@ -29,7 +31,7 @@ public data class BoundedDispatchPolicy(
     }
 }
 
-/** Terminal state for a connection; the first terminal event wins. */
+/** Terminal state for a connection; concurrent terminal events use the first observed transition. */
 public sealed interface ConnectionState {
     /** The connection is open. */
     public data object Open : ConnectionState

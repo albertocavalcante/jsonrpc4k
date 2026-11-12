@@ -95,14 +95,9 @@ internal class BoundedDispatchPump(
                     offset = end
                 }
             }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            output.fail(failure)
+        } catch (failure: Throwable) {
+            if (failure !is CancellationException) output.fail(failure)
             throw failure
-        } catch (fatal: Throwable) {
-            output.fail(fatal)
-            throw fatal
         }
     }
 
