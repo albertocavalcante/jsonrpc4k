@@ -280,6 +280,25 @@ class MessageTest {
         }
     }
 
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `response shape is preserved with alternate JSON settings and direct serializer`() {
+        val configured =
+            Json {
+                encodeDefaults = true
+                explicitNulls = false
+            }
+        val success = ResponseMessage.success(RequestId.of(1), null)
+        val error = ResponseMessage.error(null, ResponseError.parseError("Parse error"))
+        configured.parseToJsonElement(configured.encodeToString(ResponseMessage.serializer(), success)) shouldBe
+            json.parseToJsonElement("""{"jsonrpc":"2.0","id":1,"result":null}""")
+        configured.parseToJsonElement(configured.encodeToString(ResponseMessage.serializer(), error)) shouldBe
+            json.parseToJsonElement("""{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}""")
+        assertFailsWith<Exception> {
+            configured.decodeFromString(ResponseMessage.serializer(), """{"jsonrpc":"2.0","id":1}""")
+        }
+    }
+
     @Test
     fun `ResponseMessage with result`() {
         val response =
