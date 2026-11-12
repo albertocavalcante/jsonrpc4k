@@ -29,6 +29,8 @@ class BoundedMessageEncoderTest {
                 ResponseMessage.success(RequestId.of(1), null),
                 ResponseMessage.success(RequestId.of(2), data),
                 ResponseMessage.error(RequestId.of(3), ResponseError(-32000, "problem", data)),
+                ResponseMessage(id = null, error = ResponseError.parseError()),
+                ResponseMessage(id = null, error = ResponseError.invalidRequest()),
                 NotificationMessage("raw", JsonUnquotedLiteral("[{\"a\":1}]")),
                 NotificationMessage("raw-invalid", JsonUnquotedLiteral("not-json")),
                 NotificationMessage("escaped", JsonObject(mapOf("\\\"\n".repeat(100) to JsonPrimitive("\u0000\n\\\"".repeat(100))))),
@@ -82,6 +84,21 @@ class BoundedMessageEncoderTest {
         val literal = JsonUnquotedLiteral("[[[1]]]")
         assertFailsWith<JsonRpcProtocolException> {
             BoundedMessageEncoder(1024, 100, 3).encode(NotificationMessage("n", literal))
+        }
+    }
+
+    @Test
+    fun `maximum supported array and object nesting is accepted but one deeper rejects`() {
+        for (objects in listOf(false, true)) {
+            var value: JsonElement = JsonPrimitive(1)
+            repeat(255) {
+                value = if (objects) JsonObject(mapOf("v" to value)) else JsonArray(listOf(value))
+            }
+            val message = NotificationMessage("deep", value)
+            val bounded = BoundedMessageEncoder(16 * 1024, 1_000, 256)
+            assertContentEquals(codec.encode(message), bounded.encode(message))
+            val tooDeep = if (objects) JsonObject(mapOf("v" to value)) else JsonArray(listOf(value))
+            assertFailsWith<JsonRpcProtocolException> { bounded.encode(NotificationMessage("deep", tooDeep)) }
         }
     }
 
