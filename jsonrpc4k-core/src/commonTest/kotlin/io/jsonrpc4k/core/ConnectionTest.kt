@@ -86,9 +86,9 @@ class ConnectionTest {
             val connection = Connection()
             val request = launch { connection.request<JsonPrimitive>("never", null) }
             runCurrent()
-            connection.dispatcher.pendingCount shouldBe 1
+            connection.dispatcher.pending.count shouldBe 1
             request.cancelAndJoin()
-            connection.dispatcher.pendingCount shouldBe 0
+            connection.dispatcher.pending.count shouldBe 0
             connection.close()
         }
 
@@ -100,10 +100,10 @@ class ConnectionTest {
             repeat(64) { connection.notify("fill", null) }
             val request = launch { runCatching { connection.request<JsonPrimitive>("never", null) } }
             runCurrent()
-            connection.dispatcher.pendingCount shouldBe 1
+            connection.dispatcher.pending.count shouldBe 1
             connection.close()
             request.join()
-            connection.dispatcher.pendingCount shouldBe 0
+            connection.dispatcher.pending.count shouldBe 0
             assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
         }
 
@@ -117,9 +117,9 @@ class ConnectionTest {
             dispatcher.cancelAllPendingRequests()
             first.isCancelled shouldBe true
             val second = dispatcher.registerPendingRequest(id)
-            dispatcher.cancelRegisteredRequest(id, first)
-            dispatcher.pendingCount shouldBe 1
-            dispatcher.closePendingRequests()
+            dispatcher.pending.cancel(id, first)
+            dispatcher.pending.count shouldBe 1
+            dispatcher.pending.close()
             second.isCancelled shouldBe true
             assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
         }
@@ -132,10 +132,10 @@ class ConnectionTest {
             val connection = Connection(scope = CoroutineScope(parent))
             val request = launch { connection.request<JsonPrimitive>("never", null) }
             runCurrent()
-            connection.dispatcher.pendingCount shouldBe 1
+            connection.dispatcher.pending.count shouldBe 1
             parent.cancel()
             request.join()
-            connection.dispatcher.pendingCount shouldBe 0
+            connection.dispatcher.pending.count shouldBe 0
             assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
         }
 
@@ -145,10 +145,10 @@ class ConnectionTest {
             repeat(100) {
                 val dispatcher = Dispatcher()
                 val registration = async(Dispatchers.Default) { runCatching { dispatcher.registerPendingRequest(RequestId.of(1)) } }
-                val close = async(Dispatchers.Default) { dispatcher.closePendingRequests() }
+                val close = async(Dispatchers.Default) { dispatcher.pending.close() }
                 val deferred = registration.await().getOrNull()
                 close.await()
-                dispatcher.pendingCount shouldBe 0
+                dispatcher.pending.count shouldBe 0
                 if (deferred != null) deferred.isCancelled shouldBe true
                 assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(RequestId.of(2)) }
             }
@@ -180,7 +180,7 @@ class ConnectionTest {
             val connection = Connection()
             val error = assertFailsWith<JsonRpcException> { connection.request<JsonPrimitive>("never", null, 10.milliseconds) }
             error.code shouldBe ResponseError.REQUEST_CANCELLED
-            connection.dispatcher.pendingCount shouldBe 0
+            connection.dispatcher.pending.count shouldBe 0
             connection.close()
         }
 
@@ -193,7 +193,7 @@ class ConnectionTest {
                     connection.request<JsonPrimitive>("never", null)
                 }
             }
-            connection.dispatcher.pendingCount shouldBe 0
+            connection.dispatcher.pending.count shouldBe 0
             connection.close()
         }
 

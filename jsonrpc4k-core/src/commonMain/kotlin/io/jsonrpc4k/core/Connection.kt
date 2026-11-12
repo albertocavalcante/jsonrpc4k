@@ -45,12 +45,14 @@ public class Connection(
 
     init {
         connectionJob.invokeOnCompletion {
-            dispatcher.closePendingRequests()
+            dispatcher.pending.close()
             outgoingMessages.cancel()
         }
     }
 
-    private data class CompletedResponse(val value: JsonElement?)
+    private data class CompletedResponse(
+        val value: JsonElement?,
+    )
 
     /**
      * Flow of outgoing messages that need to be sent over the transport.
@@ -167,7 +169,7 @@ public class Connection(
             }
             result.value
         } finally {
-            dispatcher.cancelRegisteredRequest(id, deferred)
+            dispatcher.pending.cancel(id, deferred)
         }
     }
 
@@ -253,23 +255,24 @@ public class Connection(
      * Feed incoming data from the transport.
      * This will decode messages and dispatch them to handlers.
      */
-    public suspend fun receive(data: ByteArray): Unit = coroutineScope {
-        val receiveJob = coroutineContext[Job]!!
-        val completion = connectionJob.invokeOnCompletion { receiveJob.cancel() }
-        try {
-            ensureActive()
-            // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
-            val messages = decoder.feed(data)
-            for (message in messages) {
-                val response = dispatcher.dispatch(message)
-                if (response != null) {
-                    outgoingMessages.send(response)
+    public suspend fun receive(data: ByteArray): Unit =
+        coroutineScope {
+            val receiveJob = coroutineContext[Job]!!
+            val completion = connectionJob.invokeOnCompletion { receiveJob.cancel() }
+            try {
+                ensureActive()
+                // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
+                val messages = decoder.feed(data)
+                for (message in messages) {
+                    val response = dispatcher.dispatch(message)
+                    if (response != null) {
+                        outgoingMessages.send(response)
+                    }
                 }
+            } finally {
+                completion.dispose()
             }
-        } finally {
-            completion.dispose()
         }
-    }
 
     /**
      * Feed incoming data from the transport.
@@ -282,7 +285,7 @@ public class Connection(
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
-        dispatcher.closePendingRequests()
+        dispatcher.pending.close()
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
