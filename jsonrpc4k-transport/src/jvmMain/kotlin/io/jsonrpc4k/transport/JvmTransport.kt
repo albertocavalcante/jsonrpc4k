@@ -118,7 +118,10 @@ public class StreamTransport(
             CloseFailure(fatal, fatal = true)
         }
 
-    private fun combineFailures(first: CloseFailure?, second: CloseFailure?): CloseFailure? =
+    private fun combineFailures(
+        first: CloseFailure?,
+        second: CloseFailure?,
+    ): CloseFailure? =
         when {
             first == null -> second
             second == null || first.cause === second.cause -> first

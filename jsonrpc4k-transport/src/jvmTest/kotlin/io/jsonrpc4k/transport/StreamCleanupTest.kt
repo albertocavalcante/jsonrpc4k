@@ -47,10 +47,11 @@ class StreamCleanupTest {
             val input = CloseInput()
             val output = CloseOutput()
             val transport = StreamTransport(input, output)
-            val closer = launch {
-                coroutineContext[Job]!!.cancel()
-                transport.close()
-            }
+            val closer =
+                launch {
+                    coroutineContext[Job]!!.cancel()
+                    transport.close()
+                }
             closer.join()
             assertEquals(1, input.closes.get())
             assertEquals(1, output.closes.get())
@@ -109,10 +110,11 @@ class StreamCleanupTest {
         runBlocking {
             val entered = CompletableDeferred<Unit>()
             val release = CountDownLatch(1)
-            val input = CloseInput {
-                entered.complete(Unit)
-                check(release.await(10, TimeUnit.SECONDS)) { "Close gate was not released" }
-            }
+            val input =
+                CloseInput {
+                    entered.complete(Unit)
+                    check(release.await(10, TimeUnit.SECONDS)) { "Close gate was not released" }
+                }
             val output = CloseOutput()
             val transport = StreamTransport(input, output)
             try {
@@ -153,8 +155,7 @@ class StreamCleanupTest {
             }
         }
 
-    private fun Throwable.hasCause(original: Throwable): Boolean =
-        generateSequence(this) { it.cause }.take(8).any { it === original }
+    private fun Throwable.hasCause(original: Throwable): Boolean = generateSequence(this) { it.cause }.take(8).any { it === original }
 }
 
 private class CloseInput(
