@@ -201,7 +201,7 @@ private class SnapshotMeter(
         while (true) {
             if (current != null) {
                 chargeNode()
-                when (val value = current) {
+                when (val value = checkNotNull(current)) {
                     is JsonPrimitive -> {
                         chargeText(value.content)
                         completed = value
