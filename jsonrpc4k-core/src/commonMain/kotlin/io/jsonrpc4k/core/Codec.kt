@@ -1,7 +1,7 @@
 package io.jsonrpc4k.core
 
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.json.Json
 
 /**
  * JSON-RPC message codec for encoding/decoding messages with Content-Length headers.
@@ -18,6 +18,7 @@ public class JsonRpcCodec(
 ) {
     @OptIn(ExperimentalSerializationApi::class)
     internal val allowsComments: Boolean get() = json.configuration.allowComments
+
     /**
      * Encode a message to wire format with Content-Length header.
      */
@@ -101,6 +102,7 @@ public class JsonRpcMessageDecoder(
     internal constructor(codec: JsonRpcCodec, limits: InboundResourceLimits) : this(codec) {
         this.limits = limits
     }
+
     private var byteBuffer = ByteArray(0)
     private var byteBufferSize = 0
     private var expectedContentLength: Int? = null
@@ -137,7 +139,10 @@ public class JsonRpcMessageDecoder(
     }
 
     /** Processes each completed frame before decoding the next one. */
-    internal suspend fun feedEach(data: ByteArray, accept: suspend (Message, Int) -> Unit) {
+    internal suspend fun feedEach(
+        data: ByteArray,
+        accept: suspend (Message, Int) -> Unit,
+    ) {
         failure?.let { throw it }
         try {
             var offset = 0
@@ -228,7 +233,7 @@ public class JsonRpcMessageDecoder(
 
         // Extract and decode the message
         val jsonContentBytes = byteBuffer.copyOfRange(0, contentLength)
-        limits?.let { checkJsonNesting(jsonContentBytes, it.maxJsonNesting, codec.allowsComments) }
+        limits?.let { JsonNestingGuard(it.maxJsonNesting, codec.allowsComments).check(jsonContentBytes) }
         val jsonContent = jsonContentBytes.decodeToString()
         consumeFromFront(contentLength)
 
@@ -297,42 +302,6 @@ public class JsonRpcMessageDecoder(
             return i
         }
         return -1
-    }
-}
-
-/** Counts structural delimiters outside strings and comments before JSON tree decoding. */
-private fun checkJsonNesting(bytes: ByteArray, maximum: Int, allowComments: Boolean) {
-    var depth = 0
-    var quoted = false
-    var escaped = false
-    var lineComment = false
-    var blockComment = false
-    var bare = false
-    var index = 0
-    while (index < bytes.size) {
-        val current = bytes[index].toInt() and 0xff
-        val next = if (index + 1 < bytes.size) bytes[index + 1].toInt() and 0xff else -1
-        when {
-            lineComment -> if (current == 10) lineComment = false
-            blockComment -> if (current == 42 && next == 47) { blockComment = false; index++ }
-            quoted -> when {
-                escaped -> escaped = false
-                current == 92 -> escaped = true
-                current == 34 -> quoted = false
-            }
-            current == 34 -> { quoted = true; bare = false }
-            allowComments && !bare && current == 47 && next == 47 -> { lineComment = true; index++ }
-            allowComments && !bare && current == 47 && next == 42 -> { blockComment = true; index++ }
-            current == 123 || current == 91 -> {
-                bare = false
-                depth++
-                if (depth > maximum) throw JsonRpcProtocolException("JSON nesting exceeds $maximum")
-            }
-            current == 125 || current == 93 -> { bare = false; if (depth > 0) depth-- }
-            current == 44 || current == 58 || current == 32 || current == 9 || current == 10 || current == 13 -> bare = false
-            else -> bare = true
-        }
-        index++
     }
 }
 

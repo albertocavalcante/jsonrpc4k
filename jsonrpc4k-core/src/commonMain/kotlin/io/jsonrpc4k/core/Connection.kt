@@ -41,8 +41,7 @@ public class Connection(
     notificationErrorHandler: NotificationErrorHandler? = null,
 ) {
     @PublishedApi internal val dispatcher: Dispatcher = Dispatcher(json, notificationErrorHandler)
-    private var requestIdValue = 0L
-    private val requestIdMutex = Mutex()
+    private val requestIds = RequestIds()
 
     private sealed interface OutgoingItem {
         data class Frame(
@@ -97,7 +96,11 @@ public class Connection(
         installBoundedPump(policy, scope, limits)
     }
 
-    private fun installBoundedPump(policy: BoundedDispatchPolicy, scope: CoroutineScope, limits: InboundResourceLimits?) {
+    private fun installBoundedPump(
+        policy: BoundedDispatchPolicy,
+        scope: CoroutineScope,
+        limits: InboundResourceLimits?,
+    ) {
         boundedPump =
             BoundedDispatchPump(
                 policy = policy,
@@ -290,14 +293,12 @@ public class Connection(
     /**
      * Send a request and await the response.
      */
-    private suspend fun nextRequestId(): Long = requestIdMutex.withLock { ++requestIdValue }
-
     public suspend fun <R> request(
         method: String,
         params: JsonElement?,
         timeout: Duration = 30.seconds,
     ): JsonElement? {
-        val id = RequestId.of(nextRequestId())
+        val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
 
         val deferred = dispatcher.registerPendingRequest(id)
@@ -439,4 +440,11 @@ public class Connection(
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
+}
+
+private class RequestIds {
+    private var value = 0L
+    private val mutex = Mutex()
+
+    suspend fun next(): Long = mutex.withLock { ++value }
 }

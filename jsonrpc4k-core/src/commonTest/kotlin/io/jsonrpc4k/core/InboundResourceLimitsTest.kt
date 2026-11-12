@@ -8,12 +8,12 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.JsonElement
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -52,7 +52,14 @@ class InboundResourceLimitsTest {
 
     @Test
     fun `depth scanner skips enabled comments but not unquoted slash sequences`() {
-        val commentsCodec = JsonRpcCodec(Json { isLenient = true; ignoreUnknownKeys = true; allowComments = true })
+        val commentsCodec =
+            JsonRpcCodec(
+                Json {
+                    isLenient = true
+                    ignoreUnknownKeys = true
+                    allowComments = true
+                },
+            )
         val decoder = JsonRpcMessageDecoder(commentsCodec, InboundResourceLimits(4096, 2, 4096))
         val valid = """{ /* [{[ */ jsonrpc:"2.0",method:ab//cd,params:{value:"ok"}}"""
         assertEquals(1, decoder.feed(frame(valid)).size)
@@ -63,7 +70,14 @@ class InboundResourceLimitsTest {
 
     @Test
     fun `carriage return inside line comment cannot hide nested structure`() {
-        val commentsCodec = JsonRpcCodec(Json { isLenient = true; ignoreUnknownKeys = true; allowComments = true })
+        val commentsCodec =
+            JsonRpcCodec(
+                Json {
+                    isLenient = true
+                    ignoreUnknownKeys = true
+                    allowComments = true
+                },
+            )
         val decoder = JsonRpcMessageDecoder(commentsCodec, InboundResourceLimits(4096, 2, 4096))
         val body = "{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":{ //comment\r}}}\n\"value\":[]}}"
         assertIs<NotificationMessage>(commentsCodec.decodeFromJson(body))
@@ -128,7 +142,7 @@ class InboundResourceLimitsTest {
             connection.onRequest("hold") { _: JsonElement? ->
                 entered.complete(Unit)
                 try {
-                    CompletableDeferred<Unit>().await()
+                    CompletableDeferred<JsonElement?>().await()
                 } finally {
                     withContext(NonCancellable) { cleanup.await() }
                 }
@@ -136,8 +150,18 @@ class InboundResourceLimitsTest {
             connection.onRequest("next") { _: JsonElement? -> JsonPrimitive("done") }
             connection.receive(codec.encode(first))
             withTimeout(1.seconds) { entered.await() }
-            connection.receive(codec.encode(NotificationMessage("$/cancelRequest", kotlinx.serialization.json.buildJsonObject { put("id", JsonPrimitive(5)) })))
-            val cancelled = assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+            connection.receive(
+                codec.encode(
+                    NotificationMessage(
+                        "$/cancelRequest",
+                        kotlinx.serialization.json.buildJsonObject {
+                            put("id", JsonPrimitive(5))
+                        },
+                    ),
+                ),
+            )
+            val cancelled =
+                assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
             assertEquals(ResponseError.REQUEST_CANCELLED, cancelled.error?.code)
             connection.receive(codec.encode(second))
             val busy = assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
@@ -161,7 +185,10 @@ class InboundResourceLimitsTest {
             val frames = Channel<ByteArray>(Channel.UNLIMITED)
             val entered = CompletableDeferred<Unit>()
             val writer = backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
-            connection.onRequest("hold") { _: JsonElement? -> entered.complete(Unit); CompletableDeferred<JsonElement?>().await() }
+            connection.onRequest("hold") { _: JsonElement? ->
+                entered.complete(Unit)
+                CompletableDeferred<JsonElement?>().await()
+            }
             connection.receive(codec.encode(first))
             withTimeout(1.seconds) { entered.await() }
             val pending = backgroundScope.async { connection.request<JsonElement>("reverse", null) }
@@ -173,11 +200,46 @@ class InboundResourceLimitsTest {
         }
 
     @Test
+    fun `queued cancellation response does not keep completed work charged`() =
+        runTest {
+            val first = RequestMessage(RequestId.of(5), "hold", JsonPrimitive("payload"))
+            val second = RequestMessage(RequestId.of(6), "next", JsonPrimitive("payload"))
+            val bodyBytes = codec.encodeToJson(first).encodeToByteArray().size
+            val connection = Connection(BoundedDispatchPolicy(1, 2), InboundResourceLimits(1024, 8, bodyBytes), scope = backgroundScope)
+            val entered = CompletableDeferred<Unit>()
+            val cleanup = CompletableDeferred<Unit>()
+            val nextEntered = CompletableDeferred<Unit>()
+            connection.onRequest("hold") { _: JsonElement? ->
+                entered.complete(Unit)
+                try {
+                    CompletableDeferred<JsonElement?>().await()
+                } finally {
+                    withContext(NonCancellable) { cleanup.await() }
+                }
+            }
+            connection.onRequest("next") { _: JsonElement? ->
+                nextEntered.complete(Unit)
+                null
+            }
+            connection.receive(codec.encode(first))
+            withTimeout(1.seconds) { entered.await() }
+            connection.receive(codec.encode(NotificationMessage("$/cancelRequest", buildJsonObject { put("id", JsonPrimitive(5)) })))
+            cleanup.complete(Unit)
+            runCurrent()
+            assertEquals(0, connection.retainedApplicationBytes)
+            connection.receive(codec.encode(second))
+            withTimeout(1.seconds) { nextEntered.await() }
+            assertIs<ConnectionState.Open>(connection.state.value)
+            connection.close()
+        }
+
+    @Test
     fun `canceled queued request keeps its byte charge until notification barrier passes`() =
         runTest {
             val first = RequestMessage(RequestId.of(5), "hold", JsonPrimitive("a"))
             val barrier = NotificationMessage("barrier", JsonPrimitive("b"))
             val queued = RequestMessage(RequestId.of(6), "hold", JsonPrimitive("c"))
+
             fun weight(message: Message) = codec.encodeToJson(message).encodeToByteArray().size
             val total = weight(first) + weight(barrier) + weight(queued)
             val connection = Connection(BoundedDispatchPolicy(1, 3), InboundResourceLimits(1024, 8, total), scope = backgroundScope)
@@ -185,14 +247,19 @@ class InboundResourceLimitsTest {
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
             val writer = backgroundScope.launch { connection.outgoing.collect { frames.send(it) } }
-            connection.onRequest("hold") { _: JsonElement? -> entered.complete(Unit); release.await(); null }
+            connection.onRequest("hold") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
             connection.onNotification("barrier") { _: JsonElement? -> }
             connection.receive(codec.encode(first))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(barrier))
             connection.receive(codec.encode(queued))
             connection.receive(codec.encode(NotificationMessage("$/cancelRequest", buildJsonObject { put("id", JsonPrimitive(6)) })))
-            val cancelled = assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+            val cancelled =
+                assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
             assertEquals(ResponseError.REQUEST_CANCELLED, cancelled.error?.code)
             assertEquals(total, connection.retainedApplicationBytes)
             release.complete(Unit)
@@ -226,7 +293,7 @@ class InboundResourceLimitsTest {
             connection.onRequest("hold") { _: JsonElement? ->
                 entered.complete(Unit)
                 try {
-                    CompletableDeferred<Unit>().await()
+                    CompletableDeferred<JsonElement?>().await()
                 } finally {
                     withContext(NonCancellable) { cleanup.await() }
                 }

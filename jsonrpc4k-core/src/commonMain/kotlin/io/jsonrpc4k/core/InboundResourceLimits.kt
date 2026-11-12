@@ -20,7 +20,11 @@ public data class InboundResourceLimits(
 ) {
     init {
         require(maxFrameBodyBytes in 1..JsonRpcCodec.MAX_CONTENT_LENGTH)
-        require(maxJsonNesting in 1..256)
+        require(maxJsonNesting in 1..MAX_JSON_NESTING)
         require(maxApplicationBodyBytes in 1..JsonRpcCodec.MAX_CONTENT_LENGTH)
+    }
+
+    private companion object {
+        const val MAX_JSON_NESTING = 256
     }
 }
