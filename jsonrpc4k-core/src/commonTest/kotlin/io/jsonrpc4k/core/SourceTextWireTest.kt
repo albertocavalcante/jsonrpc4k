@@ -106,12 +106,12 @@ class SourceTextWireTest {
 
     @Test
     fun `escaping expansion is included in exact framed byte limit`() {
-        val message = message("\uD800")
+        val single = message("\uD800")
         val expected = frame("""{"jsonrpc":"2.0","method":"source/text","params":{"text":"\ud800"}}""")
-        assertContentEquals(expected, JsonRpcCodec.Default.encode(message))
-        assertContentEquals(expected, BoundedMessageEncoder(expected.size, MAX_NODES, MAX_DEPTH).encode(message))
+        assertContentEquals(expected, JsonRpcCodec.Default.encode(single))
+        assertContentEquals(expected, BoundedMessageEncoder(expected.size, MAX_NODES, MAX_DEPTH).encode(single))
         assertFailsWith<JsonRpcProtocolException> {
-            BoundedMessageEncoder(expected.size - 1, MAX_NODES, MAX_DEPTH).encode(message)
+            BoundedMessageEncoder(expected.size - 1, MAX_NODES, MAX_DEPTH).encode(single)
         }
         assertFailsWith<JsonRpcProtocolException> {
             BoundedMessageEncoder(EXPANSION_LIMIT, MAX_NODES, MAX_DEPTH).encode(message("\uD800".repeat(REPEATED_UNITS)))
