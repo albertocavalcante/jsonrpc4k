@@ -41,6 +41,22 @@ class BoundedDispatchTest {
     }
 
     @Test
+    fun `close interrupts admission of a large coalesced response batch`() =
+        runTest {
+            val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
+            val connection = Connection(policy, scope = CoroutineScope(backgroundScope.coroutineContext + parent))
+            val frame = codec.encode(ResponseMessage.success(RequestId.of(42), JsonPrimitive("ok")))
+            val batch = ByteArray(frame.size * 1000) { frame[it % frame.size] }
+            val receive = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.receive(batch) }
+            assertFalse(receive.isCompleted, "admission must give cancellation a scheduling opportunity")
+            connection.close()
+            assertFailsWith<kotlinx.coroutines.CancellationException> { withTimeout(1.seconds) { receive.await() } }
+            assertEquals(ConnectionState.Closed, connection.state.value)
+            assertTrue(parent.isActive)
+            parent.cancel()
+        }
+
+    @Test
     fun `close cancels owned handlers without cancelling parent or sibling`() =
         runTest {
             val parent = SupervisorJob(backgroundScope.coroutineContext[Job])
