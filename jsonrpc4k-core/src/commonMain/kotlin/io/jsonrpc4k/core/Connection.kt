@@ -1,5 +1,6 @@
 package io.jsonrpc4k.core
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -8,8 +9,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
@@ -39,7 +40,20 @@ public class Connection(
     @PublishedApi internal val dispatcher: Dispatcher = Dispatcher(json, notificationErrorHandler)
     private var requestIdValue = 0L
     private val requestIdMutex = Mutex()
-    private val outgoingMessages = Channel<Message>(Channel.BUFFERED)
+
+    private sealed interface OutgoingItem {
+        data class Frame(
+            val message: Message,
+        ) : OutgoingItem
+
+        data class Barrier(
+            val completion: CompletableDeferred<Unit>,
+        ) : OutgoingItem
+    }
+
+    private val outgoingMessages = Channel<OutgoingItem>(Channel.BUFFERED)
+    private val outgoingDrain = OutgoingDrain()
+    internal val pendingFlushCount: Int get() = outgoingDrain.pendingCount
     private val decoder = JsonRpcMessageDecoder(codec)
     private val connectionJob = SupervisorJob(scope.coroutineContext[Job])
 
@@ -56,11 +70,49 @@ public class Connection(
 
     /**
      * Flow of outgoing messages that need to be sent over the transport.
+     * Only one collector may be active at a time.
      */
     public val outgoing: Flow<ByteArray> =
-        outgoingMessages
-            .receiveAsFlow()
-            .map { codec.encode(it) }
+        flow {
+            outgoingDrain.acquireCollector()
+            try {
+                for (item in outgoingMessages) {
+                    when (item) {
+                        is OutgoingItem.Frame -> emit(codec.encode(item.message))
+                        is OutgoingItem.Barrier -> item.completion.complete(Unit)
+                    }
+                }
+            } catch (cause: Throwable) {
+                // Cancellation can remove a queued item before control reaches the loop body.
+                outgoingDrain.fail(cause)
+                throw cause
+            } finally {
+                outgoingDrain.releaseCollector()
+            }
+        }
+
+    /**
+     * Waits until preceding frames have returned from the sequential outgoing collector.
+     *
+     * The collector must send each frame directly, without downstream buffering. This confirms
+     * only that its call returned, not that a peer received the data. If a collector is interrupted,
+     * this and later flushes fail, even if the collector was idle. A flush with no collector waits
+     * until one consumes it or the connection closes.
+     */
+    public suspend fun flushOutgoing() {
+        val completion = CompletableDeferred<Unit>(connectionJob)
+        try {
+            outgoingDrain.register(completion)
+            select<Unit> {
+                outgoingMessages.onSend(OutgoingItem.Barrier(completion)) { }
+                completion.onAwait { }
+            }
+            completion.await()
+        } finally {
+            outgoingDrain.unregister(completion)
+            completion.cancel()
+        }
+    }
 
     /**
      * Register a request handler for a method.
@@ -162,7 +214,7 @@ public class Connection(
 
         val deferred = dispatcher.registerPendingRequest(id)
         return try {
-            outgoingMessages.send(request)
+            outgoingMessages.send(OutgoingItem.Frame(request))
             val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
             if (result == null) {
                 throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
@@ -219,7 +271,7 @@ public class Connection(
         params: JsonElement?,
     ) {
         val notification = NotificationMessage(method = method, params = params)
-        outgoingMessages.send(notification)
+        outgoingMessages.send(OutgoingItem.Frame(notification))
     }
 
     /**
@@ -266,7 +318,7 @@ public class Connection(
                 for (message in messages) {
                     val response = dispatcher.dispatch(message)
                     if (response != null) {
-                        outgoingMessages.send(response)
+                        outgoingMessages.send(OutgoingItem.Frame(response))
                     }
                 }
             } finally {
