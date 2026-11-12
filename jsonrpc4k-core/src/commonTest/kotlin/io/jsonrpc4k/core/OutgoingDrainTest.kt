@@ -188,7 +188,12 @@ class OutgoingDrainTest {
             connection.notify("first", null)
             assertTrue(first.await().decodeToString().contains("\"first\""))
             connection.notify("second", null)
-            assertTrue(connection.outgoing.first().decodeToString().contains("\"second\""))
+            assertTrue(
+                connection.outgoing
+                    .first()
+                    .decodeToString()
+                    .contains("\"second\""),
+            )
             withTimeout(1.seconds) { assertFailsWith<IllegalStateException> { connection.flushOutgoing() } }
             connection.close()
         }

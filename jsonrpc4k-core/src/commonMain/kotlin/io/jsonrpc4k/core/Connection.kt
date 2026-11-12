@@ -40,10 +40,15 @@ public class Connection(
     @PublishedApi internal val dispatcher: Dispatcher = Dispatcher(json, notificationErrorHandler)
     private var requestIdValue = 0L
     private val requestIdMutex = Mutex()
-    private sealed interface OutgoingItem {
-        data class Frame(val message: Message) : OutgoingItem
 
-        data class Barrier(val completion: CompletableDeferred<Unit>) : OutgoingItem
+    private sealed interface OutgoingItem {
+        data class Frame(
+            val message: Message,
+        ) : OutgoingItem
+
+        data class Barrier(
+            val completion: CompletableDeferred<Unit>,
+        ) : OutgoingItem
     }
 
     private val outgoingMessages = Channel<OutgoingItem>(Channel.BUFFERED)
