@@ -33,16 +33,14 @@ version = os.environ["FIXTURE_VERSION"]
 failed = False
 for name in ("jsonrpc4k-core-jvm", "jsonrpc4k-transport-jvm"):
     directory = root / name / version
-    metadata = json.loads((directory / f"{name}-{version}.module").read_text())
-    print(f"{name}: variant attributes {[(v['name'], v['attributes']) for v in metadata['variants']]}")
     root_name = name.removesuffix("-jvm")
-    root_metadata = json.loads((root / root_name / version / f"{root_name}-{version}.module").read_text())
-    print(f"{root_name}: JVM variant attributes {[(v['name'], v['attributes']) for v in root_metadata['variants'] if 'jvm' in v['name'].lower()]}")
-    versions = [v["attributes"]["org.gradle.jvm.version"] for v in metadata["variants"] if "org.gradle.jvm.version" in v["attributes"]]
-    print(f"{name}: Gradle JVM versions {versions}")
-    if not versions or any(v > 17 for v in versions):
-        print(f"{name}: incompatible Gradle JVM metadata")
-        failed = True
+    for component in (root_name, name):
+        metadata = json.loads((root / component / version / f"{component}-{version}.module").read_text())
+        variants = [v for v in metadata["variants"] if v["attributes"].get("org.jetbrains.kotlin.platform.type") == "jvm" and v["attributes"].get("org.gradle.usage") in ("java-api", "java-runtime")]
+        print(f"{component}: JVM variant attributes {[(v['name'], v['attributes']) for v in variants]}")
+        if {v["attributes"].get("org.gradle.usage") for v in variants} != {"java-api", "java-runtime"} or any(v["attributes"].get("org.gradle.jvm.version") != 17 for v in variants):
+            print(f"{component}: missing or incompatible JVM API/runtime metadata")
+            failed = True
     with zipfile.ZipFile(directory / f"{name}-{version}.jar") as jar:
         classes = [n for n in jar.namelist() if n.endswith(".class")]
         if not classes:
@@ -57,7 +55,7 @@ if failed:
 PY
 
 JAVA_HOME="$JAVA_HOME_17_X64" PATH="$JAVA_HOME_17_X64/bin:$PATH" \
-	./gradlew --no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -p "$consumer_dir" run || status=1
+	./gradlew --no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -p "$consumer_dir" run verifyJava16Rejected || status=1
 ./gradlew --no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m \
 	--init-script tools/ci/java17-consumer/publish.init.gradle.kts \
 	:jsonrpc4k-core:jvmTest :jsonrpc4k-transport:jvmTest || status=1
