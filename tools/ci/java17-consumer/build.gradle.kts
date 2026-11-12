@@ -41,7 +41,12 @@ tasks.register("verifyJava16Rejected") {
                 ?: error("A Java 16 consumer unexpectedly resolved $module")
             val details = failure.stackTraceToString()
             val requested = "io.github.albertocavalcante:$module:${System.getenv("FIXTURE_VERSION")}"
-            check("No matching variant of $requested" in details && "Java 16" in details && "Java 17" in details) {
+            val noMatchingVariant =
+                "No matching variant of $requested" in details && "Java 16" in details && "Java 17" in details
+            val jvmTooNew =
+                "JVM runtime version 16" in details &&
+                    "'$requested' is only compatible with JVM runtime version 17" in details
+            check(noMatchingVariant || jvmTooNew) {
                 "Java 16 probe failed for an unrelated reason: $details"
             }
         }

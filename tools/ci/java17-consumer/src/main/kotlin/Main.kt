@@ -9,17 +9,18 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonElement
 
-fun main() = runBlocking {
-    check(System.getProperty("java.specification.version") == "17")
-    check(Transport::class.java.isInterface)
-    Class.forName("kotlinx.collections.immutable.ExtensionsKt")
-    val codec = JsonRpcCodec.Default
-    val connection = Connection()
-    val response = async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("test", null) }
-    val outgoing = connection.outgoing.first().decodeToString()
-    check(outgoing.contains("\"method\":\"test\""))
-    connection.receive(codec.encode(ResponseMessage.success(RequestId.of(1), null)))
-    check(response.await() == null)
-    connection.close()
-    println("Java 17 artifact consumer passed")
-}
+fun main() =
+    runBlocking {
+        check(System.getProperty("java.specification.version") == "17")
+        check(Transport::class.java.isInterface)
+        Class.forName("kotlinx.collections.immutable.ExtensionsKt")
+        val codec = JsonRpcCodec.Default
+        val connection = Connection()
+        val response = async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("test", null) }
+        val outgoing = connection.outgoing.first().decodeToString()
+        check(outgoing.contains("\"method\":\"test\""))
+        connection.receive(codec.encode(ResponseMessage.success(RequestId.of(1), null)))
+        check(response.await() == null)
+        connection.close()
+        println("Java 17 artifact consumer passed")
+    }

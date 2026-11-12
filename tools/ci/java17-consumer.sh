@@ -36,7 +36,7 @@ for name in ("jsonrpc4k-core-jvm", "jsonrpc4k-transport-jvm"):
     root_name = name.removesuffix("-jvm")
     for component in (root_name, name):
         metadata = json.loads((root / component / version / f"{component}-{version}.module").read_text())
-        variants = [v for v in metadata["variants"] if v["attributes"].get("org.jetbrains.kotlin.platform.type") == "jvm" and v["attributes"].get("org.gradle.usage") in ("java-api", "java-runtime")]
+        variants = [v for v in metadata["variants"] if v["attributes"].get("org.gradle.category") == "library" and v["attributes"].get("org.jetbrains.kotlin.platform.type") == "jvm" and v["attributes"].get("org.gradle.usage") in ("java-api", "java-runtime")]
         print(f"{component}: JVM variant attributes {[(v['name'], v['attributes']) for v in variants]}")
         if {v["attributes"].get("org.gradle.usage") for v in variants} != {"java-api", "java-runtime"} or any(v["attributes"].get("org.gradle.jvm.version") != 17 for v in variants):
             print(f"{component}: missing or incompatible JVM API/runtime metadata")
