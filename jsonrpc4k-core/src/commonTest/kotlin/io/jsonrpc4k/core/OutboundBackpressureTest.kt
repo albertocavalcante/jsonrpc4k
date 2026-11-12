@@ -545,4 +545,92 @@ class OutboundBackpressureTest {
         assertEquals(0, queue.outstandingBytes)
     }
 
+
+    @Test
+    fun `public control saturation fails connection and wakes all waiters`() = runTest {
+        val connection = Connection(
+            BoundedDispatchPolicy(1, 1),
+            InboundResourceLimits(65536, 32, 65536),
+            OutboundResourceLimits(65536, 65536, 1, 8, 65536, 1, 10000, 32),
+            scope = backgroundScope,
+        )
+        val writerEntered = CompletableDeferred<Unit>()
+        val releaseWriter = CompletableDeferred<Unit>()
+        val handlerEntered = CompletableDeferred<Unit>()
+        val handlerRelease = CompletableDeferred<Unit>()
+        val frames = mutableListOf<ByteArray>()
+        val writer = backgroundScope.async {
+            runCatching {
+                connection.outgoing.collect {
+                    frames.add(it)
+                    writerEntered.complete(Unit)
+                    releaseWriter.await()
+                }
+            }
+        }
+        connection.onRequest("hold") { _: JsonElement? ->
+            handlerEntered.complete(Unit)
+            handlerRelease.await()
+            null
+        }
+        connection.notify("first", null)
+        withTimeout(1000) { writerEntered.await() }
+        val pending = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { connection.request<JsonElement>("pending", null) }
+        }
+        val blocked = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { connection.notify("blocked", null) }
+        }
+        val flush = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { connection.flushOutgoing() }
+        }
+        val codec = JsonRpcCodec.Default
+        connection.receive(codec.encode(RequestMessage(RequestId.of(1), "hold")))
+        withTimeout(1000) { handlerEntered.await() }
+        connection.receive(codec.encode(RequestMessage(RequestId.of(2), "hold")))
+        runCurrent()
+        connection.receive(codec.encode(RequestMessage(RequestId.of(3), "hold")))
+        connection.receive(codec.encode(RequestMessage(RequestId.of(4), "hold")))
+        runCatching { connection.receive(codec.encode(RequestMessage(RequestId.of(5), "hold"))) }
+        val failed = connection.state.value
+        assertTrue(failed is ConnectionState.Failed)
+        assertTrue(failed.cause.message.orEmpty().contains("control capacity"))
+        withTimeout(1000) {
+            assertTrue(pending.await().isFailure)
+            assertTrue(blocked.await().isFailure)
+            assertTrue(flush.await().isFailure)
+        }
+        releaseWriter.complete(Unit)
+        handlerRelease.complete(Unit)
+        withTimeout(1000) { writer.await() }
+        assertEquals(1, frames.size)
+        assertTrue(runCatching { connection.notify("later", null) }.isFailure)
+        connection.close()
+    }
+
+
+    @Test
+    fun `wire byte budget enforces exact boundary independently of frame count`() = runTest {
+        val message = NotificationMessage("byte-budget", JsonPrimitive("é".repeat(128)))
+        val size = JsonRpcCodec.Default.encode(message).size
+        val exact = BoundedOutgoing(OutboundResourceLimits(size, size * 2, 4, 4, size, 1, 1000, 32)) { throw it }
+        exact.send(message)
+        exact.send(message)
+        assertEquals(size * 2, exact.outstandingBytes)
+        assertEquals(2, exact.outstandingCount)
+        exact.close(IllegalStateException("closed"))
+        assertEquals(0, exact.outstandingBytes)
+
+        val short = BoundedOutgoing(OutboundResourceLimits(size, size * 2 - 1, 4, 4, size, 1, 1000, 32)) { throw it }
+        short.send(message)
+        val second = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { short.send(message) }
+        assertFalse(second.isCompleted)
+        val first = short.items.receive()
+        first.lease.release()
+        withTimeout(1000) { second.await() }
+        assertEquals(size, short.outstandingBytes)
+        short.close(IllegalStateException("closed"))
+        assertEquals(0, short.outstandingBytes)
+    }
+
 }

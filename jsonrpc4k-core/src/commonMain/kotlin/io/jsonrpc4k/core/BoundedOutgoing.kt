@@ -233,28 +233,37 @@ internal class BoundedOutgoing(
         }
     }
 
-    fun offer(message: Message, onDequeued: (() -> Unit)?): OfferResult {
-        try {
-            if (!beginControl()) return OfferResult.TERMINAL_TRANSITION
-            try {
-                val bytes = encoder.encode(message)
-                val lease = reserve(bytes.size, true)
-                if (lease == null) {
-                    if (state.value.deliveryLost) return OfferResult.TERMINAL_TRANSITION
-                    error("Outbound control capacity exceeded")
-                }
-                transfer(Item.Frame(bytes, onDequeued, lease))
-            } finally {
-                mutate { it.copy(controlEncoding = false) }
-            }
+    private fun encodeControl(message: Message, onDequeued: (() -> Unit)?): OfferResult {
+        val bytes = encoder.encode(message)
+        val lease = reserve(bytes.size, true)
+        if (lease != null) {
+            transfer(Item.Frame(bytes, onDequeued, lease))
             return OfferResult.ACCEPTED
+        }
+        if (state.value.deliveryLost) return OfferResult.TERMINAL_TRANSITION
+        error("Outbound control capacity exceeded")
+    }
+
+    fun offer(message: Message, onDequeued: (() -> Unit)?): OfferResult =
+        try {
+            if (!beginControl()) {
+                OfferResult.TERMINAL_TRANSITION
+            } else {
+                try {
+                    encodeControl(message, onDequeued)
+                } finally {
+                    mutate { it.copy(controlEncoding = false) }
+                }
+            }
         } catch (cause: Exception) {
-            if (!claimControlFailure(cause)) return OfferResult.TERMINAL_TRANSITION
-            fail(cause)
-            return OfferResult.REJECTED
+            if (claimControlFailure(cause)) {
+                fail(cause)
+                OfferResult.REJECTED
+            } else {
+                OfferResult.TERMINAL_TRANSITION
+            }
         } catch (fatal: Throwable) {
             if (claimControlFailure(fatal)) fail(fatal)
             throw fatal
         }
-    }
 }

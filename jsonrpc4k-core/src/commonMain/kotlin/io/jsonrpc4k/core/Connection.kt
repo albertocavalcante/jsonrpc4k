@@ -115,7 +115,7 @@ public class Connection(
             fail = { cause -> boundedPump?.outputInterrupted(cause) },
             haltIngress = { boundedPump?.close(); dispatcher.pending.close() },
             parentActive = { scope.coroutineContext[Job]?.isActive != false },
-            parentInactive = { transitionClosed() },
+            parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
         )
         installBoundedPump(policy, scope, inboundLimits)
         if (!connectionJob.isActive) {
@@ -161,7 +161,7 @@ public class Connection(
 
                         override fun fail(cause: Throwable) {
                             if (scope.coroutineContext[Job]?.isActive == false) {
-                                transitionClosed()
+                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                                 return
                             }
                             if (boundedOutgoing?.claimFailure(cause) == false) return
@@ -181,7 +181,7 @@ public class Connection(
     init {
         cancellationSignal.invokeOnCompletion {
             if (!connectionJob.isActive) {
-                transitionClosed()
+                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                 boundedPump?.close()
                 dispatcher.pending.close()
                 outgoingMessages.cancel()
@@ -218,7 +218,7 @@ public class Connection(
                                 bounded.resolveCollectorLoss(cause)
                                 boundedPump?.outputInterrupted(cause)
                             } else {
-                                transitionClosed()
+                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                             }
                             val observed = mutableState.value
                             if (observed !is ConnectionState.Open) {
@@ -246,7 +246,7 @@ public class Connection(
                     boundedOutgoing?.resolveCollectorLoss(cause)
                     boundedPump?.outputInterrupted(cause)
                 } else {
-                    transitionClosed()
+                    transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                 }
                 val observed = mutableState.value
                 if (boundedOutgoing == null || observed !is ConnectionState.Open) {
@@ -400,7 +400,7 @@ public class Connection(
                     dispatcher.pending.cancel(id, deferred)
                 }
             }
-            if (result == null) throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+            if (result == null) requestTimedOut(method)
             return result.value
         }
 
@@ -410,7 +410,7 @@ public class Connection(
         return try {
             outgoingMessages.send(OutgoingItem.Frame(request))
             val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
-            if (result == null) throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
+            if (result == null) requestTimedOut(method)
             result.value
         } finally {
             dispatcher.pending.cancel(id, deferred)
@@ -534,19 +534,11 @@ public class Connection(
         receive(data.encodeToByteArray())
     }
 
-    private fun transitionClosed() {
-        val claimed = boundedOutgoing?.closeNormally()
-        val terminal = if (claimed == null) ConnectionState.Closed else ConnectionState.Failed(claimed)
-        if (mutableState.compareAndSet(ConnectionState.Open, terminal) && claimed != null) {
-            outgoingDrain.fail(claimed)
-        }
-    }
-
     /**
      * Close the connection and cancel all pending operations.
      */
     public fun close() {
-        transitionClosed()
+        transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
         boundedPump?.close()
         dispatcher.pending.close()
         outgoingMessages.cancel()
@@ -560,3 +552,16 @@ private class RequestIds {
 
     suspend fun next(): Long = mutex.withLock { ++value }
 }
+
+private fun transitionClosed(
+    state: MutableStateFlow<ConnectionState>,
+    outgoing: BoundedOutgoing?,
+    drain: OutgoingDrain,
+) {
+    val claimed = outgoing?.closeNormally()
+    val terminal = if (claimed == null) ConnectionState.Closed else ConnectionState.Failed(claimed)
+    if (state.compareAndSet(ConnectionState.Open, terminal) && claimed != null) drain.fail(claimed)
+}
+
+private fun requestTimedOut(method: String): Nothing =
+    throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request timed out: $method")
