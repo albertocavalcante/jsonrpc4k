@@ -34,6 +34,10 @@ failed = False
 for name in ("jsonrpc4k-core-jvm", "jsonrpc4k-transport-jvm"):
     directory = root / name / version
     metadata = json.loads((directory / f"{name}-{version}.module").read_text())
+    print(f"{name}: variant attributes {[(v['name'], v['attributes']) for v in metadata['variants']]}")
+    root_name = name.removesuffix("-jvm")
+    root_metadata = json.loads((root / root_name / version / f"{root_name}-{version}.module").read_text())
+    print(f"{root_name}: JVM variant attributes {[(v['name'], v['attributes']) for v in root_metadata['variants'] if 'jvm' in v['name'].lower()]}")
     versions = [v["attributes"]["org.gradle.jvm.version"] for v in metadata["variants"] if "org.gradle.jvm.version" in v["attributes"]]
     print(f"{name}: Gradle JVM versions {versions}")
     if not versions or any(v > 17 for v in versions):

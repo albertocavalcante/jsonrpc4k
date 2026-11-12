@@ -12,7 +12,7 @@ kotlin {
         }
     }
 
-    jvmToolchain(21)
+    jvmToolchain(17)
 
     js(IR) {
         browser()
