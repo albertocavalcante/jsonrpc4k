@@ -4,7 +4,11 @@ import org.gradle.api.tasks.testing.Test
 allprojects {
     tasks.withType<Test>().configureEach {
         doFirst {
-            val version = javaLauncher.get().metadata.languageVersion.asInt()
+            val version =
+                javaLauncher
+                    .get()
+                    .metadata.languageVersion
+                    .asInt()
             check(version == 17) { "JVM tests must run on Java 17, got $version" }
             println("JVM tests use Java $version")
         }
