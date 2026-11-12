@@ -466,4 +466,55 @@ class OutboundBackpressureTest {
         assertEquals(0, queue.outstandingCount)
     }
 
+
+    @Test
+    fun `parent first writer interruption remains a normal close`() = runTest {
+        val parent = Job()
+        val connection = Connection(
+            BoundedDispatchPolicy(1, 2),
+            InboundResourceLimits(65536, 32, 65536),
+            OutboundResourceLimits(65536, 65536, 1, 8, 65536, 2, 10000, 32),
+            scope = CoroutineScope(parent + StandardTestDispatcher(testScheduler)),
+        )
+        val entered = CompletableDeferred<Unit>()
+        val failWriter = CompletableDeferred<Unit>()
+        val writer = backgroundScope.async {
+            runCatching {
+                connection.outgoing.collect {
+                    entered.complete(Unit)
+                    failWriter.await()
+                    error("late writer failure")
+                }
+            }
+        }
+        connection.notify("first", null)
+        entered.await()
+        parent.cancel()
+        failWriter.complete(Unit)
+        withTimeout(1000) { writer.await() }
+        assertEquals(ConnectionState.Closed, connection.state.value)
+        assertTrue(runCatching { connection.notify("late", null) }.isFailure)
+    }
+
+    @Test
+    fun `writer failure first remains failed after parent cancellation`() = runTest {
+        val parent = Job()
+        val connection = Connection(
+            BoundedDispatchPolicy(1, 2),
+            InboundResourceLimits(65536, 32, 65536),
+            OutboundResourceLimits(65536, 65536, 1, 8, 65536, 2, 10000, 32),
+            scope = CoroutineScope(parent + StandardTestDispatcher(testScheduler)),
+        )
+        val original = IllegalStateException("first writer failure")
+        val writer = backgroundScope.async {
+            runCatching { connection.outgoing.collect { throw original } }
+        }
+        connection.notify("first", null)
+        withTimeout(1000) { writer.await() }
+        parent.cancel()
+        val failed = connection.state.value
+        assertTrue(failed is ConnectionState.Failed)
+        assertSame(original, failed.cause)
+    }
+
 }
