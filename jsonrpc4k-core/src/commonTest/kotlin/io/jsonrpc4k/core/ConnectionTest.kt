@@ -4,12 +4,20 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -47,6 +55,148 @@ private data class ConnectionAddResult(
 )
 
 class ConnectionTest {
+    @Test
+    fun `close cancels an active receiver without cancelling its parent`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            connection.onRequest("wait") { _: kotlinx.serialization.json.JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
+            val receive = launch { connection.receive(JsonRpcCodec.Default.encode(RequestMessage(RequestId.of(1), "wait"))) }
+            entered.await()
+            connection.close()
+            receive.join()
+            receive.isCancelled shouldBe true
+            parent.isActive shouldBe true
+            assertFailsWith<kotlinx.coroutines.CancellationException> {
+                connection.receive(JsonRpcCodec.Default.encode(NotificationMessage("ignored")))
+            }
+            parent.cancel()
+        }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cancelled caller removes a registered waiter`() =
+        runTest {
+            val connection = Connection()
+            val request = launch { connection.request<JsonPrimitive>("never", null) }
+            runCurrent()
+            connection.dispatcher.pending.count shouldBe 1
+            request.cancelAndJoin()
+            connection.dispatcher.pending.count shouldBe 0
+            connection.close()
+        }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `close cleans up a request suspended while sending`() =
+        runTest {
+            val connection = Connection()
+            repeat(64) { connection.notify("fill", null) }
+            val request = launch { runCatching { connection.request<JsonPrimitive>("never", null) } }
+            runCurrent()
+            connection.dispatcher.pending.count shouldBe 1
+            connection.close()
+            request.join()
+            connection.dispatcher.pending.count shouldBe 0
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+        }
+
+    @Test
+    fun `cancel all remains reusable while close seals the registry`() =
+        runTest {
+            val dispatcher = Dispatcher()
+            val id = RequestId.of(1)
+            val first = dispatcher.registerPendingRequest(id)
+            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
+            dispatcher.cancelAllPendingRequests()
+            first.isCancelled shouldBe true
+            val second = dispatcher.registerPendingRequest(id)
+            dispatcher.pending.cancel(id, first)
+            dispatcher.pending.count shouldBe 1
+            dispatcher.pending.close()
+            second.isCancelled shouldBe true
+            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
+        }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `parent cancellation cancels pending requests and seals connection`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            val request = launch { connection.request<JsonPrimitive>("never", null) }
+            runCurrent()
+            connection.dispatcher.pending.count shouldBe 1
+            parent.cancel()
+            request.join()
+            connection.dispatcher.pending.count shouldBe 0
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+        }
+
+    @Test
+    fun `concurrent registration and close leave no pending waiters`() =
+        runTest {
+            repeat(100) {
+                val dispatcher = Dispatcher()
+                val registration = async(Dispatchers.Default) { runCatching { dispatcher.registerPendingRequest(RequestId.of(1)) } }
+                val close = async(Dispatchers.Default) { dispatcher.pending.close() }
+                val deferred = registration.await().getOrNull()
+                close.await()
+                dispatcher.pending.count shouldBe 0
+                if (deferred != null) deferred.isCancelled shouldBe true
+                assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(RequestId.of(2)) }
+            }
+        }
+
+    @Test
+    fun `closing a connection preserves its caller scope`() =
+        runTest {
+            val parent = Job()
+            val connection = Connection(scope = CoroutineScope(parent))
+            connection.close()
+            parent.isActive shouldBe true
+            parent.cancel()
+        }
+
+    @Test
+    fun `already cancelled parent starts a closed connection`() =
+        runTest {
+            val parent = Job()
+            parent.cancel()
+            val connection = Connection(scope = CoroutineScope(parent))
+            assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
+            connection.close()
+        }
+
+    @Test
+    fun `request timeout cleans the waiter`() =
+        runTest {
+            val connection = Connection()
+            val error = assertFailsWith<JsonRpcException> { connection.request<JsonPrimitive>("never", null, 10.milliseconds) }
+            error.code shouldBe ResponseError.REQUEST_CANCELLED
+            connection.dispatcher.pending.count shouldBe 0
+            connection.close()
+        }
+
+    @Test
+    fun `caller timeout remains cancellation rather than request timeout error`() =
+        runTest {
+            val connection = Connection()
+            assertFailsWith<TimeoutCancellationException> {
+                withTimeout(10.milliseconds) {
+                    connection.request<JsonPrimitive>("never", null)
+                }
+            }
+            connection.dispatcher.pending.count shouldBe 0
+            connection.close()
+        }
+
     // ===== Request Handler Registration Tests =====
 
     @Test
