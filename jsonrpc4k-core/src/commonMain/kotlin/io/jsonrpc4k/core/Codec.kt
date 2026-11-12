@@ -21,10 +21,11 @@ public class JsonRpcCodec(
 
     /**
      * Encode a message to wire format with Content-Length header.
+     * Lone UTF-16 units in quoted strings use JSON escapes to preserve their value on the wire.
      */
     public fun encode(message: Message): ByteArray {
         val content = json.encodeToString(Message.serializer(), message)
-        val contentBytes = content.encodeToByteArray()
+        val contentBytes = content.escapeLoneJsonSurrogates(allowComments = allowsComments).encodeToByteArray()
         val header = "Content-Length: ${contentBytes.size}\r\n\r\n"
         return header.encodeToByteArray() + contentBytes
     }

@@ -16,7 +16,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * Container changes after capture cannot alter the snapshot. Concurrent mutation during capture
  * can fail or produce a mixed view; this API does not provide a coherent concurrent snapshot.
  * Source collection operations must terminate and must not themselves allocate without bound.
- * Raw unquoted JSON literals retain their existing semantics and are not validated as JSON.
+ * Raw unquoted JSON literals are not validated as JSON. Quoted strings in valid JSON preserve
+ * lone UTF-16 units using escapes before UTF-8 conversion; raw spelling can consequently change.
+ * Malformed raw JSON is not repaired and has no quoted-value preservation guarantee.
  * Node accounting treats each raw literal as one primitive; it does not count nodes encoded
  * inside the raw text. The emitted nesting limit is still checked on the resulting bytes.
  *
@@ -45,7 +47,7 @@ public class BoundedMessageEncoder(
                 is RequestMessage -> json.encodeToString(RequestMessage.serializer(), snapshot)
                 is NotificationMessage -> json.encodeToString(NotificationMessage.serializer(), snapshot)
                 is ResponseMessage -> json.encodeToString(ResponseMessage.serializer(), snapshot)
-            }.encodeToByteArray()
+            }.escapeLoneJsonSurrogates(maxWireBytes).encodeToByteArray()
         JsonNestingGuard(maxJsonNesting, false).check(body)
         val header = "Content-Length: ${body.size}\r\n\r\n".encodeToByteArray()
         if (body.size > maxWireBytes - header.size) throw JsonRpcProtocolException("Encoded frame exceeds $maxWireBytes bytes")
