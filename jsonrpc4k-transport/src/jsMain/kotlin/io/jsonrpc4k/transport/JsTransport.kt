@@ -22,6 +22,18 @@ internal external object NodeProcess {
 }
 
 /**
+ * External declarations for the Node.js fs module.
+ */
+@JsModule("fs")
+@JsNonModule
+@Suppress("UnusedParameter")
+internal external object Fs {
+    fun lstatSync(path: String): dynamic
+
+    fun unlinkSync(path: String)
+}
+
+/**
  * External declarations for Node.js Buffer.
  */
 @JsModule("buffer")
@@ -193,30 +205,39 @@ public class SocketTransport internal constructor(
         public suspend fun connect(
             host: String,
             port: Int,
-        ): SocketTransport =
-            suspendCoroutine { continuation ->
-                var resolved = false
-                var socketRef: dynamic = null
-
-                socketRef =
-                    Net.createConnection(port, host) {
-                        if (!resolved) {
-                            resolved = true
-                            continuation.resume(SocketTransport(socketRef))
-                        }
-                    }
-
-                socketRef.once("error") { error: dynamic ->
-                    if (!resolved) {
-                        resolved = true
-                        continuation.resumeWithException(
-                            TransportException("Failed to connect to $host:$port: ${error?.message ?: error}"),
-                        )
-                    }
-                }
-            }
+        ): SocketTransport = connectNodeSocket("$host:$port") { onConnect -> Net.createConnection(port, host, onConnect) }
     }
 }
+
+/**
+ * Create a Node.js socket with [create], which receives the connect callback, and wait for it to connect.
+ * [target] only names the endpoint in the failure message.
+ */
+internal suspend fun connectNodeSocket(
+    target: String,
+    create: (onConnect: () -> Unit) -> dynamic,
+): SocketTransport =
+    suspendCoroutine { continuation ->
+        var resolved = false
+        var socketRef: dynamic = null
+
+        socketRef =
+            create {
+                if (!resolved) {
+                    resolved = true
+                    continuation.resume(SocketTransport(socketRef))
+                }
+            }
+
+        socketRef.once("error") { error: dynamic ->
+            if (!resolved) {
+                resolved = true
+                continuation.resumeWithException(
+                    TransportException("Failed to connect to $target: ${error?.message ?: error}"),
+                )
+            }
+        }
+    }
 
 /**
  * Copy the bytes of a Node.js Buffer chunk (a Uint8Array) into a new ByteArray.

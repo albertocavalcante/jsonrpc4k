@@ -1,7 +1,5 @@
 package io.jsonrpc4k.transport
 
-import kotlinx.coroutines.runBlocking
-
 /**
  * Native implementation of TransportFactory.
  *
@@ -13,16 +11,6 @@ public actual object TransportFactory {
      * Create a stdio transport.
      */
     public actual fun stdio(): Transport = createStdioTransport()
-
-    /**
-     * Create a socket transport that connects to the given host and port.
-     *
-     * Note: This is a blocking call.
-     */
-    public actual fun socket(
-        host: String,
-        port: Int,
-    ): Transport = runBlocking { createSocketTransport(host, port) }
 }
 
 /**
@@ -30,10 +18,13 @@ public actual object TransportFactory {
  */
 internal expect fun createStdioTransport(): Transport
 
-/**
- * Create a platform-specific socket transport.
- */
-internal expect suspend fun createSocketTransport(
-    host: String,
-    port: Int,
-): Transport
+// Windows named pipes do not exist on POSIX, and the Windows native target has no validated
+// implementation yet, so no native target supports them.
+internal actual suspend fun connectNamedPipe(pipePath: String): Transport =
+    throw UnsupportedTransportException("Named pipes are not supported on native targets: $pipePath")
+
+internal actual suspend fun bindNamedPipe(pipePath: String): LocalListener =
+    throw UnsupportedTransportException("Named pipes are not supported on native targets: $pipePath")
+
+internal actual fun connectNodeIpc(): Transport =
+    throw UnsupportedTransportException("Node IPC exists only in Node.js processes started with an IPC channel")

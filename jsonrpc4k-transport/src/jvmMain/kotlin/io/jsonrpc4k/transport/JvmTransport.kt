@@ -7,7 +7,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -241,13 +240,9 @@ public class SocketTransport internal constructor(
  */
 public actual object TransportFactory {
     public actual fun stdio(): Transport = StdioTransport()
-
-    public actual fun socket(
-        host: String,
-        port: Int,
-    ): Transport {
-        // Note: This is a blocking call, should be used with care
-        // Prefer using SocketTransport.connect() for async connection
-        return runBlocking { SocketTransport.connect(host, port) }
-    }
 }
+
+internal actual suspend fun connectTcp(
+    host: String,
+    port: Int,
+): Transport = SocketTransport.connect(host, port)

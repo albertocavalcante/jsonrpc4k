@@ -88,7 +88,7 @@ internal actual fun createStdioTransport(): Transport = MingwStdioTransport()
 /**
  * Create the platform-specific socket transport for Windows.
  */
-internal actual suspend fun createSocketTransport(
+internal actual suspend fun connectTcp(
     host: String,
     port: Int,
 ): Transport = MingwSocketTransport.connect(host, port)

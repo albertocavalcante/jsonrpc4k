@@ -53,7 +53,7 @@ internal actual fun createStdioTransport(): Transport = PosixStdioTransport()
 /**
  * Create the platform-specific socket transport for POSIX platforms.
  */
-internal actual suspend fun createSocketTransport(
+internal actual suspend fun connectTcp(
     host: String,
     port: Int,
 ): Transport = PosixSocketTransport.connect(host, port)
