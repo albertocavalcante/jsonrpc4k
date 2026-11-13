@@ -26,8 +26,12 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import platform.posix.EINTR
 import platform.posix.FIONBIO
+import platform.posix.POLLERR
+import platform.posix.POLLHUP
+import platform.posix.POLLNVAL
 import platform.posix.POLLRDNORM
 import platform.posix.POLLWRNORM
 import platform.posix.SD_SEND
@@ -50,11 +54,13 @@ import platform.posix.write
 import platform.windows.ADDRINFOA
 import platform.windows.AF_INET
 import platform.windows.SOCK_STREAM
+import platform.windows.Sleep
 import platform.windows.connect
 import platform.windows.freeaddrinfo
 import platform.windows.getaddrinfo
 import platform.windows.socket
 import kotlin.concurrent.AtomicInt
+import kotlin.time.TimeSource
 
 // Constants for Windows sockets
 internal const val SOCKET_ERROR_VALUE = -1
@@ -62,6 +68,13 @@ internal val INVALID_SOCKET_VALUE = ULong.MAX_VALUE
 
 // How long a waiting read or a write to a full send buffer sleeps in WSAPoll() before it re-checks close().
 private const val SOCKET_POLL_MILLIS = 100
+
+// revents that let a read make progress: data, or an EOF, reset or invalid handle that recv then reports.
+private const val READ_READY = POLLRDNORM or POLLHUP or POLLERR or POLLNVAL
+
+// revents that let a write make progress. POLLHUP is left out: WSAPoll reports it once the peer has shut down its
+// sending side, whatever was requested, while that peer may still read and the send buffer may still be full.
+private const val WRITE_READY = POLLWRNORM or POLLERR or POLLNVAL
 
 // Returned by a poll slice that found nothing to read.
 private val NO_DATA = ByteArray(0)
@@ -211,9 +224,11 @@ internal class MingwStdioTransport(
  * Socket transport for Windows using Winsock2.
  *
  * The socket is non-blocking and every wait is a `WSAPoll()` slice of [SOCKET_POLL_MILLIS] that re-checks [close]
- * and the collector's cancellation in between: a collector that stops early (for example `first`) or is cancelled
- * returns within a slice, and [close] never waits on the peer. Blocking `recv` and `send` would not do: Winsock's
- * `shutdown` does not end them, and only `closesocket` from another thread does.
+ * and the caller's cancellation in between: a collector that stops early (for example `first`) or is cancelled
+ * returns within a slice, and [close] never waits on the peer. The transport stays open afterwards, but the bytes
+ * already read for that collector are dropped: the chunk of the slice in progress and any chunks that `flowOn`
+ * buffered ahead of it. Blocking `recv` and `send` would not do: Winsock's `shutdown` does not end them, and only
+ * `closesocket` from another thread does.
  *
  * [close] works from a cancelled coroutine. It sends FIN with `shutdown(SD_SEND)` at once, so the peer sees EOF
  * after the bytes already sent, and then closes the socket under the read and write locks, so a concurrent read or
@@ -247,7 +262,8 @@ internal class MingwSocketTransport internal constructor(
                     // Poll slices never suspend, so a cancelled collector (for example `first`) is noticed here.
                     currentCoroutineContext().ensureActive()
                     val chunk = readLock.withLock { readStep(buffer) } ?: break
-                    if (chunk.isNotEmpty()) emit(chunk)
+                    // After a quiet slice, let other work queued on the IO pool run before the next one.
+                    if (chunk.isNotEmpty()) emit(chunk) else yield()
                 }
             }
         }.flowOn(Dispatchers.IO)
@@ -255,7 +271,7 @@ internal class MingwSocketTransport internal constructor(
     /** Returns the next chunk, [NO_DATA] after a quiet poll slice, or null at EOF or once closed. */
     private fun readStep(buffer: CPointer<ByteVar>): ByteArray? {
         if (closing.value != 0 || eof.value != 0) return null
-        if (!pollSocket(socketHandle, POLLRDNORM, SOCKET_POLL_MILLIS)) return NO_DATA
+        if (!pollSocket(socketHandle, POLLRDNORM, READ_READY, SOCKET_POLL_MILLIS)) return NO_DATA
         val count = recv(socketHandle, buffer, bufferSize, 0)
         return when {
             // Closing ends incoming quietly, including a read that returns only after close().
@@ -302,7 +318,7 @@ internal class MingwSocketTransport internal constructor(
             val reason = if (closing.value != 0) "Transport is closed" else "Write failed: socket error $error"
             throw TransportException(reason)
         }
-        pollSocket(socketHandle, POLLWRNORM, SOCKET_POLL_MILLIS)
+        pollSocket(socketHandle, POLLWRNORM, WRITE_READY, SOCKET_POLL_MILLIS)
         return 0
     }
 
@@ -399,19 +415,28 @@ private fun setNonBlocking(handle: ULong): Boolean =
     }
 
 /**
- * Waits at most [timeoutMillis] for [events] on [handle]. True when the socket is ready, hung up or failed, and also
- * when `WSAPoll` itself fails: the socket is non-blocking, so the call that follows reports the error without waiting.
+ * Waits at most [timeoutMillis] for [events] on [handle] and returns true when the socket reports any of [ready].
+ * Otherwise, including when `WSAPoll` fails or returns early with only other bits (a lasting `POLLHUP`, say), it
+ * sleeps out the rest of the slice and returns false, so a caller that retries never spins.
  */
 @OptIn(ExperimentalForeignApi::class)
 private fun pollSocket(
     handle: ULong,
     events: Int,
+    ready: Int,
     timeoutMillis: Int,
-): Boolean =
-    memScoped {
-        val entry = alloc<pollfd>()
-        entry.fd = handle
-        entry.events = events.convert()
-        entry.revents = 0
-        WSAPoll(entry.ptr, 1u, timeoutMillis) != 0
-    }
+): Boolean {
+    val start = TimeSource.Monotonic.markNow()
+    val reported =
+        memScoped {
+            val entry = alloc<pollfd>()
+            entry.fd = handle
+            entry.events = events.convert()
+            entry.revents = 0
+            if (WSAPoll(entry.ptr, 1u, timeoutMillis) > 0) entry.revents.toInt() else 0
+        }
+    if ((reported and ready) != 0) return true
+    val left = timeoutMillis - start.elapsedNow().inWholeMilliseconds
+    if (left > 0) Sleep(left.convert())
+    return false
+}
