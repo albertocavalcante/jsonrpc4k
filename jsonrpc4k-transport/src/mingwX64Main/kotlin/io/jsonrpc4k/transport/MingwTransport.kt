@@ -20,6 +20,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import platform.posix.EINTR
+import platform.posix.WSAGetLastError
+import platform.posix._O_BINARY
+import platform.posix._setmode
 import platform.posix.closesocket
 import platform.posix.errno
 import platform.posix.init_sockets
@@ -39,6 +42,31 @@ import kotlin.concurrent.AtomicInt
 // Constants for Windows sockets
 private const val SOCKET_ERROR_VALUE = -1
 private val INVALID_SOCKET_VALUE = ULong.MAX_VALUE
+
+// CRT file descriptors for the process stdio streams, and the _setmode failure value.
+private const val STDIN_FD = 0
+private const val STDOUT_FD = 1
+private const val SETMODE_FAILED = -1
+
+/**
+ * Switches CRT fds 0 and 1 to binary mode exactly once per process. The MinGW CRT opens them in
+ * text mode, which translates `\n` <-> `\r\n` and treats Ctrl-Z (0x1A) as end of file, corrupting
+ * Content-Length framed bodies. A failed attempt is retried by the next stdio transport.
+ */
+private val binaryStdio: Lazy<Unit> =
+    lazy {
+        setBinaryMode(STDIN_FD)
+        setBinaryMode(STDOUT_FD)
+    }
+
+private fun ensureBinaryStdio(): Unit = binaryStdio.value
+
+@OptIn(ExperimentalForeignApi::class)
+private fun setBinaryMode(fd: Int) {
+    if (_setmode(fd, _O_BINARY) == SETMODE_FAILED) {
+        throw TransportException("Failed to set binary mode on fd $fd: error $errno")
+    }
+}
 
 /**
  * Create the platform-specific stdio transport for Windows.
@@ -63,8 +91,12 @@ internal class MingwStdioTransport(
     private val bufferSize: Int = 8192,
 ) : Transport {
     // Use POSIX file descriptors for stdio (0 = stdin, 1 = stdout)
-    private val readFd = 0
-    private val writeFd = 1
+    private val readFd = STDIN_FD
+    private val writeFd = STDOUT_FD
+
+    init {
+        ensureBinaryStdio()
+    }
 
     // 0 = connected, 1 = disconnected
     private val connected = AtomicInt(0)
@@ -161,9 +193,10 @@ internal class MingwSocketTransport private constructor(
 
                     when {
                         bytesRead < 0 -> {
+                            val err = WSAGetLastError()
                             if (connected.value == 0) {
                                 connected.compareAndSet(0, 1)
-                                throw TransportException("Read failed: socket error")
+                                throw TransportException("Read failed: socket error $err")
                             }
                             break
                         }
@@ -200,7 +233,7 @@ internal class MingwSocketTransport private constructor(
 
                     when {
                         bytesWritten == SOCKET_ERROR_VALUE -> {
-                            throw TransportException("Write failed: socket error")
+                            throw TransportException("Write failed: socket error ${WSAGetLastError()}")
                         }
                         bytesWritten == 0 -> {
                             throw TransportException("Write returned 0 bytes")
@@ -225,17 +258,16 @@ internal class MingwSocketTransport private constructor(
         get() = connected.value == 0
 
     companion object {
-        private var wsaInitialized = false
-
-        private fun initWsa() {
-            if (!wsaInitialized) {
+        // Thread-safe, once-only WSAStartup; a failed attempt is retried by the next connect.
+        private val wsaStartup: Lazy<Unit> =
+            lazy {
                 val result = init_sockets()
                 if (result != 0) {
-                    throw TransportException("WSAStartup failed: $result")
+                    throw TransportException("WSAStartup failed: error $result")
                 }
-                wsaInitialized = true
             }
-        }
+
+        private fun initWsa(): Unit = wsaStartup.value
 
         /**
          * Connect to a socket server.
@@ -274,7 +306,7 @@ internal class MingwSocketTransport private constructor(
                                 result.pointed.ai_protocol,
                             )
                         if (sockHandle == INVALID_SOCKET_VALUE) {
-                            throw TransportException("Failed to create socket")
+                            throw TransportException("Failed to create socket: error ${WSAGetLastError()}")
                         }
 
                         try {
@@ -287,7 +319,9 @@ internal class MingwSocketTransport private constructor(
                                 )
 
                             if (connectResult == SOCKET_ERROR_VALUE) {
-                                throw TransportException("Failed to connect to $host:$port")
+                                throw TransportException(
+                                    "Failed to connect to $host:$port: error ${WSAGetLastError()}",
+                                )
                             }
 
                             MingwSocketTransport(sockHandle)
