@@ -213,18 +213,28 @@ internal class JvmUnixListener private constructor(
 
     private fun acceptBlocking(context: CoroutineContext): Transport {
         while (true) {
-            if (!server.isOpen) throw TransportException("Listener is closed")
-            try {
-                val channel = server.accept()
-                if (channel != null) return UnixSocketTransport.wrap(channel)
-                selector.select(ACCEPT_POLL_MILLIS)
-                selector.selectedKeys().clear()
-                context.ensureActive()
-            } catch (e: ClosedSelectorException) {
-                throw acceptFailure(e)
-            } catch (e: IOException) {
-                throw acceptFailure(e)
-            }
+            requireOpen()
+            acceptAttempt(context)?.let { return it }
+        }
+    }
+
+    private fun requireOpen() {
+        if (!server.isOpen) throw TransportException("Listener is closed")
+    }
+
+    /** One non-blocking accept; returns null after waiting for a connection to arrive. */
+    private fun acceptAttempt(context: CoroutineContext): Transport? {
+        try {
+            val channel = server.accept()
+            if (channel != null) return UnixSocketTransport.wrap(channel)
+            selector.select(ACCEPT_POLL_MILLIS)
+            selector.selectedKeys().clear()
+            context.ensureActive()
+            return null
+        } catch (e: ClosedSelectorException) {
+            throw acceptFailure(e)
+        } catch (e: IOException) {
+            throw acceptFailure(e)
         }
     }
 

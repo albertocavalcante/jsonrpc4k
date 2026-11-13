@@ -103,6 +103,8 @@ public object NodeIpc {
 /** Whether [name] already is a Windows pipe path rather than a bare pipe name. */
 internal fun isPipePath(name: String): Boolean = listOf(WINDOWS_PIPE_PREFIX, FORWARD_PIPE_PREFIX).any(name::startsWith)
 
+private fun isForbiddenPipeNameChar(char: Char): Boolean = char == '\\' || char == '/' || char == '\u0000'
+
 /** Normalizes a pipe name or either pipe path spelling to `\\.\pipe\name`. */
 internal fun pipePath(nameOrPath: String): String {
     val name =
@@ -111,7 +113,7 @@ internal fun pipePath(nameOrPath: String): String {
             nameOrPath.startsWith(FORWARD_PIPE_PREFIX) -> nameOrPath.removePrefix(FORWARD_PIPE_PREFIX)
             else -> nameOrPath
         }
-    if (name.isEmpty() || name.any { it == '\\' || it == '/' || it == '\u0000' }) {
+    if (name.isEmpty() || name.any(::isForbiddenPipeNameChar)) {
         throw TransportException("Invalid named pipe name: '$nameOrPath'")
     }
     return WINDOWS_PIPE_PREFIX + name

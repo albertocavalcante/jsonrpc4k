@@ -3,11 +3,9 @@ package io.jsonrpc4k.transport
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.set
 import kotlinx.coroutines.Dispatchers
@@ -21,10 +19,8 @@ import platform.posix.close
 import platform.posix.connect
 import platform.posix.errno
 import platform.posix.listen
-import platform.posix.lstat
 import platform.posix.sockaddr
 import platform.posix.socket
-import platform.posix.stat
 import platform.posix.unlink
 
 /** Bytes of `sun_path` including the terminating NUL; 108 on Linux, 104 on Apple platforms. */
@@ -40,6 +36,12 @@ internal expect fun writeUnixFamily(
     buffer: CPointer<ByteVar>,
     length: Int,
 )
+
+/**
+ * The `st_mode` of [path] from `lstat` (symbolic links are not followed), or -1 when the call fails.
+ * `st_mode` is 16 bits wide on Apple and 32 bits on Linux, so the platform source sets widen it.
+ */
+internal expect fun lstatMode(path: String): Int
 
 /** Offset of `sun_path`; both families put a two byte header before it. */
 private const val SUN_PATH_OFFSET = 2
@@ -67,14 +69,13 @@ internal fun <R> withUnixAddress(
 
 /** Whether [path] exists and is itself a socket (a symbolic link is not followed). */
 @OptIn(ExperimentalForeignApi::class)
-internal fun isSocketFile(path: String): Boolean =
-    memScoped {
-        val info = alloc<stat>()
-        lstat(path, info.ptr) == 0 && (info.st_mode.convert<UInt>() and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
-    }
+internal fun isSocketFile(path: String): Boolean {
+    val mode = lstatMode(path)
+    return mode >= 0 && (mode and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
+}
 
-private const val FILE_TYPE_MASK = 0xF000u
-private const val FILE_TYPE_SOCKET = 0xC000u
+private const val FILE_TYPE_MASK = 0xF000
+private const val FILE_TYPE_SOCKET = 0xC000
 
 private fun checkUnixPath(path: String) {
     if (path.isEmpty() || '\u0000' in path) throw TransportException("Invalid Unix socket path")
