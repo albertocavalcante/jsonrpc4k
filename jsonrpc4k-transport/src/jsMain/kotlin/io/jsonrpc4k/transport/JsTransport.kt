@@ -17,7 +17,7 @@ import kotlin.coroutines.suspendCoroutine
  * The modules are deliberately not declared with a module annotation: that form makes the Kotlin/JS
  * output import them when the file loads, which breaks a browser bundle that only uses the core APIs.
  * Resolving them here, behind a runtime check and through a call a bundler cannot follow statically,
- * keeps the import lazy.
+ * keeps the import lazy. It relies on the default Kotlin/JS module kind (UMD), where `require` is in scope.
  */
 internal fun nodeRequire(name: String): dynamic {
     if (!isNodeRuntime()) {
@@ -33,6 +33,7 @@ internal object NodeProcess {
     val stdin: dynamic get() = raw.stdin
     val stdout: dynamic get() = raw.stdout
     val env: dynamic get() = raw.env
+    val execPath: String get() = raw.execPath.unsafeCast<String>()
 }
 
 /** The Node.js fs module, resolved on first access. */

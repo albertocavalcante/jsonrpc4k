@@ -38,8 +38,9 @@ transports for the JVM, Node.js and Kotlin/Native.
 | In memory (`InMemoryTransport.pair`) | yes | yes | yes | yes | yes |
 
 An unsupported cell throws `UnsupportedTransportException`. The Node.js modules are loaded lazily, so a
-browser bundle that uses only the core APIs and the in-memory transport never resolves `net`, `fs`,
-`child_process`, `os`, `buffer` or `process`.
+browser bundle that uses only the core APIs and the in-memory transport should not need `net`, `fs`,
+`child_process`, `os`, `buffer` or `process` (not yet verified with a bundler). The lookup uses `require`,
+so it assumes the default Kotlin/JS UMD module kind.
 
 ## Ownership and teardown
 
@@ -68,7 +69,7 @@ val client = Connection()
 scope.launch { clientEnd.incoming.collect { client.receive(it) } }
 scope.launch { client.outgoing.collect { clientEnd.send(it) } }
 
-val result = client.request("echo", JsonPrimitive("hello"))
+val result = client.request<JsonElement>("echo", JsonPrimitive("hello"))
 ```
 
 Over a socket, replace the in-memory pair with `TcpSocket.connect(host, port)` or
