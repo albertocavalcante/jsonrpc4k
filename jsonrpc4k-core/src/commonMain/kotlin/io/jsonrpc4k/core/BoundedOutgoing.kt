@@ -321,7 +321,10 @@ internal class BoundedOutgoing(
         }
 }
 
-/** Sends [message] as an ordinary frame, waiting for a producer slot, admission and capacity. */
+/**
+ * Sends [message] as an ordinary frame: takes a producer slot, failing at once when none is free,
+ * then waits for admission and capacity.
+ */
 internal suspend fun BoundedOutgoing.send(
     message: Message,
     onDequeued: (() -> Unit)? = null,

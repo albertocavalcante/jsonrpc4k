@@ -6,6 +6,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -278,11 +279,12 @@ class CancellationTest {
             val call = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("late", null) }
             assertEquals(1, connection.dispatcher.pending.count)
             call.cancel()
+            // Drain the queue before the caller's finally block runs, so a wrongly sent cancellation would fit.
+            val frames = Channel<ByteArray>(Channel.UNLIMITED)
+            backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { connection.outgoing.collect { frames.send(it) } }
             runCurrent()
             assertEquals(0, connection.dispatcher.pending.count)
-            val frames = backgroundScope.outgoingFrames(connection)
             repeat(64) { assertEquals("fill", assertIs<NotificationMessage>(decode(frames.nextFrame())).method) }
-            runCurrent()
             assertTrue(frames.tryReceive().isFailure)
             connection.close()
         }

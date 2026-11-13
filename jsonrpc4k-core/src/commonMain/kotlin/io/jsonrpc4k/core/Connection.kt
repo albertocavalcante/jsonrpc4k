@@ -462,6 +462,8 @@ public class Connection(
         val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
         val deferred = dispatcher.registerPendingRequest(id)
+        // A send cancelled while it waits for queue space may still hand the request over; such a
+        // request gets no cancellation, which is the best-effort limit of this path.
         var sent = false
         return try {
             outgoingMessages.send(OutgoingItem.Frame(request))

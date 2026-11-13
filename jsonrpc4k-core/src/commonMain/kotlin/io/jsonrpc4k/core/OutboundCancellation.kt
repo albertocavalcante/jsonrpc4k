@@ -12,8 +12,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * The `$/cancelRequest` notification is queued at once, after the request and before anything the
  * caller sends next, and it never waits: [trySend] queues it without suspending and without taking a
  * producer slot, or refuses it. A refused notification is dropped, and so is one that would exceed
- * eight notifications not yet dequeued by the outgoing collector, so that cancellations can neither
- * block a caller nor crowd out the replies that a connection must queue.
+ * eight notifications not yet dequeued by the outgoing collector. Cancellations therefore never
+ * block a caller, and their share of the queue that replies also need stays bounded. A notification
+ * that an interrupted legacy collector loses keeps its slot.
  */
 internal class OutboundCancellation(
     private val pending: PendingRequests,
