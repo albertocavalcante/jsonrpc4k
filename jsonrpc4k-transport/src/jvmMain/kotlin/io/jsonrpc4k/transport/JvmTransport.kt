@@ -9,24 +9,47 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.FilterInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PrintStream
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
+
+private val DEFAULT_CLOSE_TIMEOUT: Duration = 1.seconds
 
 /**
- * JVM implementation of Transport using InputStreams and OutputStreams.
- * The transport owns both streams; EOF does not dispose them automatically.
+ * JVM [Transport] over an [InputStream] and an [OutputStream], both owned by the transport.
+ *
+ * EOF does not dispose the streams; call [close]. Concurrent [send] calls are serialized, so each payload is written
+ * contiguously. [close] marks the transport closed, then closes the output first, so the peer sees EOF, and the input
+ * second. Each stream is closed on a daemon thread and awaited for at most `closeTimeout`: a stream whose close
+ * blocks, such as a process pipe or console held by a blocked reader or writer, finishes closing in the background
+ * and a later [close] reports its outcome, so [close] never waits indefinitely for a live peer. A chunk that a
+ * blocked read returns after [close] is dropped.
+ *
+ * @param bufferSize maximum number of bytes read from the input at once.
+ * @param closeTimeout longest wait for each stream to close; defaults to one second.
  */
 public class StreamTransport(
     private val input: InputStream,
     private val output: OutputStream,
-    private val bufferSize: Int = 8192,
+    private val bufferSize: Int = DEFAULT_BUFFER_SIZE,
+    private val closeTimeout: Duration = DEFAULT_CLOSE_TIMEOUT,
 ) : Transport {
     private val connected = AtomicBoolean(true)
+    private val sendMutex = Mutex()
     private val closeMutex = Mutex()
-    private var inputClosed = false
-    private var outputClosed = false
+    private val outputCloser = BoundedCloser(output, "jsonrpc4k-close-output")
+    private val inputCloser = BoundedCloser(input, "jsonrpc4k-close-input")
+
+    init {
+        require(bufferSize > 0) { "bufferSize must be positive" }
+        require(!closeTimeout.isNegative()) { "closeTimeout must not be negative" }
+    }
 
     private data class CloseFailure(
         val cause: Throwable,
@@ -50,73 +73,60 @@ public class StreamTransport(
                     break
                 }
 
-                if (bytesRead > 0) {
+                // Closing ends incoming quietly, including a read that returns only after close().
+                if (bytesRead > 0 && connected.get()) {
                     emit(buffer.copyOf(bytesRead))
                 }
             }
         }.flowOn(Dispatchers.IO)
 
     override suspend fun send(data: ByteArray) {
-        if (!connected.get()) {
-            throw TransportException("Transport is closed")
-        }
-        withContext(Dispatchers.IO) {
-            try {
-                output.write(data)
-                output.flush()
-            } catch (e: Exception) {
-                throw TransportException("Write failed", e)
+        ensureOpen()
+        sendMutex.withLock {
+            ensureOpen()
+            withContext(Dispatchers.IO) {
+                try {
+                    output.write(data)
+                    output.flush()
+                } catch (e: Exception) {
+                    throw TransportException("Write failed", e)
+                }
             }
         }
     }
 
     /**
      * Disposes both owned streams, including after EOF or caller cancellation.
-     * Concurrent callers wait for the same serialized cleanup. Failed resources may be retried;
+     * Concurrent callers wait for the same serialized cleanup. Failed resources are retried by the next call;
      * successfully closed resources are not closed again. Close failures are reported with their causes.
      */
-    override suspend fun close() {
+    override suspend fun close(): Unit = close { null }
+
+    /**
+     * Runs [close] with [beforeInput] between closing the output and closing the input; [ProcessTransport] ends its
+     * child there. A failure that [beforeInput] returns is reported together with the stream failures.
+     */
+    internal suspend fun close(beforeInput: suspend () -> Throwable?) {
         withContext(NonCancellable + Dispatchers.IO) {
             closeMutex.withLock {
                 connected.set(false)
-                closeStreams()
+                val outputFailure = outputCloser.close(closeTimeout)?.toCloseFailure()
+                val peerFailure = beforeInput()?.toCloseFailure()
+                val inputFailure = inputCloser.close(closeTimeout)?.toCloseFailure()
+                val failure = combineFailures(combineFailures(inputFailure, outputFailure), peerFailure)
+                if (failure != null) {
+                    if (failure.fatal) throw failure.cause
+                    throw TransportException("Close failed", failure.cause)
+                }
             }
         }
     }
 
-    private fun closeStreams() {
-        val inputFailure =
-            if (inputClosed) {
-                null
-            } else {
-                closeResource {
-                    input.close()
-                    inputClosed = true
-                }
-            }
-        val outputFailure =
-            if (outputClosed) {
-                null
-            } else {
-                closeResource {
-                    output.close()
-                    outputClosed = true
-                }
-            }
-        val failure = combineFailures(inputFailure, outputFailure) ?: return
-        if (failure.fatal) throw failure.cause
-        throw TransportException("Close failed", failure.cause)
+    private fun ensureOpen() {
+        if (!connected.get()) throw TransportException("Transport is closed")
     }
 
-    private fun closeResource(close: () -> Unit): CloseFailure? =
-        try {
-            close()
-            null
-        } catch (failure: Exception) {
-            CloseFailure(failure, fatal = false)
-        } catch (fatal: Throwable) {
-            CloseFailure(fatal, fatal = true)
-        }
+    private fun Throwable.toCloseFailure(): CloseFailure = CloseFailure(this, fatal = this !is Exception)
 
     private fun combineFailures(
         first: CloseFailure?,
@@ -138,14 +148,46 @@ public class StreamTransport(
 }
 
 /**
- * Stdio transport for JVM.
- * Uses System.in for reading and System.out for writing.
+ * Stdio transport for JVM: reads [System.in] and writes [System.out].
+ *
+ * The process's standard streams are not owned: closing the transport stops it without closing them, like the native
+ * stdio transports. A read blocked on stdin returns only when input or EOF arrives, and its chunk is then dropped.
+ * Nothing else may write to [System.out] while the transport is in use, or the framing breaks.
  */
 public class StdioTransport :
     Transport by StreamTransport(
-        input = System.`in`,
-        output = System.out,
+        input = UnownedInputStream(System.`in`),
+        output = UnownedPrintStream(System.out),
     )
+
+/** View of an input stream that the transport reads but does not own, such as [System.in]: closing it does nothing. */
+private class UnownedInputStream(
+    input: InputStream,
+) : FilterInputStream(input) {
+    override fun close(): Unit = Unit
+}
+
+/**
+ * View of a [PrintStream] that the transport writes but does not own, such as [System.out]: closing it does nothing,
+ * and [flush] reports the failure that [PrintStream] records instead of throwing as an [IOException].
+ */
+private class UnownedPrintStream(
+    private val out: PrintStream,
+) : OutputStream() {
+    override fun write(b: Int): Unit = out.write(b)
+
+    override fun write(
+        b: ByteArray,
+        off: Int,
+        len: Int,
+    ): Unit = out.write(b, off, len)
+
+    override fun flush() {
+        if (out.checkError()) throw IOException("Standard output failed")
+    }
+
+    override fun close(): Unit = Unit
+}
 
 /**
  * Socket transport for JVM.
