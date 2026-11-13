@@ -41,12 +41,11 @@ import platform.posix.EAGAIN
 import platform.posix.EINTR
 import platform.posix.ENOENT
 import platform.posix.ETIMEDOUT
-import platform.posix.X_OK
 import platform.posix.FD_CLOEXEC
 import platform.posix.F_SETFD
 import platform.posix.F_SETFL
-import platform.posix.O_NONBLOCK
 import platform.posix.O_DIRECTORY
+import platform.posix.O_NONBLOCK
 import platform.posix.O_RDONLY
 import platform.posix.O_WRONLY
 import platform.posix.POLLIN
@@ -55,6 +54,7 @@ import platform.posix.SIGKILL
 import platform.posix.SIGPIPE
 import platform.posix.SIGTERM
 import platform.posix.SIG_DFL
+import platform.posix.X_OK
 import platform.posix._exit
 import platform.posix.access
 import platform.posix.close
@@ -64,12 +64,12 @@ import platform.posix.execv
 import platform.posix.fchdir
 import platform.posix.fcntl
 import platform.posix.fork
+import platform.posix.getenv
 import platform.posix.kill
 import platform.posix.pipe
 import platform.posix.pollfd
 import platform.posix.read
 import platform.posix.signal
-import platform.posix.getenv
 import platform.posix.waitpid
 import platform.posix.write
 import kotlin.concurrent.AtomicInt
@@ -92,6 +92,7 @@ private const val ENV_PROGRAM = "/usr/bin/env"
 private const val DEFAULT_PATH = "/usr/bin:/bin"
 private val EXEC_REPORT_TIMEOUT: Duration = 10.seconds
 private val NO_DATA = ByteArray(0)
+
 // Serializes the pipe-then-FD_CLOEXEC sequence against another spawn, so a descriptor is never inherited by a sibling.
 private val spawnLock = Mutex()
 
