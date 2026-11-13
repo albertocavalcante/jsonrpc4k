@@ -23,6 +23,9 @@ import platform.posix.AF_INET
 import platform.posix.EAGAIN
 import platform.posix.EINTR
 import platform.posix.EWOULDBLOCK
+import platform.posix.SHUT_RDWR
+import platform.posix.SIGPIPE
+import platform.posix.SIG_IGN
 import platform.posix.SOCK_STREAM
 import platform.posix.STDIN_FILENO
 import platform.posix.STDOUT_FILENO
@@ -34,6 +37,8 @@ import platform.posix.freeaddrinfo
 import platform.posix.gai_strerror
 import platform.posix.getaddrinfo
 import platform.posix.read
+import platform.posix.shutdown
+import platform.posix.signal
 import platform.posix.socket
 import platform.posix.strerror
 import platform.posix.write
@@ -55,6 +60,11 @@ internal actual suspend fun createSocketTransport(
 
 /**
  * POSIX implementation of Transport using file descriptors.
+ *
+ * @property shutdownOnClose when true (sockets only), [close] calls `shutdown(fd, SHUT_RDWR)`
+ * before `close(fd)`. On Linux, `close()` alone does not wake a thread blocked in `read()` on
+ * the same descriptor; `shutdown()` makes that read return 0 so [incoming] completes. Never
+ * set this for stdio descriptors.
  */
 @OptIn(ExperimentalForeignApi::class)
 internal class PosixFileDescriptorTransport(
@@ -62,6 +72,7 @@ internal class PosixFileDescriptorTransport(
     private val writeFd: Int,
     private val closeOnComplete: Boolean = true,
     private val bufferSize: Int = 8192,
+    private val shutdownOnClose: Boolean = false,
 ) : Transport {
     // 0 = connected, 1 = disconnected
     private val connected = AtomicInt(0)
@@ -136,6 +147,10 @@ internal class PosixFileDescriptorTransport(
         if (connected.compareAndSet(0, 1)) {
             if (closeOnComplete) {
                 withContext(Dispatchers.Default) {
+                    if (shutdownOnClose) {
+                        // Wake any reader blocked in read() before releasing the descriptor.
+                        shutdown(writeFd, SHUT_RDWR.convert())
+                    }
                     if (readFd != writeFd) {
                         close(readFd)
                     }
@@ -171,6 +186,7 @@ internal class PosixSocketTransport private constructor(
         readFd = socketFd,
         writeFd = socketFd,
         closeOnComplete = true,
+        shutdownOnClose = true,
     ) {
     companion object {
         /**
@@ -181,6 +197,8 @@ internal class PosixSocketTransport private constructor(
             port: Int,
         ): PosixSocketTransport =
             withContext(Dispatchers.Default) {
+                // A peer that closed its end must surface as EPIPE, not kill the process.
+                ignoreSigpipeOnce()
                 memScoped {
                     // Use getaddrinfo for proper hostname resolution
                     val hints = alloc<addrinfo>()
@@ -230,6 +248,29 @@ internal class PosixSocketTransport private constructor(
                     }
                 }
             }
+    }
+}
+
+// 0 = SIGPIPE disposition not yet changed, 1 = set to SIG_IGN
+private val sigpipeIgnored = AtomicInt(0)
+
+/**
+ * Ignore SIGPIPE process-wide, exactly once, before the first socket is created.
+ *
+ * Writing to a socket whose peer has closed raises SIGPIPE, whose default action terminates
+ * the process. With the signal ignored, `write()` fails with `EPIPE` instead, which
+ * [Transport.send] reports as a [TransportException].
+ *
+ * Tradeoff: this changes the disposition for the whole process (every broken-pipe write then
+ * fails with `EPIPE`, and exec'd children inherit the ignored signal). The per-socket
+ * alternatives are platform-specific (`send(..., MSG_NOSIGNAL)` on Linux, `SO_NOSIGPIPE` on
+ * macOS) and would need separate Linux and Apple source sets; `posixMain` is shared by both,
+ * and ignoring SIGPIPE is the common choice for networked native runtimes.
+ */
+@OptIn(ExperimentalForeignApi::class)
+private fun ignoreSigpipeOnce() {
+    if (sigpipeIgnored.compareAndSet(0, 1)) {
+        signal(SIGPIPE, SIG_IGN)
     }
 }
 
