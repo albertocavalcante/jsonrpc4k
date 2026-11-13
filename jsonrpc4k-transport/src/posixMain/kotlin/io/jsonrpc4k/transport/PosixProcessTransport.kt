@@ -273,6 +273,8 @@ internal class PosixProcessTransport private constructor(
             memScoped {
                 val buffer = allocArray<ByteVar>(BUFFER_SIZE)
                 while (true) {
+                    // Idle slices never suspend, so a cancelled collector (e.g. `first`) must be noticed here.
+                    currentCoroutineContext().ensureActive()
                     val chunk = readLock.withLock { readStep(buffer) } ?: break
                     if (chunk.isNotEmpty()) emit(chunk)
                 }
