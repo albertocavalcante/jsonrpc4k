@@ -27,7 +27,13 @@ kotlin {
     macosArm64()
     linuxX64()
     linuxArm64()
-    mingwX64()
+    mingwX64 {
+        // Windows reserves 1 MB of stack by default (8 MB on Linux/macOS). kotlinx.serialization
+        // recurses per JSON nesting level, and depth 256 overflows the default reservation.
+        binaries.all {
+            linkerOpts("-Wl,--stack,8388608")
+        }
+    }
 
     compilerOptions {
         freeCompilerArgs.addAll(

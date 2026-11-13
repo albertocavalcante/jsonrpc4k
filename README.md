@@ -99,6 +99,11 @@ val connection = Connection(
 - `InboundResourceLimits` bounds the frame body, JSON nesting and queued application bytes.
   `OutboundResourceLimits` bounds frame size, retained bytes, outstanding frames and waiting producers.
 - In bounded mode `outgoing` needs one dedicated, continuous collector.
+- **Windows native limitation:** kotlinx.serialization encodes and decodes JSON trees recursively, and
+  a Windows executable reserves only 1 MB of stack by default (8 MB on Linux and macOS). Documents
+  nested near the 256-level maximum can overflow it. This build links its own mingwX64 executables
+  with an 8 MB reservation (`-Wl,--stack,8388608`); executables that embed jsonrpc4k and accept
+  deeply nested JSON should do the same.
 
 ## Cancellation
 
