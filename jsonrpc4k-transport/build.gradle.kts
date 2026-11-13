@@ -4,6 +4,16 @@ plugins {
 }
 
 kotlin {
+    js {
+        // The JS transports import Node modules (buffer, net, process); a browser
+        // test bundle cannot resolve them, so JS transport tests run on Node only.
+        browser {
+            testTask {
+                enabled = false
+            }
+        }
+    }
+
     sourceSets {
         commonMain {
             dependencies {
