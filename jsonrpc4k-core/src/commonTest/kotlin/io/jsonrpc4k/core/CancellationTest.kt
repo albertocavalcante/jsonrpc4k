@@ -1,10 +1,12 @@
 package io.jsonrpc4k.core
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -110,6 +112,43 @@ class CancellationTest {
             entered.await()
             dispatcher.dispatch(cancel(RequestId.of(3)))
             assertEquals(ResponseError(ResponseError.REQUEST_CANCELLED, "Stopped early", partial), response.await()?.error)
+        }
+
+    @Test
+    fun `a value returned after cancellation is discarded`() =
+        runTest {
+            val dispatcher = Dispatcher()
+            val entered = CompletableDeferred<Unit>()
+            dispatcher.onRequest(
+                "stubborn",
+                RequestHandler {
+                    entered.complete(Unit)
+                    try {
+                        awaitCancellation()
+                    } catch (_: CancellationException) {
+                        JsonPrimitive("late")
+                    }
+                },
+            )
+            val response = async { dispatcher.dispatch(RequestMessage(RequestId.of(5), "stubborn")) }
+            entered.await()
+            dispatcher.dispatch(cancel(RequestId.of(5)))
+            assertEquals(ResponseMessage.error(RequestId.of(5), ResponseError.requestCancelled()), response.await())
+        }
+
+    @Test
+    fun `caller cancellation wins over a remote cancellation`() =
+        runTest {
+            val dispatcher = Dispatcher()
+            val entered = CompletableDeferred<Unit>()
+            dispatcher.onRequest("slow", runUntilCancelled(entered))
+            val outcome = CompletableDeferred<Result<ResponseMessage?>>()
+            val caller = launch { outcome.complete(runCatching { dispatcher.dispatch(RequestMessage(RequestId.of(4), "slow")) }) }
+            entered.await()
+            dispatcher.dispatch(cancel(RequestId.of(4)))
+            caller.cancel()
+            assertIs<CancellationException>(outcome.await().exceptionOrNull())
+            assertEquals(0, dispatcher.inbound.count)
         }
 
     @Test
@@ -228,6 +267,51 @@ class CancellationTest {
                 assertTrue(frames.tryReceive().isFailure)
                 connection.close()
             }
+        }
+
+    @Test
+    fun `caller cancelled before its request was queued sends nothing`() =
+        runTest {
+            val connection = Connection(scope = backgroundScope)
+            // Nothing collects yet, so these fill the outgoing queue and the request waits to be queued.
+            repeat(64) { connection.notify("fill", null) }
+            val call = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("late", null) }
+            assertEquals(1, connection.dispatcher.pending.count)
+            call.cancel()
+            runCurrent()
+            assertEquals(0, connection.dispatcher.pending.count)
+            val frames = backgroundScope.outgoingFrames(connection)
+            repeat(64) { assertEquals("fill", assertIs<NotificationMessage>(decode(frames.nextFrame())).method) }
+            runCurrent()
+            assertTrue(frames.tryReceive().isFailure)
+            connection.close()
+        }
+
+    @Test
+    fun `outbound cancellation never waits or takes a producer slot`() =
+        runTest {
+            val connection =
+                Connection(
+                    BoundedDispatchPolicy(1, 2),
+                    InboundResourceLimits(65_536, 32, 65_536),
+                    OutboundResourceLimits(65_536, 65_536, 1, 1, 65_536, 2, 10_000, 32),
+                    backgroundScope,
+                )
+            // Nothing collects yet, so the request holds the only outstanding frame.
+            val call = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("slow", null) }
+            call.cancel()
+            runCurrent()
+            assertEquals(0, connection.dispatcher.pending.count)
+            // The cancellation found no capacity and was dropped, so the single producer slot is still free.
+            val after = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("after", null) }
+            assertTrue(after.isActive)
+            val frames = backgroundScope.outgoingFrames(connection)
+            assertEquals("slow", assertIs<RequestMessage>(decode(frames.nextFrame())).method)
+            assertEquals("after", assertIs<NotificationMessage>(decode(frames.nextFrame())).method)
+            after.await()
+            runCurrent()
+            assertTrue(frames.tryReceive().isFailure)
+            connection.close()
         }
 
     /** A handler that runs until it is cancelled and records that it observed the cancellation. */

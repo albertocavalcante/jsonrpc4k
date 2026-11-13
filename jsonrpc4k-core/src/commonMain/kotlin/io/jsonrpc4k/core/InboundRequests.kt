@@ -35,8 +35,8 @@ internal class InboundRequests {
     /**
      * Runs [block] as the handler of the inbound request [id], in a child job that a remote
      * cancellation of [id] cancels. A cancelled [block] then ends with a [JsonRpcException] that
-     * carries [ResponseError.REQUEST_CANCELLED], unless it throws an exception of its own or the
-     * calling coroutine is cancelled as well.
+     * carries [ResponseError.REQUEST_CANCELLED], even if it returns a value, unless it throws an
+     * exception of its own or the calling coroutine is cancelled as well.
      */
     suspend fun <T> runCancellable(
         id: RequestId,
@@ -57,7 +57,8 @@ internal class InboundRequests {
             if (!cancelled.value) throw cause
             // The caller's own cancellation takes precedence over the remote one.
             currentCoroutineContext().ensureActive()
-            throw JsonRpcException(ResponseError.REQUEST_CANCELLED, "Request cancelled")
+            val error = ResponseError.requestCancelled()
+            throw JsonRpcException(error.code, error.message, error.data)
         }
     }
 

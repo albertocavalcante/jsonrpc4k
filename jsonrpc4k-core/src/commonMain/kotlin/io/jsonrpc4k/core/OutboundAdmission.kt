@@ -23,6 +23,9 @@ internal class OutboundAdmission(
         }
     }
 
+    /** Takes the token only when it is free now; a token handed to a waiting producer is never taken. */
+    fun tryAcquire(): Boolean = tokens.tryReceive().isSuccess
+
     fun release() {
         if (!tokens.trySend(Unit).isSuccess) fail(IllegalStateException("Outbound admission token was returned twice"))
     }

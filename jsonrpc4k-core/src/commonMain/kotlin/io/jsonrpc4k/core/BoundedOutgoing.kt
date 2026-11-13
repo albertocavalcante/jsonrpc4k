@@ -227,11 +227,27 @@ internal class BoundedOutgoing(
         transfer(Item.Frame(bytes, onDequeued, reserveOrdinary(bytes.size)))
     }
 
-    suspend fun send(
+    /**
+     * Queues [message] as an ordinary frame only when admission and capacity are free now, without
+     * taking a producer slot, so it never waits behind or crowds out other producers. Returns false,
+     * dropping the message, when it would have to wait or cannot be queued. It never throws, because
+     * it runs in a caller's finally block, where a throw would hide that caller's own outcome.
+     */
+    fun trySend(
         message: Message,
-        onDequeued: (() -> Unit)? = null,
-    ) = withProducer {
-        sendRegistered(message, onDequeued)
+        onDequeued: (() -> Unit)?,
+    ): Boolean {
+        if (!admission.tryAcquire()) return false
+        return try {
+            val bytes = encoder.encode(message)
+            val lease = reserve(bytes.size, control = false)
+            if (lease != null) transfer(Item.Frame(bytes, onDequeued, lease))
+            lease != null
+        } catch (_: Throwable) {
+            false
+        } finally {
+            admission.release()
+        }
     }
 
     /** Sends [messages] as one JSON-RPC 2.0 batch frame; the frame limits apply to the whole array. */
@@ -303,4 +319,12 @@ internal class BoundedOutgoing(
             if (claimFailure(fatal, control = true)) fail(fatal)
             throw fatal
         }
+}
+
+/** Sends [message] as an ordinary frame, waiting for a producer slot, admission and capacity. */
+internal suspend fun BoundedOutgoing.send(
+    message: Message,
+    onDequeued: (() -> Unit)? = null,
+) = withProducer {
+    sendRegistered(message, onDequeued)
 }

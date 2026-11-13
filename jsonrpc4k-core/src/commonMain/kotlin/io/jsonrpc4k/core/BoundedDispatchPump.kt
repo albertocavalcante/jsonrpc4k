@@ -315,7 +315,7 @@ internal class BoundedDispatchPump(
                         running.map { it.finalized }.joinAll()
                         running.clear()
                         queueSlots.release()
-                        output.sendBatch(dispatcher.dispatch(event.batch))
+                        output.sendBatch(dispatcher.dispatch(event.batch, cancellable = false))
                     } finally {
                         event.reservation?.release()
                     }
@@ -352,7 +352,8 @@ internal class BoundedDispatchPump(
 
     private suspend fun runRequest(event: Event.Request) {
         try {
-            val response = checkNotNull(dispatcher.dispatch(event.message))
+            // This pump cancels its own workers, so the dispatcher does not track the handler.
+            val response = checkNotNull(dispatcher.dispatch(event.message, cancellable = false))
             val id = event.message.id
             val token = event.token
             if (claimReply(id, token)) {

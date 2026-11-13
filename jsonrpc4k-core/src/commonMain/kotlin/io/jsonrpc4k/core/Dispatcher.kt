@@ -116,11 +116,13 @@ internal class PendingRequests {
  * Dispatches incoming JSON-RPC messages to registered handlers.
  *
  * Request ids are scoped to one peer, so a dispatcher serves a single connection. An inbound
- * `$/cancelRequest` cancels the running handler of the request that it names, and [dispatch] then
- * answers that request with a Request Cancelled error (-32800), unless the handler ends with its
- * own [JsonRpcException]. Cancellation is cooperative and reaches a handler only while it runs,
- * so it needs messages to be dispatched concurrently. It never completes an outbound waiter that
- * was registered with the same id.
+ * `$/cancelRequest` cancels the running handler of the request that it names. Once that handler
+ * stops, [dispatch] answers the request with a Request Cancelled error (-32800); a handler that
+ * throws an exception of its own instead is answered as for that exception, and a value that it
+ * returns after the cancellation is discarded. Cancellation is cooperative and reaches a handler
+ * only while it runs, so it needs messages to be dispatched concurrently. It never completes an
+ * outbound waiter that was registered with the same id. Each handler runs in its own child job,
+ * so its response also waits for coroutines that it starts in that job.
  *
  * @param json The JSON configuration used for serialization/deserialization.
  * @param notificationErrorHandler Optional handler invoked when a notification handler throws.
@@ -248,9 +250,18 @@ public class Dispatcher(
      * runs until it returns, or until a `$/cancelRequest` for its id, dispatched concurrently,
      * cancels it.
      */
-    public suspend fun dispatch(message: Message): ResponseMessage? =
+    public suspend fun dispatch(message: Message): ResponseMessage? = dispatch(message, cancellable = true)
+
+    /**
+     * Dispatch an incoming message. With [cancellable] false a request's handler runs untracked, for a
+     * caller such as the bounded pump that handles `$/cancelRequest` itself.
+     */
+    internal suspend fun dispatch(
+        message: Message,
+        cancellable: Boolean,
+    ): ResponseMessage? =
         when (message) {
-            is RequestMessage -> handleRequest(message)
+            is RequestMessage -> handleRequest(message, cancellable)
             is NotificationMessage -> {
                 handleNotification(message)
                 null
@@ -267,8 +278,16 @@ public class Dispatcher(
      * invalid entry. Notifications and responses add nothing, so an empty result means that no reply
      * is sent, as for a batch of only notifications. Entries run sequentially.
      */
-    public suspend fun dispatch(batch: Payload.Batch): List<ResponseMessage> =
-        batch.entries.mapNotNull { entry -> if (entry == null) Payload.Invalid.INVALID_REQUEST.response else dispatch(entry) }
+    public suspend fun dispatch(batch: Payload.Batch): List<ResponseMessage> = dispatch(batch, cancellable = true)
+
+    /** Dispatch the entries of an inbound batch; [cancellable] applies to each request as in [dispatch]. */
+    internal suspend fun dispatch(
+        batch: Payload.Batch,
+        cancellable: Boolean,
+    ): List<ResponseMessage> =
+        batch.entries.mapNotNull { entry ->
+            if (entry == null) Payload.Invalid.INVALID_REQUEST.response else dispatch(entry, cancellable)
+        }
 
     /**
      * Register a pending request that expects a response.
@@ -290,14 +309,22 @@ public class Dispatcher(
         pending.remove(id)?.cancel()
     }
 
-    private suspend fun handleRequest(request: RequestMessage): ResponseMessage {
+    private suspend fun handleRequest(
+        request: RequestMessage,
+        cancellable: Boolean,
+    ): ResponseMessage {
         val handler =
             mutex.withLock {
                 requestHandlers[request.method]
             } ?: return ResponseMessage.error(request.id, ResponseError.methodNotFound(request.method))
 
         return try {
-            val result = inbound.runCancellable(request.id) { handler.handle(request.params) }
+            val result =
+                if (cancellable) {
+                    inbound.runCancellable(request.id) { handler.handle(request.params) }
+                } else {
+                    handler.handle(request.params)
+                }
             ResponseMessage.success(request.id, result)
         } catch (e: CancellationException) {
             throw e
