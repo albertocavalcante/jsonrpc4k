@@ -17,11 +17,13 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 private const val ROUND_TRIP_BYTES = 1024 * 1024
 private const val ROUND_TRIP_CHUNK = 4096
 private const val ORDERING_MESSAGES = 500
 private const val BYTE_RANGE = 256
+private val CASE_TIMEOUT = 30.seconds
 
 /**
  * Reusable behavioural contract for [Transport] implementations. Subclass it, supply connected
@@ -130,14 +132,22 @@ abstract class TransportContractTest {
             }
         }
 
+    // runTest's timeout runs on the real clock, unlike a withTimeout inside runTest, which virtual time would expire
+    // as soon as the test dispatcher idles. On timeout runTest cancels the case, and the cleanup below closes both
+    // ends from that cancelled coroutine, which the contract allows; closing ends any pending read, so a stuck case
+    // fails by name instead of hanging the run.
     private fun contract(body: suspend CoroutineScope.(Transport, Transport) -> Unit): TestResult =
-        runTest {
+        runTest(timeout = CASE_TIMEOUT) {
             val (a, b) = createPair()
             try {
                 body(this, a, b)
             } finally {
-                a.close()
-                b.close()
+                // A close that suspends in a cancelled coroutine throws once it is done, so b is closed regardless.
+                try {
+                    a.close()
+                } finally {
+                    b.close()
+                }
             }
         }
 }
