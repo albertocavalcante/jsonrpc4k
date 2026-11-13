@@ -109,6 +109,7 @@ class TcpListenerTest {
                 } finally {
                     first.close()
                 }
+                Unit
             }
         }
 
