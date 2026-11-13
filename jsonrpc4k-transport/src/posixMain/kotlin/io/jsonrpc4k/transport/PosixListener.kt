@@ -46,7 +46,7 @@ import kotlin.concurrent.AtomicInt
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.coroutineContext
 
-private const val LISTEN_BACKLOG = 128
+internal const val LISTEN_BACKLOG = 128
 
 /** Polls a single descriptor; split per platform family because poll() takes a platform-width nfds_t. */
 @OptIn(ExperimentalForeignApi::class)
@@ -62,10 +62,11 @@ private const val ACCEPT_POLL_MILLIS = 100
 internal actual suspend fun bindTcpListener(
     host: String,
     port: Int,
-): TransportListener = PosixTcpListener.bind(host, port)
+): TransportListener = PosixListener.bind(host, port)
 
 /**
- * TCP listener over a BSD listening socket.
+ * Listener over a BSD listening socket (TCP or Unix domain); [onClose] runs once when closing starts, for
+ * example to delete a socket file.
  *
  * The descriptor is only closed once no [accept] is using it, so a concurrent `close()` can never
  * make an accepting thread operate on a recycled descriptor. `accept` waits in `poll()` with a short
@@ -73,9 +74,10 @@ internal actual suspend fun bindTcpListener(
  * `accept()` on Linux but not on macOS, while the poll loop notices close and cancellation on both.
  */
 @OptIn(ExperimentalForeignApi::class)
-internal class PosixTcpListener private constructor(
+internal class PosixListener(
     private val fd: Int,
     override val port: Int,
+    private val onClose: () -> Unit = {},
 ) : TransportListener {
     // 0 = open, 1 = close requested
     private val closing = AtomicInt(0)
@@ -136,6 +138,7 @@ internal class PosixTcpListener private constructor(
         if (closing.compareAndSet(0, 1)) {
             // Wakes a blocked accept immediately on Linux; macOS answers ENOTCONN and relies on the poll loop.
             shutdown(fd, SHUT_RDWR.convert())
+            onClose()
         }
         releaseIfUnused()
     }
@@ -150,7 +153,7 @@ internal class PosixTcpListener private constructor(
         suspend fun bind(
             host: String,
             port: Int,
-        ): PosixTcpListener =
+        ): PosixListener =
             withContext(Dispatchers.IO) {
                 ignoreSigpipeOnce()
                 memScoped {
@@ -177,7 +180,7 @@ internal class PosixTcpListener private constructor(
             info: addrinfo,
             host: String,
             port: Int,
-        ): PosixTcpListener {
+        ): PosixListener {
             val fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
             if (fd < 0) {
                 throw TransportException("Failed to create socket: ${posixErrorMessage(errno)}")
@@ -185,7 +188,7 @@ internal class PosixTcpListener private constructor(
             try {
                 enableReuseAddress(fd)
                 bindAndListen(fd, info, "$host:$port")
-                return PosixTcpListener(fd, localPort(fd))
+                return PosixListener(fd, localPort(fd))
             } catch (e: Exception) {
                 close(fd)
                 throw e

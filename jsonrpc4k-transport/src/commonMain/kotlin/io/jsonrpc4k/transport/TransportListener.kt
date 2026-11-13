@@ -9,7 +9,7 @@ package io.jsonrpc4k.transport
 public interface TransportListener {
     /**
      * The local port the listener is bound to. When bound with port 0 this is the port the
-     * operating system chose.
+     * operating system chose. `-1` for a [LocalListener], which has no TCP port.
      */
     public val port: Int
 
@@ -27,6 +27,15 @@ public interface TransportListener {
      * accepted are unaffected.
      */
     public suspend fun close()
+}
+
+/**
+ * A [TransportListener] on a local IPC endpoint: a Unix domain socket or a Windows named pipe.
+ * It has no TCP port, so [TransportListener.port] is `-1`.
+ */
+public interface LocalListener : TransportListener {
+    /** The socket path, or the full Windows pipe path, the listener is bound to. */
+    public val path: String
 }
 
 /**

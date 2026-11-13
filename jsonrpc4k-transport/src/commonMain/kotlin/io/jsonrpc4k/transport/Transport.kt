@@ -52,21 +52,15 @@ public interface Transport {
 }
 
 /**
- * Factory for creating transports.
+ * Factory for transports that need no connection setup. Connecting transports are suspending:
+ * see [TcpSocket], [UnixSocket], [NamedPipe], [NodeIpc] and the [connect] helper for LSP launch
+ * arguments.
  */
 public expect object TransportFactory {
     /**
      * Create a stdio transport (stdin/stdout).
      */
     public fun stdio(): Transport
-
-    /**
-     * Create a socket transport that connects to the given host and port.
-     */
-    public fun socket(
-        host: String,
-        port: Int,
-    ): Transport
 }
 
 /**
