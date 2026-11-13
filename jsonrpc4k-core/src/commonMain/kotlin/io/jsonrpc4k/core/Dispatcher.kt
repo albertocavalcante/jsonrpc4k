@@ -87,11 +87,14 @@ internal class PendingRequests {
         }
     }
 
+    /** Removes and cancels the waiter [expected] for [id]; returns false when it is no longer pending. */
     fun cancel(
         id: RequestId,
         expected: CompletableDeferred<JsonElement?>,
-    ) {
-        remove(id, expected)?.cancel()
+    ): Boolean {
+        val waiter = remove(id, expected) ?: return false
+        waiter.cancel()
+        return true
     }
 
     fun cancelAll() = drain(close = false)
@@ -112,6 +115,13 @@ internal class PendingRequests {
 /**
  * Dispatches incoming JSON-RPC messages to registered handlers.
  *
+ * Request ids are scoped to one peer, so a dispatcher serves a single connection. An inbound
+ * `$/cancelRequest` cancels the running handler of the request that it names, and [dispatch] then
+ * answers that request with a Request Cancelled error (-32800), unless the handler ends with its
+ * own [JsonRpcException]. Cancellation is cooperative and reaches a handler only while it runs,
+ * so it needs messages to be dispatched concurrently. It never completes an outbound waiter that
+ * was registered with the same id.
+ *
  * @param json The JSON configuration used for serialization/deserialization.
  * @param notificationErrorHandler Optional handler invoked when a notification handler throws.
  *   By default, notification handler exceptions are silently ignored per the JSON-RPC spec
@@ -125,6 +135,7 @@ public class Dispatcher(
     private val requestHandlers = mutableMapOf<String, RequestHandler>()
     private val notificationHandlers = mutableMapOf<String, NotificationHandler>()
     internal val pending = PendingRequests()
+    internal val inbound = InboundRequests()
 
     /**
      * Register a request handler for a method.
@@ -233,7 +244,9 @@ public class Dispatcher(
 
     /**
      * Dispatch an incoming message.
-     * Returns a response message if the input was a request, null otherwise.
+     * Returns a response message if the input was a request, null otherwise. A request's handler
+     * runs until it returns, or until a `$/cancelRequest` for its id, dispatched concurrently,
+     * cancels it.
      */
     public suspend fun dispatch(message: Message): ResponseMessage? =
         when (message) {
@@ -284,7 +297,7 @@ public class Dispatcher(
             } ?: return ResponseMessage.error(request.id, ResponseError.methodNotFound(request.method))
 
         return try {
-            val result = handler.handle(request.params)
+            val result = inbound.runCancellable(request.id) { handler.handle(request.params) }
             ResponseMessage.success(request.id, result)
         } catch (e: CancellationException) {
             throw e
@@ -301,8 +314,8 @@ public class Dispatcher(
 
     private suspend fun handleNotification(notification: NotificationMessage) {
         if (notification.method == CANCEL_REQUEST_METHOD) {
-            // TODO(#49): Cancel inbound handler jobs when their directional registry is available.
-            // Until then, remote cancellation is best-effort and must not affect outbound waiters.
+            // Only inbound handlers are cancelled, so an outbound waiter with the same id keeps waiting.
+            cancelledRequestId(notification.params)?.let(inbound::cancel)
             return
         }
         val handler =

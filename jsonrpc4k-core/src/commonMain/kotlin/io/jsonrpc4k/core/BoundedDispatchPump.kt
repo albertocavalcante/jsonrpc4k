@@ -18,8 +18,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.yield
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 
 internal enum class OfferResult { ACCEPTED, TERMINAL_TRANSITION, REJECTED }
 
@@ -275,8 +273,7 @@ internal class BoundedDispatchPump(
     }
 
     private fun cancel(message: NotificationMessage) {
-        val primitive = (message.params as? JsonObject)?.get("id") as? JsonPrimitive ?: return
-        val id = if (primitive.isString) RequestId.of(primitive.content) else primitive.content.toLongOrNull()?.let(RequestId::of) ?: return
+        val id = cancelledRequestId(message.params) ?: return
         while (true) {
             val current = incoming.value
             val entry = current.requests[id] ?: return

@@ -43,6 +43,12 @@ import kotlin.time.Duration.Companion.seconds
  * earlier requests finish, runs its entries in order before later messages, and its requests cannot
  * be cancelled with `$/cancelRequest`. A batch that cannot be queued fails the connection, as a
  * notification does.
+ *
+ * An inbound `$/cancelRequest` (LSP base protocol) cancels the handler of the request that it names,
+ * and that request is answered with a Request Cancelled error (-32800). The default mode runs each
+ * handler to completion inside [receive] before it reads the next message, so only bounded mode,
+ * where handlers run concurrently, lets a cancellation stop a handler that is running. A caller of
+ * [request] that stops waiting sends `$/cancelRequest` for its own request.
  */
 public class Connection(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
@@ -78,6 +84,10 @@ public class Connection(
     internal val retainedApplicationBytes: Int get() = boundedPump?.retainedApplicationBytes ?: 0
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
+    private val outboundCancellation =
+        OutboundCancellation(dispatcher.pending, CoroutineScope(scope.coroutineContext + connectionJob)) { params ->
+            notify(Dispatcher.CANCEL_REQUEST_METHOD, params)
+        }
 
     /** The first observed terminal transition and its cause, if any. */
     public val state: StateFlow<ConnectionState> = mutableState.asStateFlow()
@@ -403,6 +413,12 @@ public class Connection(
     /**
      * Send a request and await the response. For an outbound-limited connection, the timeout
      * includes waiting for outbound admission; legacy connections start it after enqueue.
+     *
+     * Cancelling the caller, or reaching [timeout], after the request was queued stops waiting for
+     * it and asks the peer to cancel it with a `$/cancelRequest` notification that carries its id.
+     * A response that arrives later is ignored, and a request that was already answered sends
+     * nothing. The notification is an ordinary outgoing message, sent best effort from the
+     * connection's scope: a closed connection or a full producer limit drops it.
      */
     public suspend fun <R> request(
         method: String,
@@ -428,7 +444,7 @@ public class Connection(
                     try {
                         CompletedResponse(deferred.await())
                     } finally {
-                        dispatcher.pending.cancel(id, deferred)
+                        outboundCancellation.abandon(id, deferred)
                     }
                 }
             if (result == null) requestTimedOut(method)
@@ -438,13 +454,15 @@ public class Connection(
         val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
         val deferred = dispatcher.registerPendingRequest(id)
+        var sent = false
         return try {
             outgoingMessages.send(OutgoingItem.Frame(request))
+            sent = true
             val result = withTimeoutOrNull(timeout) { CompletedResponse(deferred.await()) }
             if (result == null) requestTimedOut(method)
             result.value
         } finally {
-            dispatcher.pending.cancel(id, deferred)
+            if (sent) outboundCancellation.abandon(id, deferred) else dispatcher.pending.cancel(id, deferred)
         }
     }
 
