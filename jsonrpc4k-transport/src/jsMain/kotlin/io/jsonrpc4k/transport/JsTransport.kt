@@ -12,52 +12,54 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 /**
- * External declarations for Node.js process object.
+ * Loads a Node.js built-in module on first use.
+ *
+ * The modules are deliberately not declared with a module annotation: that form makes the Kotlin/JS
+ * output import them when the file loads, which breaks a browser bundle that only uses the core APIs.
+ * Resolving them here, behind a runtime check and through a call a bundler cannot follow statically,
+ * keeps the import lazy.
  */
-@JsModule("process")
-@JsNonModule
-internal external object NodeProcess {
-    val stdin: dynamic
-    val stdout: dynamic
-    val env: dynamic
-    val execPath: String
+internal fun nodeRequire(name: String): dynamic {
+    if (!isNodeRuntime()) {
+        throw UnsupportedTransportException("The '$name' module requires Node.js; it is not available in a browser")
+    }
+    val require: dynamic = js("require")
+    return require(name)
 }
 
-/**
- * External declarations for the Node.js fs module.
- */
-@JsModule("fs")
-@JsNonModule
-@Suppress("UnusedParameter")
-internal external object Fs {
-    fun lstatSync(path: String): dynamic
-
-    fun unlinkSync(path: String)
+/** The Node.js process object, resolved on first access. */
+internal object NodeProcess {
+    val raw: dynamic get() = nodeRequire("process")
+    val stdin: dynamic get() = raw.stdin
+    val stdout: dynamic get() = raw.stdout
+    val env: dynamic get() = raw.env
 }
 
-/**
- * External declarations for Node.js Buffer.
- */
-@JsModule("buffer")
-@JsNonModule
-internal external object BufferModule {
-    val Buffer: dynamic
+/** The Node.js fs module, resolved on first access. */
+internal object Fs {
+    fun lstatSync(path: String): dynamic = nodeRequire("fs").lstatSync(path)
+
+    fun unlinkSync(path: String) {
+        nodeRequire("fs").unlinkSync(path)
+    }
 }
 
-/**
- * External declarations for Node.js net module.
- */
-@JsModule("net")
-@JsNonModule
-internal external object Net {
-    @Suppress("UnusedParameter")
+/** The Node.js buffer module, resolved on first access. */
+internal object BufferModule {
+    val Buffer: dynamic get() = nodeRequire("buffer").Buffer
+}
+
+/** The Node.js net module, resolved on first access. */
+internal object Net {
+    fun raw(): dynamic = nodeRequire("net")
+
     fun createConnection(
         port: Int,
         host: String,
-        callback: () -> Unit = definedExternally,
-    ): dynamic
+        callback: () -> Unit,
+    ): dynamic = nodeRequire("net").createConnection(port, host, callback)
 
-    fun createServer(): dynamic
+    fun createServer(): dynamic = nodeRequire("net").createServer()
 }
 
 /**

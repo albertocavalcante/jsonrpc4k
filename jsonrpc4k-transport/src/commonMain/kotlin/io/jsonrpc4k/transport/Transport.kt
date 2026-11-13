@@ -79,23 +79,3 @@ public class UnsupportedTransportException(
     message: String,
     cause: Throwable? = null,
 ) : TransportException(message, cause)
-
-/**
- * A connected JSON-RPC session over a transport.
- */
-public interface JsonRpcSession {
-    /**
-     * The underlying transport.
-     */
-    public val transport: Transport
-
-    /**
-     * Start the session - begins reading from transport and processing messages.
-     */
-    public suspend fun start()
-
-    /**
-     * Stop the session and close the transport.
-     */
-    public suspend fun stop()
-}
