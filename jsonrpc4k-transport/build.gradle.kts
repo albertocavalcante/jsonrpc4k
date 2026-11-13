@@ -47,20 +47,28 @@ kotlin {
             dependsOn(nativeMain)
         }
 
-        // Apple targets depend on posixMain
-        macosX64Main {
+        // poll() takes a platform-width nfds_t, so its call lives in per-family source sets.
+        val posixAppleMain by creating {
             dependsOn(posixMain)
         }
-        macosArm64Main {
+        val posixLinuxMain by creating {
             dependsOn(posixMain)
         }
 
-        // Linux targets depend on posixMain
+        // Apple targets depend on posixAppleMain
+        macosX64Main {
+            dependsOn(posixAppleMain)
+        }
+        macosArm64Main {
+            dependsOn(posixAppleMain)
+        }
+
+        // Linux targets depend on posixLinuxMain
         linuxX64Main {
-            dependsOn(posixMain)
+            dependsOn(posixLinuxMain)
         }
         linuxArm64Main {
-            dependsOn(posixMain)
+            dependsOn(posixLinuxMain)
         }
 
         // Windows depends on nativeMain directly

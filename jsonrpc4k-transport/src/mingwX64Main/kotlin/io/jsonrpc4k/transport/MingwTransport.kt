@@ -40,8 +40,8 @@ import platform.windows.socket
 import kotlin.concurrent.AtomicInt
 
 // Constants for Windows sockets
-private const val SOCKET_ERROR_VALUE = -1
-private val INVALID_SOCKET_VALUE = ULong.MAX_VALUE
+internal const val SOCKET_ERROR_VALUE = -1
+internal val INVALID_SOCKET_VALUE = ULong.MAX_VALUE
 
 // CRT file descriptors for the process stdio streams, and the _setmode failure value.
 private const val STDIN_FD = 0
@@ -67,6 +67,17 @@ private fun setBinaryMode(fd: Int) {
         throw TransportException("Failed to set binary mode on fd $fd: error $errno")
     }
 }
+
+// Thread-safe, once-only WSAStartup; a failed attempt is retried by the next caller.
+private val wsaStartup: Lazy<Unit> =
+    lazy {
+        val result = init_sockets()
+        if (result != 0) {
+            throw TransportException("WSAStartup failed: error $result")
+        }
+    }
+
+internal fun initWinsock(): Unit = wsaStartup.value
 
 /**
  * Create the platform-specific stdio transport for Windows.
@@ -177,7 +188,7 @@ internal class MingwStdioTransport(
  * Socket transport for Windows using Winsock2.
  */
 @OptIn(ExperimentalForeignApi::class)
-internal class MingwSocketTransport private constructor(
+internal class MingwSocketTransport internal constructor(
     private val socketHandle: ULong,
     private val bufferSize: Int = 8192,
 ) : Transport {
@@ -258,17 +269,6 @@ internal class MingwSocketTransport private constructor(
         get() = connected.value == 0
 
     companion object {
-        // Thread-safe, once-only WSAStartup; a failed attempt is retried by the next connect.
-        private val wsaStartup: Lazy<Unit> =
-            lazy {
-                val result = init_sockets()
-                if (result != 0) {
-                    throw TransportException("WSAStartup failed: error $result")
-                }
-            }
-
-        private fun initWsa(): Unit = wsaStartup.value
-
         /**
          * Connect to a socket server.
          */
@@ -277,7 +277,7 @@ internal class MingwSocketTransport private constructor(
             port: Int,
         ): MingwSocketTransport =
             withContext(Dispatchers.Default) {
-                initWsa()
+                initWinsock()
 
                 memScoped {
                     // Use getaddrinfo for hostname resolution

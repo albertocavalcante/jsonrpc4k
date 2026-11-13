@@ -42,6 +42,8 @@ internal external object Net {
         host: String,
         callback: () -> Unit = definedExternally,
     ): dynamic
+
+    fun createServer(): dynamic
 }
 
 /**
@@ -118,7 +120,7 @@ public class StdioTransport : Transport {
 /**
  * Socket transport for JS/Node.js.
  */
-public class SocketTransport private constructor(
+public class SocketTransport internal constructor(
     private val socket: dynamic,
 ) : Transport {
     private var connected = true

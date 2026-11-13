@@ -180,7 +180,7 @@ internal class PosixStdioTransport :
  * Socket transport for POSIX platforms using BSD sockets.
  */
 @OptIn(ExperimentalForeignApi::class)
-internal class PosixSocketTransport private constructor(
+internal class PosixSocketTransport internal constructor(
     socketFd: Int,
 ) : Transport by PosixFileDescriptorTransport(
         readFd = socketFd,
@@ -268,7 +268,7 @@ private val sigpipeIgnored = AtomicInt(0)
  * and ignoring SIGPIPE is the common choice for networked native runtimes.
  */
 @OptIn(ExperimentalForeignApi::class)
-private fun ignoreSigpipeOnce() {
+internal fun ignoreSigpipeOnce() {
     if (sigpipeIgnored.compareAndSet(0, 1)) {
         signal(SIGPIPE, SIG_IGN)
     }
@@ -278,7 +278,7 @@ private fun ignoreSigpipeOnce() {
  * Get error message from errno.
  */
 @OptIn(ExperimentalForeignApi::class)
-private fun posixErrorMessage(err: Int): String {
+internal fun posixErrorMessage(err: Int): String {
     val msg = strerror(err)
     return msg?.toKString() ?: "Unknown error ($err)"
 }
