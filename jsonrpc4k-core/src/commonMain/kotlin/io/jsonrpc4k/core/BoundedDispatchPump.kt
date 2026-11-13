@@ -18,8 +18,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.yield
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 
 internal enum class OfferResult { ACCEPTED, TERMINAL_TRANSITION, REJECTED }
 
@@ -275,8 +273,7 @@ internal class BoundedDispatchPump(
     }
 
     private fun cancel(message: NotificationMessage) {
-        val primitive = (message.params as? JsonObject)?.get("id") as? JsonPrimitive ?: return
-        val id = if (primitive.isString) RequestId.of(primitive.content) else primitive.content.toLongOrNull()?.let(RequestId::of) ?: return
+        val id = cancelledRequestId(message.params) ?: return
         while (true) {
             val current = incoming.value
             val entry = current.requests[id] ?: return
@@ -318,7 +315,7 @@ internal class BoundedDispatchPump(
                         running.map { it.finalized }.joinAll()
                         running.clear()
                         queueSlots.release()
-                        output.sendBatch(dispatcher.dispatch(event.batch))
+                        output.sendBatch(dispatcher.dispatch(event.batch, cancellable = false))
                     } finally {
                         event.reservation?.release()
                     }
@@ -355,7 +352,8 @@ internal class BoundedDispatchPump(
 
     private suspend fun runRequest(event: Event.Request) {
         try {
-            val response = checkNotNull(dispatcher.dispatch(event.message))
+            // This pump cancels its own workers, so the dispatcher does not track the handler.
+            val response = checkNotNull(dispatcher.dispatch(event.message, cancellable = false))
             val id = event.message.id
             val token = event.token
             if (claimReply(id, token)) {
