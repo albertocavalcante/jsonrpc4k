@@ -486,6 +486,8 @@ class BoundedDispatchTest {
                         offered.add(response)
                     }
 
+                    override suspend fun sendBatch(responses: List<ResponseMessage>): Unit = error("Unexpected batch: $responses")
+
                     override fun offer(
                         response: ResponseMessage,
                         onDequeued: (() -> Unit)?,
@@ -537,6 +539,8 @@ class BoundedDispatchTest {
                             secondSent.complete(Unit)
                         }
                     }
+
+                    override suspend fun sendBatch(responses: List<ResponseMessage>): Unit = error("Unexpected batch: $responses")
 
                     override fun offer(
                         response: ResponseMessage,
@@ -825,7 +829,7 @@ class BoundedDispatchTest {
             )
         }
 
-    private fun decode(frame: ByteArray): Message = JsonRpcMessageDecoder(codec).feed(frame).single()
+    private fun decode(frame: ByteArray): Message = JsonRpcMessageDecoder(codec).feed(frame).messages().single()
 
     private fun cancel(id: RequestId): NotificationMessage {
         val wireId =

@@ -31,6 +31,9 @@ internal interface DispatchOutput {
         onDequeued: () -> Unit,
     )
 
+    /** Sends the responses of one batch as a single JSON array frame, or nothing when there are none. */
+    suspend fun sendBatch(responses: List<ResponseMessage>)
+
     fun offer(
         response: ResponseMessage,
         onDequeued: (() -> Unit)? = null,
@@ -39,7 +42,18 @@ internal interface DispatchOutput {
     fun fail(cause: Throwable)
 }
 
-/** Owns bounded asynchronous application dispatch; only the scheduler starts handlers. */
+/**
+ * Owns bounded asynchronous application dispatch; only the scheduler starts handlers.
+ *
+ * A JSON-RPC 2.0 batch is admitted as one ordered unit, the simplest form that keeps every bound.
+ * Its responses and `$/cancelRequest` notifications take effect at admission, as in single frames.
+ * The remaining entries share one queue slot and one byte reservation for the whole frame. Like a
+ * notification, the scheduler starts the batch after earlier requests finish and runs its entries
+ * in order before later messages, then sends their responses as one array frame. Requests inside a
+ * batch are therefore not tracked for `$/cancelRequest` or duplicate IDs, and a batch that cannot
+ * be queued fails the connection, as a notification does. An invalid frame is answered at admission
+ * through the control reserve, as a busy reply is.
+ */
 internal class BoundedDispatchPump(
     private val policy: BoundedDispatchPolicy,
     private val decoder: JsonRpcMessageDecoder,
@@ -87,6 +101,11 @@ internal class BoundedDispatchPump(
             val message: NotificationMessage,
             override val reservation: Reservation?,
         ) : Event
+
+        data class Batch(
+            val batch: Payload.Batch,
+            override val reservation: Reservation?,
+        ) : Event
     }
 
     private data class Running(
@@ -126,9 +145,9 @@ internal class BoundedDispatchPump(
                 var offset = 0
                 while (offset < data.size) {
                     val end = minOf(data.size, offset + minOf(data.size - offset, INPUT_SLICE_SIZE))
-                    decoder.feedEach(data.copyOfRange(offset, end)) { message, bodyBytes ->
+                    decoder.feedEach(data.copyOfRange(offset, end)) { payload, bodyBytes ->
                         currentCoroutineContext().ensureActive()
-                        admit(message, bodyBytes)
+                        admit(payload, bodyBytes)
                     }
                     offset = end
                     if (offset < data.size) yield()
@@ -176,33 +195,50 @@ internal class BoundedDispatchPump(
     }
 
     private suspend fun admit(
-        message: Message,
+        payload: Payload,
         bodyBytes: Int,
     ) {
         if (output.isTerminating) throw CancellationException("Connection is terminating")
-        when (message) {
-            is ResponseMessage -> dispatcher.dispatch(message)
-            is RequestMessage -> admitRequest(message, bodyBytes)
-            is NotificationMessage -> {
-                if (message.method == Dispatcher.CANCEL_REQUEST_METHOD) {
-                    cancel(message)
-                } else {
-                    admitNotification(message, bodyBytes)
+        when (payload) {
+            is Payload.Single -> {
+                when (val message = payload.message) {
+                    is ResponseMessage -> dispatcher.dispatch(message)
+                    is RequestMessage -> admitRequest(message, bodyBytes)
+                    is NotificationMessage -> {
+                        if (message.method == Dispatcher.CANCEL_REQUEST_METHOD) {
+                            cancel(message)
+                        } else {
+                            admitOrdered(bodyBytes) { Event.Notification(message, it) }
+                        }
+                    }
+                }
+            }
+            is Payload.Batch -> {
+                val (control, ordered) = payload.entries.partition { it.isAdmissionControl() }
+                for (message in control.filterNotNull()) {
+                    admit(Payload.Single(message), bodyBytes = 0)
+                }
+                if (ordered.isNotEmpty()) admitOrdered(bodyBytes) { Event.Batch(Payload.Batch(ordered), it) }
+            }
+            is Payload.Invalid -> {
+                if (output.offer(payload.response) == OfferResult.REJECTED) {
+                    throw JsonRpcProtocolException("Outgoing response queue is full")
                 }
             }
         }
     }
 
-    private fun admitNotification(
-        message: NotificationMessage,
+    /** Queues an event that the scheduler runs in order, after earlier requests finish. */
+    private fun admitOrdered(
         bodyBytes: Int,
+        event: (Reservation) -> Event,
     ) {
         val reservation = reserve(bodyBytes) ?: throw JsonRpcProtocolException("Incoming application byte budget is full")
         val acquired = queueSlots.tryAcquire()
-        if (!acquired || !queued.trySend(Event.Notification(message, reservation)).isSuccess) {
+        if (!acquired || !queued.trySend(event(reservation)).isSuccess) {
             if (acquired) queueSlots.release()
             reservation.release()
-            throw JsonRpcProtocolException("Incoming notification queue is full or closed")
+            throw JsonRpcProtocolException("Incoming ordered queue is full or closed")
         }
     }
 
@@ -273,6 +309,16 @@ internal class BoundedDispatchPump(
                         running.clear()
                         queueSlots.release()
                         dispatcher.dispatch(event.message)
+                    } finally {
+                        event.reservation?.release()
+                    }
+                }
+                is Event.Batch -> {
+                    try {
+                        running.map { it.finalized }.joinAll()
+                        running.clear()
+                        queueSlots.release()
+                        output.sendBatch(dispatcher.dispatch(event.batch))
                     } finally {
                         event.reservation?.release()
                     }
@@ -415,3 +461,7 @@ internal class BoundedDispatchPump(
         const val SERVER_BUSY = -32000
     }
 }
+
+/** Batch entries that a bounded pump handles at admission instead of queueing them. */
+private fun Message?.isAdmissionControl(): Boolean =
+    this is ResponseMessage || (this is NotificationMessage && method == Dispatcher.CANCEL_REQUEST_METHOD)

@@ -209,7 +209,7 @@ class CodecTest {
         val contentBytes = content.encodeToByteArray()
         val input = "Content-Length: ${contentBytes.size}\r\n\r\n$content"
 
-        val messages = decoder.feed(input)
+        val messages = decoder.feed(input).messages()
         messages shouldHaveSize 1
         messages[0].shouldBeInstanceOf<NotificationMessage>()
         (messages[0] as NotificationMessage).method shouldBe "initialized"
@@ -226,7 +226,7 @@ class CodecTest {
             "Content-Length: ${content1Bytes.size}\r\n\r\n$content1" +
                 "Content-Length: ${content2Bytes.size}\r\n\r\n$content2"
 
-        val messages = decoder.feed(input)
+        val messages = decoder.feed(input).messages()
         messages shouldHaveSize 2
         (messages[0] as NotificationMessage).method shouldBe "method1"
         (messages[1] as NotificationMessage).method shouldBe "method2"
@@ -246,7 +246,7 @@ class CodecTest {
         val messages1 = decoder.feed(part1)
         messages1 shouldHaveSize 0
 
-        val messages2 = decoder.feed(part2)
+        val messages2 = decoder.feed(part2).messages()
         messages2 shouldHaveSize 1
         (messages2[0] as NotificationMessage).method shouldBe "test"
     }
@@ -312,7 +312,7 @@ class CodecTest {
         val contentBytes = content.encodeToByteArray()
         val input = "Content-Length: ${contentBytes.size}\r\n\r\n$content"
 
-        val messages = decoder.feed(input)
+        val messages = decoder.feed(input).messages()
         messages shouldHaveSize 1
         val request = messages[0] as RequestMessage
         request.id shouldBe RequestId.of(1)
@@ -326,7 +326,7 @@ class CodecTest {
         val contentBytes = content.encodeToByteArray()
         val input = "Content-Length: ${contentBytes.size}\r\n\r\n$content"
 
-        val messages = decoder.feed(input)
+        val messages = decoder.feed(input).messages()
         messages shouldHaveSize 1
         val response = messages[0] as ResponseMessage
         response.id shouldBe RequestId.of(1)
@@ -340,7 +340,7 @@ class CodecTest {
         val contentBytes = content.encodeToByteArray()
         val input = "Content-Length: ${contentBytes.size}\r\nContent-Type: application/json\r\n\r\n$content"
 
-        val messages = decoder.feed(input)
+        val messages = decoder.feed(input).messages()
         messages shouldHaveSize 1
         (messages[0] as NotificationMessage).method shouldBe "test"
     }
@@ -399,7 +399,7 @@ class CodecTest {
         val msg3 = "Content-Length: ${content3Bytes.size}\r\n\r\n$content3"
 
         // Feed all three at once
-        val messages = decoder.feed(msg1 + msg2 + msg3)
+        val messages = decoder.feed(msg1 + msg2 + msg3).messages()
         messages shouldHaveSize 3
         (messages[0] as NotificationMessage).method shouldBe "one"
         (messages[1] as NotificationMessage).method shouldBe "two"

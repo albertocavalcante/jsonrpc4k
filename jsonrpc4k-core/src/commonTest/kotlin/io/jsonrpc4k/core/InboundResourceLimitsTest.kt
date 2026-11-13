@@ -45,7 +45,7 @@ class InboundResourceLimitsTest {
         val decoder = JsonRpcMessageDecoder(codec, InboundResourceLimits(4096, 2, 4096))
         val body = """{jsonrpc:"2.0",method:ab//cd,params:{url:"http://host",text:"\\\"[{世界}]"}}"""
         val bytes = frame(body)
-        val messages = bytes.flatMap { decoder.feed(byteArrayOf(it)) }
+        val messages = bytes.flatMap { decoder.feed(byteArrayOf(it)).messages() }
         assertEquals(1, messages.size)
         assertIs<NotificationMessage>(messages.single())
     }

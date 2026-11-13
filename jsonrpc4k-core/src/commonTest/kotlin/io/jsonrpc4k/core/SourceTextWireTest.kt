@@ -38,7 +38,7 @@ class SourceTextWireTest {
         forEachVector { vector ->
             val body = """{"jsonrpc":"2.0","method":"source/text","params":{"text":"${vector.escaped}"}}"""
             val decoder = JsonRpcMessageDecoder()
-            val messages = frame(body).flatMap { decoder.feed(byteArrayOf(it)) }
+            val messages = frame(body).flatMap { decoder.feed(byteArrayOf(it)).messages() }
             assertUnits(vector, source(assertIs<NotificationMessage>(messages.single())))
         }
     }
@@ -57,7 +57,7 @@ class SourceTextWireTest {
         forEachVector { vector ->
             val bytes = JsonRpcCodec.Default.encode(message(vector.text))
             assertFrameLength(bytes)
-            val decoded = JsonRpcMessageDecoder().feed(bytes).single()
+            val decoded = JsonRpcMessageDecoder().feed(bytes).messages().single()
             assertUnits(vector, source(assertIs<NotificationMessage>(decoded)))
         }
     }
@@ -68,7 +68,7 @@ class SourceTextWireTest {
         forEachVector { vector ->
             val bytes = encoder.encode(message(vector.text))
             assertFrameLength(bytes)
-            val decoded = JsonRpcMessageDecoder().feed(bytes).single()
+            val decoded = JsonRpcMessageDecoder().feed(bytes).messages().single()
             assertUnits(vector, source(assertIs<NotificationMessage>(decoded)))
         }
     }
@@ -80,7 +80,7 @@ class SourceTextWireTest {
             val text = prefix + "\uD800" + prefix + "\uDC00"
             val message = message(text)
             for (bytes in listOf(JsonRpcCodec.Default.encode(message), encoder.encode(message))) {
-                val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder().feed(bytes).single())
+                val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder().feed(bytes).messages().single())
                 assertEquals(text.map { it.code }, source(decoded).map { it.code })
             }
         }
@@ -98,7 +98,7 @@ class SourceTextWireTest {
         val encoder = BoundedMessageEncoder(MAX_WIRE_BYTES, MAX_NODES, MAX_DEPTH)
         for (message in messages) {
             for (bytes in listOf(JsonRpcCodec.Default.encode(message), encoder.encode(message))) {
-                assertEquals(message, JsonRpcMessageDecoder().feed(bytes).single())
+                assertEquals(message, JsonRpcMessageDecoder().feed(bytes).messages().single())
                 assertFrameLength(bytes)
             }
         }
@@ -128,7 +128,7 @@ class SourceTextWireTest {
             val message = NotificationMessage("raw", JsonUnquotedLiteral(raw))
             val expected = JsonRpcCodec.defaultJson.parseToJsonElement(raw)
             for (bytes in listOf(JsonRpcCodec.Default.encode(message), encoder.encode(message))) {
-                val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder().feed(bytes).single())
+                val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder().feed(bytes).messages().single())
                 assertEquals(expected, decoded.params)
             }
         }
@@ -159,7 +159,7 @@ class SourceTextWireTest {
         for (comment in comments) {
             val raw = comment + """{"text":"$high"}"""
             val message = NotificationMessage("raw", JsonUnquotedLiteral(raw))
-            val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder(codec).feed(codec.encode(message)).single())
+            val decoded = assertIs<NotificationMessage>(JsonRpcMessageDecoder(codec).feed(codec.encode(message)).messages().single())
             assertEquals(high.map { it.code }, source(decoded).map { it.code })
         }
     }

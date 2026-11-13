@@ -40,14 +40,30 @@ public class BoundedMessageEncoder(
     /** Returns one complete Content-Length frame or throws if a limit is exceeded. */
     public fun encode(message: Message): ByteArray {
         val meter = SnapshotMeter(maxWireBytes, maxNodes, maxJsonNesting)
-        val snapshot = meter.snapshotMessage(message)
+        return frame(serialize(meter.snapshotMessage(message)))
+    }
+
+    /**
+     * Returns one complete Content-Length frame whose body is a JSON array of [messages] (a JSON-RPC
+     * 2.0 batch), or throws if a limit is exceeded. Every limit applies to the whole array.
+     */
+    public fun encode(messages: List<Message>): ByteArray {
+        require(messages.isNotEmpty()) { "A batch must contain at least one message" }
+        val meter = SnapshotMeter(maxWireBytes, maxNodes, maxJsonNesting)
+        return frame(messages.joinToString(separator = ",", prefix = "[", postfix = "]") { serialize(meter.snapshotMessage(it)) })
+    }
+
+    private fun serialize(snapshot: Message): String {
         val json = JsonRpcCodec.defaultJson
-        val body =
-            when (snapshot) {
-                is RequestMessage -> json.encodeToString(RequestMessage.serializer(), snapshot)
-                is NotificationMessage -> json.encodeToString(NotificationMessage.serializer(), snapshot)
-                is ResponseMessage -> json.encodeToString(ResponseMessage.serializer(), snapshot)
-            }.escapeLoneJsonSurrogates(maxWireBytes).encodeToByteArray()
+        return when (snapshot) {
+            is RequestMessage -> json.encodeToString(RequestMessage.serializer(), snapshot)
+            is NotificationMessage -> json.encodeToString(NotificationMessage.serializer(), snapshot)
+            is ResponseMessage -> json.encodeToString(ResponseMessage.serializer(), snapshot)
+        }
+    }
+
+    private fun frame(json: String): ByteArray {
+        val body = json.escapeLoneJsonSurrogates(maxWireBytes).encodeToByteArray()
         JsonNestingGuard(maxJsonNesting, false).check(body)
         val header = "Content-Length: ${body.size}\r\n\r\n".encodeToByteArray()
         if (body.size > maxWireBytes - header.size) throw JsonRpcProtocolException("Encoded frame exceeds $maxWireBytes bytes")
