@@ -137,7 +137,8 @@ class ProcessTransportTest {
             val missing = File(System.getProperty("java.io.tmpdir"), "jsonrpc4k-missing-${System.nanoTime()}").path
             assertFailsWith<IllegalArgumentException> { ProcessTransport.start(emptyList()) }
             val failure = assertFailsWith<TransportException> { ProcessTransport.start(listOf(missing)) }
-            assertTrue(failure.cause is IOException)
+            // Coroutine stack-trace recovery may wrap the exception in a copy, so look through the cause chain.
+            assertTrue(generateSequence<Throwable>(failure) { it.cause }.any { it is IOException })
         }
 
     /** Closes a child that stays alive after stdin EOF and checks that close is bounded and ends it. */
