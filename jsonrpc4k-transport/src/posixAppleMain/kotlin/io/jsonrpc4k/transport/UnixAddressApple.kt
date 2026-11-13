@@ -1,46 +1,21 @@
 package io.jsonrpc4k.transport
 
+import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.alloc
-import kotlinx.cinterop.convert
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.ptr
-import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.set
-import kotlinx.cinterop.sizeOf
-import platform.posix.AF_UNIX
-import platform.posix.lstat
-import platform.posix.memset
-import platform.posix.sockaddr
-import platform.posix.sockaddr_un
-import platform.posix.stat
 
-// sun_path is 104 bytes on Apple platforms; one is kept for the NUL.
-internal actual val UNIX_PATH_MAX_BYTES: Int = 103
+// sockaddr_un.sun_path is 104 bytes on Apple platforms.
+internal actual val SUN_PATH_SIZE: Int = 104
 
-private const val FILE_TYPE_MASK = 0xF000u
-private const val FILE_TYPE_SOCKET = 0xC000u
+private const val AF_UNIX_VALUE: Byte = 1
 
+/** Apple layout: sun_len at offset 0 followed by the one byte sa_family. */
 @OptIn(ExperimentalForeignApi::class)
-internal actual fun <R> withUnixAddress(
-    path: String,
-    block: (address: CPointer<sockaddr>, length: Int) -> R,
-): R =
-    memScoped {
-        val address = alloc<sockaddr_un>()
-        val length = sizeOf<sockaddr_un>().toInt()
-        memset(address.ptr, 0, length.convert())
-        address.sun_len = length.convert()
-        address.sun_family = AF_UNIX.convert()
-        val bytes = path.encodeToByteArray()
-        for (index in bytes.indices) address.sun_path[index] = bytes[index]
-        block(address.ptr.reinterpret(), length)
-    }
-
-@OptIn(ExperimentalForeignApi::class)
-internal actual fun isSocketFile(path: String): Boolean =
-    memScoped {
-        val info = alloc<stat>()
-        lstat(path, info.ptr) == 0 && (info.st_mode.toUInt() and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
-    }
+internal actual fun writeUnixFamily(
+    buffer: CPointer<ByteVar>,
+    length: Int,
+) {
+    buffer[0] = length.toByte()
+    buffer[1] = AF_UNIX_VALUE
+}

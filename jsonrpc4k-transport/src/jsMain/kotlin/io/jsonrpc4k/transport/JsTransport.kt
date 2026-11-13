@@ -26,6 +26,7 @@ internal external object NodeProcess {
  */
 @JsModule("fs")
 @JsNonModule
+@Suppress("UnusedParameter")
 internal external object Fs {
     fun lstatSync(path: String): dynamic
 

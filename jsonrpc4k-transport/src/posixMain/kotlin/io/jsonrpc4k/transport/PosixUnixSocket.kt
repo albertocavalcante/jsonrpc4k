@@ -1,8 +1,15 @@
 package io.jsonrpc4k.transport
 
+import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.convert
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.set
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.withContext
@@ -14,26 +21,60 @@ import platform.posix.close
 import platform.posix.connect
 import platform.posix.errno
 import platform.posix.listen
+import platform.posix.lstat
 import platform.posix.sockaddr
 import platform.posix.socket
+import platform.posix.stat
 import platform.posix.unlink
 
+/** Bytes of `sun_path` including the terminating NUL; 108 on Linux, 104 on Apple platforms. */
+internal expect val SUN_PATH_SIZE: Int
+
 /**
- * Fills a `sockaddr_un` for [path] and passes it with its length to [block]. The struct layout
- * differs between Apple and Linux, so each family builds it in its own source set.
+ * Writes the address family (and on Apple the `sun_len` byte) into the first [SUN_PATH_OFFSET]
+ * bytes of a zeroed `sockaddr_un` buffer of [length] bytes. The cinterop struct is not visible to
+ * the shared intermediate source sets, so the layout is written by hand.
  */
 @OptIn(ExperimentalForeignApi::class)
-internal expect fun <R> withUnixAddress(
-    path: String,
-    block: (address: CPointer<sockaddr>, length: Int) -> R,
-): R
+internal expect fun writeUnixFamily(
+    buffer: CPointer<ByteVar>,
+    length: Int,
+)
+
+/** Offset of `sun_path`; both families put a two byte header before it. */
+private const val SUN_PATH_OFFSET = 2
 
 /** Longest socket path in bytes, excluding the terminating NUL; differs per platform family. */
-internal expect val UNIX_PATH_MAX_BYTES: Int
+internal val UNIX_PATH_MAX_BYTES: Int
+    get() = SUN_PATH_SIZE - 1
+
+/**
+ * Builds a `sockaddr_un` for [path] in a zeroed byte buffer and passes it with its length to [block].
+ */
+@OptIn(ExperimentalForeignApi::class)
+internal fun <R> withUnixAddress(
+    path: String,
+    block: (address: CPointer<sockaddr>, length: Int) -> R,
+): R =
+    memScoped {
+        val length = SUN_PATH_OFFSET + SUN_PATH_SIZE
+        val buffer = allocArray<ByteVar>(length)
+        val bytes = path.encodeToByteArray()
+        for (index in bytes.indices) buffer[SUN_PATH_OFFSET + index] = bytes[index]
+        writeUnixFamily(buffer, length)
+        block(buffer.reinterpret(), length)
+    }
 
 /** Whether [path] exists and is itself a socket (a symbolic link is not followed). */
 @OptIn(ExperimentalForeignApi::class)
-internal expect fun isSocketFile(path: String): Boolean
+internal fun isSocketFile(path: String): Boolean =
+    memScoped {
+        val info = alloc<stat>()
+        lstat(path, info.ptr) == 0 && (info.st_mode.convert<UInt>() and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
+    }
+
+private const val FILE_TYPE_MASK = 0xF000u
+private const val FILE_TYPE_SOCKET = 0xC000u
 
 private fun checkUnixPath(path: String) {
     if (path.isEmpty() || '\u0000' in path) throw TransportException("Invalid Unix socket path")

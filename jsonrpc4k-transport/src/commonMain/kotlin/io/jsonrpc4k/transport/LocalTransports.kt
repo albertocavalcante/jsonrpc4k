@@ -57,8 +57,7 @@ public object UnixSocket {
  * | Platform | Support |
  * |---|---|
  * | Node.js on Windows | connect and bind |
- * | JVM on Windows | connect only, see [connect] |
- * | JVM elsewhere, POSIX native, Windows native, browser | [UnsupportedTransportException] |
+ * | JVM, POSIX native, Windows native, browser | [UnsupportedTransportException] |
  *
  * Windows native is unsupported until a Windows runner can validate it.
  */
@@ -66,10 +65,8 @@ public object NamedPipe {
     /**
      * Connect to a pipe server.
      *
-     * JVM limitation: the pipe is opened with `RandomAccessFile`, one synchronous handle. Windows
-     * serializes a pending read with writes on such a handle, so a write issued while the reader is
-     * waiting can stall until the peer sends data. Use Node.js, TCP or a process transport for
-     * full-duplex traffic on the JVM.
+     * The JVM is unsupported on purpose: a single synchronous handle cannot read and write at once
+     * on Windows, which would deadlock request/response traffic.
      *
      * @throws TransportException if the name is invalid or no pipe server is available.
      * @throws UnsupportedTransportException on platforms without client support.
@@ -77,8 +74,7 @@ public object NamedPipe {
     public suspend fun connect(nameOrPath: String): Transport = connectNamedPipe(pipePath(nameOrPath))
 
     /**
-     * Create a pipe server. The JVM cannot create named pipes without native code, so it throws
-     * [UnsupportedTransportException].
+     * Create a pipe server.
      *
      * @throws TransportException if the name is invalid or the pipe cannot be created.
      * @throws UnsupportedTransportException on platforms without server support.
@@ -105,7 +101,7 @@ public object NodeIpc {
 }
 
 /** Whether [name] already is a Windows pipe path rather than a bare pipe name. */
-internal fun isPipePath(name: String): Boolean = name.startsWith(WINDOWS_PIPE_PREFIX) || name.startsWith(FORWARD_PIPE_PREFIX)
+internal fun isPipePath(name: String): Boolean = listOf(WINDOWS_PIPE_PREFIX, FORWARD_PIPE_PREFIX).any(name::startsWith)
 
 /** Normalizes a pipe name or either pipe path spelling to `\\.\pipe\name`. */
 internal fun pipePath(nameOrPath: String): String {

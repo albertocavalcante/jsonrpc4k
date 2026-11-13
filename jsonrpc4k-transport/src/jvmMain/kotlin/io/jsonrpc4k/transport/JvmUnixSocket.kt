@@ -29,6 +29,8 @@ import kotlin.coroutines.coroutineContext
 // A blocked read or accept wakes up this often so coroutine cancellation and close are noticed.
 private const val READ_POLL_MILLIS = 100L
 private const val ACCEPT_POLL_MILLIS = 250L
+private const val FILE_TYPE_MASK = 0xF000
+private const val FILE_TYPE_SOCKET = 0xC000
 
 internal actual suspend fun connectUnixSocket(path: String): Transport =
     withContext(Dispatchers.IO) {
@@ -77,11 +79,20 @@ internal class PolledChannel(
     private val writeSelector: Selector
 
     init {
-        channel.configureBlocking(false)
-        readSelector = Selector.open()
-        writeSelector = Selector.open()
-        channel.register(readSelector, SelectionKey.OP_READ)
-        channel.register(writeSelector, SelectionKey.OP_WRITE)
+        val read = Selector.open()
+        var write: Selector? = null
+        try {
+            channel.configureBlocking(false)
+            write = Selector.open()
+            channel.register(read, SelectionKey.OP_READ)
+            channel.register(write, SelectionKey.OP_WRITE)
+        } catch (e: IOException) {
+            runCatching { read.close() }
+            runCatching { write?.close() }
+            throw e
+        }
+        readSelector = read
+        writeSelector = write
     }
 
     val input: InputStream =
@@ -169,8 +180,13 @@ internal class UnixSocketTransport private constructor(
 
     companion object {
         fun wrap(channel: SocketChannel): UnixSocketTransport {
-            val polled = PolledChannel(channel)
-            return UnixSocketTransport(channel, StreamTransport(polled.input, polled.output))
+            try {
+                val polled = PolledChannel(channel)
+                return UnixSocketTransport(channel, StreamTransport(polled.input, polled.output))
+            } catch (e: Throwable) {
+                runCatching { channel.close() }
+                throw e
+            }
         }
     }
 }
@@ -205,25 +221,28 @@ internal class JvmUnixListener private constructor(
                 selector.selectedKeys().clear()
                 context.ensureActive()
             } catch (e: ClosedSelectorException) {
-                throw TransportException("Listener is closed", e)
+                throw acceptFailure(e)
             } catch (e: IOException) {
-                val reason = if (server.isOpen) "Accept failed" else "Listener is closed"
-                throw TransportException(reason, e)
+                throw acceptFailure(e)
             }
         }
     }
 
+    private fun acceptFailure(cause: Exception): TransportException =
+        TransportException(if (server.isOpen && cause is IOException) "Accept failed" else "Listener is closed", cause)
+
     override suspend fun close() {
         if (!closed.compareAndSet(false, true)) return
         withContext(NonCancellable + Dispatchers.IO) {
-            try {
-                server.close()
-                selector.close()
-            } catch (e: IOException) {
-                throw TransportException("Failed to close listener", e)
-            } finally {
-                Files.deleteIfExists(socketFile)
+            var failure: IOException? = null
+            for (step in listOf<() -> Unit>({ server.close() }, { selector.close() }, { Files.deleteIfExists(socketFile) })) {
+                try {
+                    step()
+                } catch (e: IOException) {
+                    failure = failure ?: e
+                }
             }
+            failure?.let { throw TransportException("Failed to close listener", it) }
         }
     }
 
@@ -233,14 +252,16 @@ internal class JvmUnixListener private constructor(
             val socketFile = Path.of(path)
             removeStaleSocket(socketFile, path)
             val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+            var selector: Selector? = null
             try {
                 server.bind(UnixDomainSocketAddress.of(socketFile))
                 server.configureBlocking(false)
-                val selector = Selector.open()
+                selector = Selector.open()
                 server.register(selector, SelectionKey.OP_ACCEPT)
                 return JvmUnixListener(server, selector, socketFile, path)
             } catch (e: Throwable) {
-                server.close()
+                runCatching { selector?.close() }
+                runCatching { server.close() }
                 throw e
             }
         }
@@ -260,9 +281,27 @@ internal class JvmUnixListener private constructor(
                     return
                 }
             if (!attributes.isOther) return
-            if (isServed(socketFile)) throw TransportException("Unix socket $path is already in use")
-            Files.deleteIfExists(socketFile)
+            if (!isSocket(socketFile) || isServed(socketFile)) {
+                throw TransportException("$path is not a stale Unix socket (not a socket, or still in use)")
+            }
+            try {
+                Files.deleteIfExists(socketFile)
+            } catch (e: IOException) {
+                throw TransportException("Cannot remove stale Unix socket $path", e)
+            }
         }
+
+        private fun isSocket(socketFile: Path): Boolean =
+            try {
+                val mode = Files.getAttribute(socketFile, "unix:mode", LinkOption.NOFOLLOW_LINKS) as Int
+                (mode and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
+            } catch (ignored: UnsupportedOperationException) {
+                false
+            } catch (ignored: IllegalArgumentException) {
+                false
+            } catch (ignored: IOException) {
+                false
+            }
 
         private fun isServed(socketFile: Path): Boolean =
             try {
@@ -270,6 +309,8 @@ internal class JvmUnixListener private constructor(
                 true
             } catch (ignored: ConnectException) {
                 false
+            } catch (e: IOException) {
+                throw TransportException("Cannot probe Unix socket $socketFile", e)
             }
     }
 }

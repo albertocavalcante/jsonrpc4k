@@ -135,6 +135,12 @@ class UnixSocketTest {
         }
 
     @Test
+    fun `named pipe client is unsupported on the JVM`() =
+        withSocketDir {
+            assertFailsWith<UnsupportedTransportException> { NamedPipe.connect("jsonrpc") }
+        }
+
+    @Test
     fun `Node IPC is unsupported on the JVM`() {
         assertFailsWith<UnsupportedTransportException> { NodeIpc.connect() }
     }
