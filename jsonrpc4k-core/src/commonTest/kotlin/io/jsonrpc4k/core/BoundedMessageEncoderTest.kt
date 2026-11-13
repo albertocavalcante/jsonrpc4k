@@ -130,7 +130,7 @@ class BoundedMessageEncoderTest {
                         }
             }
         val bytes = encoder.encode(NotificationMessage("n", JsonObject(changing)))
-        val decoded = assertIsNotification(JsonRpcMessageDecoder(codec).feed(bytes).single())
+        val decoded = assertIsNotification(JsonRpcMessageDecoder(codec).feed(bytes).messages().single())
         assertEquals(JsonPrimitive("old"), (decoded.params as JsonObject)["key"])
         assertEquals(JsonPrimitive("new"), backing["key"])
     }

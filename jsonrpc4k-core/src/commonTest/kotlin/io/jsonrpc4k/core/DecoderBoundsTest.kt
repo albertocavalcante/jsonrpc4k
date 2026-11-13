@@ -1,6 +1,5 @@
 package io.jsonrpc4k.core
 
-import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -31,7 +30,7 @@ class DecoderBoundsTest {
         val header = headerOfSize(headerLimit)
         val decoder = JsonRpcMessageDecoder(codec)
         assertTrue(decoder.feed(header.dropLast(1)).isEmpty())
-        val messages = decoder.feed(header.takeLast(1) + content)
+        val messages = decoder.feed(header.takeLast(1) + content).messages()
         assertTrue(messages == listOf(NotificationMessage(method = "bounded")))
     }
 
@@ -55,11 +54,18 @@ class DecoderBoundsTest {
     @Test
     fun `decoder failure is terminal until explicit reset`() {
         val decoder = JsonRpcMessageDecoder(codec)
-        val failure = assertFailsWith<SerializationException> { decoder.feed("Content-Length: 1\r\n\r\n{") }
-        val repeated = assertFailsWith<SerializationException> { decoder.feed(headerOfSize(64) + content) }
+        val failure = assertFailsWith<JsonRpcProtocolException> { decoder.feed("Content-Length: x\r\n\r\n") }
+        val repeated = assertFailsWith<JsonRpcProtocolException> { decoder.feed(headerOfSize(64) + content) }
         assertSame(failure, repeated)
         decoder.reset()
-        assertTrue(decoder.feed(headerOfSize(64) + content) == listOf(NotificationMessage(method = "bounded")))
+        assertTrue(decoder.feed(headerOfSize(64) + content).messages() == listOf(NotificationMessage(method = "bounded")))
+    }
+
+    @Test
+    fun `malformed body decodes to a payload and the stream continues`() {
+        val decoder = JsonRpcMessageDecoder(codec)
+        assertTrue(decoder.feed("Content-Length: 1\r\n\r\n{") == listOf(Payload.Invalid.PARSE_ERROR))
+        assertTrue(decoder.feed(headerOfSize(64) + content).messages() == listOf(NotificationMessage(method = "bounded")))
     }
 
     @Test
@@ -76,7 +82,7 @@ class DecoderBoundsTest {
             var offset = 0
             while (offset < bytes.size) {
                 val count = minOf(chunkSize, bytes.size - offset)
-                actual.addAll(decoder.feed(bytes.copyOfRange(offset, offset + count)))
+                actual.addAll(decoder.feed(bytes.copyOfRange(offset, offset + count)).messages())
                 offset += count
             }
             assertTrue(actual == expected, "Chunk size $chunkSize altered valid UTF-8 messages")

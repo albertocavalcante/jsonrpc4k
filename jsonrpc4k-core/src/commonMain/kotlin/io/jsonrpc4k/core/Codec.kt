@@ -1,7 +1,11 @@
 package io.jsonrpc4k.core
 
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 
 /**
  * JSON-RPC message codec for encoding/decoding messages with Content-Length headers.
@@ -23,12 +27,12 @@ public class JsonRpcCodec(
      * Encode a message to wire format with Content-Length header.
      * Lone UTF-16 units in quoted strings use JSON escapes to preserve their value on the wire.
      */
-    public fun encode(message: Message): ByteArray {
-        val content = json.encodeToString(Message.serializer(), message)
-        val contentBytes = content.escapeLoneJsonSurrogates(allowComments = allowsComments).encodeToByteArray()
-        val header = "Content-Length: ${contentBytes.size}\r\n\r\n"
-        return header.encodeToByteArray() + contentBytes
-    }
+    public fun encode(message: Message): ByteArray = frame(encodeToJson(message))
+
+    /**
+     * Encode a JSON-RPC 2.0 batch: one frame whose content is a JSON array of [messages].
+     */
+    public fun encode(messages: List<Message>): ByteArray = frame(encodeToJson(messages))
 
     /**
      * Encode a message to JSON string (without headers).
@@ -36,9 +40,51 @@ public class JsonRpcCodec(
     public fun encodeToJson(message: Message): String = json.encodeToString(Message.serializer(), message)
 
     /**
-     * Decode a JSON string to a Message.
+     * Encode a JSON-RPC 2.0 batch to a JSON array string (without headers). A batch is never empty.
+     */
+    public fun encodeToJson(messages: List<Message>): String {
+        require(messages.isNotEmpty()) { "A batch must contain at least one message" }
+        return json.encodeToString(ListSerializer(Message.serializer()), messages)
+    }
+
+    /**
+     * Decode a JSON string to a single Message, throwing if it is not one valid message object.
      */
     public fun decodeFromJson(jsonString: String): Message = json.decodeFromString(Message.serializer(), jsonString)
+
+    /**
+     * Decode one frame body into a [Payload] (JSON-RPC 2.0 sections 5.1 and 6). Malformed input is a
+     * value, not an exception: text that is not JSON is [Payload.Invalid.PARSE_ERROR], and an empty
+     * array or a value that is not a message object is [Payload.Invalid.INVALID_REQUEST]. A batch
+     * keeps each invalid element as a `null` entry.
+     */
+    public fun decodePayload(jsonString: String): Payload {
+        val element =
+            try {
+                json.parseToJsonElement(jsonString)
+            } catch (_: SerializationException) {
+                return Payload.Invalid.PARSE_ERROR
+            }
+        return when {
+            element !is JsonArray -> decodeMessageOrNull(element)?.let { Payload.Single(it) } ?: Payload.Invalid.INVALID_REQUEST
+            element.isEmpty() -> Payload.Invalid.INVALID_REQUEST
+            else -> Payload.Batch(element.map { decodeMessageOrNull(it) })
+        }
+    }
+
+    private fun decodeMessageOrNull(element: JsonElement): Message? =
+        try {
+            json.decodeFromJsonElement(Message.serializer(), element)
+        } catch (_: IllegalArgumentException) {
+            // SerializationException is an IllegalArgumentException, as are the envelope checks.
+            null
+        }
+
+    private fun frame(content: String): ByteArray {
+        val contentBytes = content.escapeLoneJsonSurrogates(allowComments = allowsComments).encodeToByteArray()
+        val header = "Content-Length: ${contentBytes.size}\r\n\r\n"
+        return header.encodeToByteArray() + contentBytes
+    }
 
     /**
      * Parse Content-Length header from a header line.
@@ -86,13 +132,15 @@ public class JsonRpcCodec(
 }
 
 /**
- * A streaming decoder for JSON-RPC messages.
+ * A streaming decoder for JSON-RPC payloads.
  * Handles partial reads and buffering.
  *
  * Note: Content-Length specifies the number of bytes, not characters.
  * This decoder maintains a byte buffer to correctly handle multi-byte UTF-8 characters.
  * Header and content limits apply per frame, including when a feed contains multiple frames.
- * A framing or decoding failure is terminal until [reset] starts a new stream.
+ * A framing or resource-limit failure is terminal until [reset] starts a new stream. A well-framed
+ * body that is not valid JSON-RPC is not a failure: it decodes to [Payload.Invalid] and the stream
+ * continues, as each frame is decoded by [JsonRpcCodec.decodePayload].
  */
 public class JsonRpcMessageDecoder(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
@@ -113,25 +161,25 @@ public class JsonRpcMessageDecoder(
 
     /**
      * Feed data into the decoder.
-     * Returns a list of complete messages that were decoded.
-     * A framing or decoding failure is terminal until [reset] starts a new stream.
+     * Returns the complete payloads that were decoded, one per frame.
+     * A framing failure is terminal until [reset] starts a new stream.
      */
-    public fun feed(data: String): List<Message> = feed(data.encodeToByteArray())
+    public fun feed(data: String): List<Payload> = feed(data.encodeToByteArray())
 
     /**
      * Feed data into the decoder.
-     * Returns a list of complete messages that were decoded.
+     * Returns the complete payloads that were decoded, one per frame.
      */
-    public fun feed(data: ByteArray): List<Message> {
+    public fun feed(data: ByteArray): List<Payload> {
         failure?.let { throw it }
         try {
-            val messages = mutableListOf<Message>()
+            val payloads = mutableListOf<Payload>()
             var offset = 0
             while (offset < data.size) {
                 offset += appendChunk(data, offset)
-                drainMessages(messages)
+                drainPayloads(payloads)
             }
-            return messages
+            return payloads
         } catch (cause: Exception) {
             reset()
             failure = cause
@@ -142,7 +190,7 @@ public class JsonRpcMessageDecoder(
     /** Processes each completed frame before decoding the next one. */
     internal suspend fun feedEach(
         data: ByteArray,
-        accept: suspend (Message, Int) -> Unit,
+        accept: suspend (Payload, Int) -> Unit,
     ) {
         failure?.let { throw it }
         try {
@@ -150,8 +198,8 @@ public class JsonRpcMessageDecoder(
             while (offset < data.size) {
                 offset += appendChunk(data, offset)
                 while (true) {
-                    val message = tryDecodeOne() ?: break
-                    accept(message, lastDecodedLength)
+                    val payload = tryDecodeOne() ?: break
+                    accept(payload, lastDecodedLength)
                 }
             }
         } catch (cause: Exception) {
@@ -214,14 +262,14 @@ public class JsonRpcMessageDecoder(
         byteBufferSize -= count
     }
 
-    private fun drainMessages(messages: MutableList<Message>) {
+    private fun drainPayloads(payloads: MutableList<Payload>) {
         while (true) {
-            val message = tryDecodeOne() ?: break
-            messages.add(message)
+            val payload = tryDecodeOne() ?: break
+            payloads.add(payload)
         }
     }
 
-    private fun tryDecodeOne(): Message? {
+    private fun tryDecodeOne(): Payload? {
         if (!headersParsed && !tryParseHeaders()) {
             return null
         }
@@ -243,7 +291,7 @@ public class JsonRpcMessageDecoder(
         headersParsed = false
         lastDecodedLength = contentLength
 
-        return codec.decodeFromJson(jsonContent)
+        return codec.decodePayload(jsonContent)
     }
 
     private fun tryParseHeaders(): Boolean {

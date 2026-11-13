@@ -353,10 +353,11 @@ public object MessageSerializer : JsonContentPolymorphicSerializer<Message>(Mess
     override fun selectDeserializer(element: JsonElement): DeserializationStrategy<Message> {
         val jsonObject = element.jsonObject
 
-        // Validate jsonrpc version
-        val jsonrpcVersion = jsonObject["jsonrpc"]?.jsonPrimitive?.content
-        require(jsonrpcVersion != null) { "Missing required jsonrpc field" }
+        // Validate jsonrpc version: exactly the string "2.0".
+        val jsonrpcVersion = jsonObject["jsonrpc"].stringContentOrNull()
+        require(jsonrpcVersion != null) { "Missing required jsonrpc string field" }
         require(jsonrpcVersion == JSONRPC_VERSION) { "Invalid jsonrpc version: $jsonrpcVersion (expected $JSONRPC_VERSION)" }
+        require("method" !in jsonObject || jsonObject["method"].stringContentOrNull() != null) { "Method must be a string" }
 
         // Validate response members before selecting the request or response serializer.
         require(!("result" in jsonObject && "error" in jsonObject)) {
@@ -382,6 +383,62 @@ public object MessageSerializer : JsonContentPolymorphicSerializer<Message>(Mess
             // Response with null id (error response to notification)
             "result" in jsonObject || "error" in jsonObject -> ResponseMessage.serializer()
             else -> throw IllegalArgumentException("Cannot determine message type from: $element")
+        }
+    }
+}
+
+/** JSON literals that are not strings, as a lenient codec reads them when they are unquoted. */
+private val JSON_NON_STRING_LITERAL = Regex("true|false|null|-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+
+/**
+ * Returns the text of a JSON string member, or null when it is absent or not a string. A lenient
+ * codec reads unquoted text as a non-string literal, which counts as a string unless it is a JSON
+ * number, boolean or null.
+ */
+private fun JsonElement?.stringContentOrNull(): String? {
+    val primitive = this as? JsonPrimitive ?: return null
+    return primitive.content.takeIf { primitive.isString || !JSON_NON_STRING_LITERAL.matches(it) }
+}
+
+/**
+ * One decoded frame body: a single message, a batch, or text that is not a valid JSON-RPC 2.0
+ * payload (specification sections 4, 5.1 and 6).
+ */
+public sealed interface Payload {
+    /** A single message object. */
+    public data class Single(
+        public val message: Message,
+    ) : Payload
+
+    /**
+     * A non-empty JSON array of message objects, in wire order. A `null` entry marks an element that
+     * is not a valid message object; a receiver answers it with an Invalid Request error whose id is
+     * null, inside the batch's response array.
+     */
+    public data class Batch(
+        public val entries: List<Message?>,
+    ) : Payload {
+        init {
+            require(entries.isNotEmpty()) { "A batch must contain at least one entry" }
+        }
+    }
+
+    /**
+     * Text that is not valid JSON, an empty array, or a value that is not a message object. A
+     * receiver answers it with [response], a single response object rather than an array.
+     */
+    public data class Invalid(
+        public val error: ResponseError,
+    ) : Payload {
+        /** The single error response owed for this payload; its id is null because none can be trusted. */
+        public val response: ResponseMessage get() = ResponseMessage.error(id = null, error = error)
+
+        public companion object {
+            /** The payload is not valid JSON (-32700). */
+            public val PARSE_ERROR: Invalid = Invalid(ResponseError.parseError("Parse error"))
+
+            /** The payload is neither a valid message object nor a non-empty batch (-32600). */
+            public val INVALID_REQUEST: Invalid = Invalid(ResponseError.invalidRequest("Invalid Request"))
         }
     }
 }

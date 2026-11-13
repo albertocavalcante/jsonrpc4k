@@ -249,6 +249,15 @@ public class Dispatcher(
         }
 
     /**
+     * Dispatch the entries of an inbound batch in wire order and return the responses owed for it
+     * (JSON-RPC 2.0 section 6): one per request, and one Invalid Request error with a null id per
+     * invalid entry. Notifications and responses add nothing, so an empty result means that no reply
+     * is sent, as for a batch of only notifications. Entries run sequentially.
+     */
+    public suspend fun dispatch(batch: Payload.Batch): List<ResponseMessage> =
+        batch.entries.mapNotNull { entry -> if (entry == null) Payload.Invalid.INVALID_REQUEST.response else dispatch(entry) }
+
+    /**
      * Register a pending request that expects a response.
      * Returns a Deferred that will complete when the response arrives.
      */

@@ -33,6 +33,16 @@ import kotlin.time.Duration.Companion.seconds
  * - Sending notifications (fire-and-forget)
  * - Receiving and dispatching incoming messages
  * - Request ID generation
+ *
+ * Each inbound frame holds one message or a JSON-RPC 2.0 batch (a JSON array). A batch is answered
+ * with one array frame holding a response for each request and an Invalid Request error for each
+ * invalid entry; a batch of only notifications or responses is answered with nothing. A frame that
+ * is not valid JSON is answered with a Parse error, and an empty array or any other value that is
+ * not a message object with an Invalid Request, each as a single response with a null id. The
+ * connection stays open after both. In bounded mode a batch is one ordered unit: it starts after
+ * earlier requests finish, runs its entries in order before later messages, and its requests cannot
+ * be cancelled with `$/cancelRequest`. A batch that cannot be queued fails the connection, as a
+ * notification does.
  */
 public class Connection(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
@@ -47,6 +57,10 @@ public class Connection(
         data class Frame(
             val message: Message,
             val onDequeued: (() -> Unit)? = null,
+        ) : OutgoingItem
+
+        data class Batch(
+            val messages: List<Message>,
         ) : OutgoingItem
 
         data class Barrier(
@@ -156,6 +170,12 @@ public class Connection(
                             }
                         }
 
+                        override suspend fun sendBatch(responses: List<ResponseMessage>) {
+                            if (responses.isEmpty()) return
+                            val bounded = boundedOutgoing
+                            if (bounded != null) bounded.sendBatch(responses) else outgoingMessages.send(OutgoingItem.Batch(responses))
+                        }
+
                         override fun offer(
                             response: ResponseMessage,
                             onDequeued: (() -> Unit)?,
@@ -245,6 +265,7 @@ public class Connection(
                             item.onDequeued?.invoke()
                             emit(codec.encode(item.message))
                         }
+                        is OutgoingItem.Batch -> emit(codec.encode(item.messages))
                         is OutgoingItem.Barrier -> item.completion.complete(Unit)
                     }
                 }
@@ -525,11 +546,14 @@ public class Connection(
                     return@coroutineScope
                 }
                 // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
-                val messages = decoder.feed(data)
-                for (message in messages) {
-                    val response = dispatcher.dispatch(message)
-                    if (response != null) {
-                        outgoingMessages.send(OutgoingItem.Frame(response))
+                for (payload in decoder.feed(data)) {
+                    when (payload) {
+                        is Payload.Single -> dispatcher.dispatch(payload.message)?.let { outgoingMessages.send(OutgoingItem.Frame(it)) }
+                        is Payload.Batch -> {
+                            val responses = dispatcher.dispatch(payload)
+                            if (responses.isNotEmpty()) outgoingMessages.send(OutgoingItem.Batch(responses))
+                        }
+                        is Payload.Invalid -> outgoingMessages.send(OutgoingItem.Frame(payload.response))
                     }
                 }
             } finally {

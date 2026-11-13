@@ -6,7 +6,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.test.Test
-import kotlin.test.assertFailsWith
 
 /**
  * Edge case tests for JsonRpcCodec and JsonRpcMessageDecoder.
@@ -18,13 +17,11 @@ class CodecEdgeCaseTest {
     // ==================== Content-Length Parsing Tests ====================
 
     @Test
-    fun `decoder handles zero Content-Length`() {
+    fun `decoder answers zero Content-Length with a parse error`() {
         val decoder = JsonRpcMessageDecoder(codec)
-        // Zero content length should result in parsing error (empty JSON)
+        // An empty body is not valid JSON, so it decodes to a Parse error payload, not a failure.
         val message = "Content-Length: 0\r\n\r\n"
-        assertFailsWith<Exception> {
-            decoder.feed(message)
-        }
+        decoder.feed(message) shouldBe listOf(Payload.Invalid.PARSE_ERROR)
     }
 
     @Test
@@ -78,7 +75,7 @@ class CodecEdgeCaseTest {
             )
         val encoded = codec.encode(request)
         val decoder = JsonRpcMessageDecoder(codec)
-        val parsed = decoder.feed(encoded)
+        val parsed = decoder.feed(encoded).messages()
         parsed.size shouldBe 1
         (parsed.first() as RequestMessage).method shouldBe "test/方法"
     }
@@ -96,7 +93,7 @@ class CodecEdgeCaseTest {
             )
         val encoded = codec.encode(request)
         val decoder = JsonRpcMessageDecoder(codec)
-        val parsed = decoder.feed(encoded)
+        val parsed = decoder.feed(encoded).messages()
         parsed.size shouldBe 1
         val decoded = parsed.first() as RequestMessage
         decoded.params.toString() shouldContain "世界"
@@ -116,7 +113,7 @@ class CodecEdgeCaseTest {
             )
         val encoded = codec.encode(request)
         val decoder = JsonRpcMessageDecoder(codec)
-        val parsed = decoder.feed(encoded)
+        val parsed = decoder.feed(encoded).messages()
         parsed.size shouldBe 1
         val decoded = parsed.first() as RequestMessage
         decoded.params.toString() shouldContain "👍"
@@ -200,7 +197,7 @@ class CodecEdgeCaseTest {
         val content = """{"jsonrpc":"2.0","method":"x"}"""
         val message = "Content-Length: ${content.length}\r\n\r\n$content"
 
-        var parsed = emptyList<Message>()
+        var parsed = emptyList<Payload>()
         for (char in message) {
             parsed = decoder.feed(char.toString())
         }

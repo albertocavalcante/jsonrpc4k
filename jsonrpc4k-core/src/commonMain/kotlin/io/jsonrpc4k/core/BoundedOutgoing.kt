@@ -139,16 +139,12 @@ internal class BoundedOutgoing(
         }
     }
 
-    private fun beginProducer() {
+    suspend fun <T> withProducer(block: suspend () -> T): T {
         mutate { s ->
             (s.failure ?: s.terminalClaim)?.let { throw it }
             check(s.producers < limits.maxPendingProducers) { "Outbound producer limit exceeded" }
             s.copy(producers = s.producers + 1)
         }
-    }
-
-    suspend fun <T> withProducer(block: suspend () -> T): T {
-        beginProducer()
         try {
             val open = state.first { !it.deliveryLost || it.failure != null }
             (open.failure ?: open.terminalClaim)?.let { throw it }
@@ -237,6 +233,15 @@ internal class BoundedOutgoing(
     ) = withProducer {
         sendRegistered(message, onDequeued)
     }
+
+    /** Sends [messages] as one JSON-RPC 2.0 batch frame; the frame limits apply to the whole array. */
+    suspend fun sendBatch(messages: List<Message>) =
+        withProducer {
+            admitted {
+                val bytes = encoder.encode(messages)
+                transfer(Item.Frame(bytes, null, reserveOrdinary(bytes.size)))
+            }
+        }
 
     suspend fun barrier(
         completion: CompletableDeferred<Unit>,

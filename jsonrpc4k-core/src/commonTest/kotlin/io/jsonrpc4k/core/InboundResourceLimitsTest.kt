@@ -45,7 +45,7 @@ class InboundResourceLimitsTest {
         val decoder = JsonRpcMessageDecoder(codec, InboundResourceLimits(4096, 2, 4096))
         val body = """{jsonrpc:"2.0",method:ab//cd,params:{url:"http://host",text:"\\\"[{世界}]"}}"""
         val bytes = frame(body)
-        val messages = bytes.flatMap { decoder.feed(byteArrayOf(it)) }
+        val messages = bytes.flatMap { decoder.feed(byteArrayOf(it)).messages() }
         assertEquals(1, messages.size)
         assertIs<NotificationMessage>(messages.single())
     }
@@ -140,14 +140,14 @@ class InboundResourceLimitsTest {
             connection.receive(codec.encode(first))
             withTimeout(1.seconds) { entered.await() }
             connection.receive(codec.encode(second))
-            val busy = JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single()
+            val busy = frames.nextMessage()
             assertEquals(-32000, assertIs<ResponseMessage>(busy).error?.code)
             release.complete(Unit)
-            val response = JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single()
+            val response = frames.nextMessage()
             assertEquals(first.id, assertIs<ResponseMessage>(response).id)
             runCurrent()
             connection.receive(codec.encode(second))
-            val retried = JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single()
+            val retried = frames.nextMessage()
             assertEquals(second.id, assertIs<ResponseMessage>(retried).id)
             assertTrue(retried.error == null)
             connection.close()
@@ -187,15 +187,15 @@ class InboundResourceLimitsTest {
                 ),
             )
             val cancelled =
-                assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+                assertIs<ResponseMessage>(frames.nextMessage())
             assertEquals(ResponseError.REQUEST_CANCELLED, cancelled.error?.code)
             connection.receive(codec.encode(second))
-            val busy = assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+            val busy = assertIs<ResponseMessage>(frames.nextMessage())
             assertEquals(-32000, busy.error?.code)
             cleanup.complete(Unit)
             runCurrent()
             connection.receive(codec.encode(second))
-            val retried = assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+            val retried = assertIs<ResponseMessage>(frames.nextMessage())
             assertEquals(second.id, retried.id)
             assertEquals(null, retried.error)
             connection.close()
@@ -218,7 +218,7 @@ class InboundResourceLimitsTest {
             connection.receive(codec.encode(first))
             withTimeout(1.seconds) { entered.await() }
             val pending = backgroundScope.async { connection.request<JsonElement>("reverse", null) }
-            val outbound = assertIs<RequestMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+            val outbound = assertIs<RequestMessage>(frames.nextMessage())
             connection.receive(codec.encode(ResponseMessage.success(outbound.id, JsonPrimitive("ok"))))
             assertEquals(JsonPrimitive("ok"), withTimeout(1.seconds) { pending.await() })
             connection.close()
@@ -285,7 +285,7 @@ class InboundResourceLimitsTest {
             connection.receive(codec.encode(queued))
             connection.receive(codec.encode(NotificationMessage("$/cancelRequest", buildJsonObject { put("id", JsonPrimitive(6)) })))
             val cancelled =
-                assertIs<ResponseMessage>(JsonRpcMessageDecoder(codec).feed(withTimeout(1.seconds) { frames.receive() }).single())
+                assertIs<ResponseMessage>(frames.nextMessage())
             assertEquals(ResponseError.REQUEST_CANCELLED, cancelled.error?.code)
             assertEquals(total, connection.retainedApplicationBytes)
             release.complete(Unit)
@@ -335,6 +335,11 @@ class InboundResourceLimitsTest {
             runCurrent()
             assertEquals(0, connection.retainedApplicationBytes)
         }
+
+    private suspend fun Channel<ByteArray>.nextMessage(): Message {
+        val frame = withTimeout(1.seconds) { receive() }
+        return JsonRpcMessageDecoder(codec).feed(frame).messages().single()
+    }
 
     private fun frame(body: String): ByteArray {
         val bytes = body.encodeToByteArray()
