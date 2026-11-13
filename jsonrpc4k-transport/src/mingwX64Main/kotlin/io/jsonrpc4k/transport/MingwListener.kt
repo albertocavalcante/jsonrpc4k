@@ -57,12 +57,14 @@ internal class MingwTcpListener private constructor(
         withContext(Dispatchers.IO) {
             if (closed.value != 0) throw TransportException("Listener is closed")
             val client = accept(handle, null, null)
-            if (client == INVALID_SOCKET_VALUE) {
-                if (closed.value != 0) throw TransportException("Listener is closed")
-                throw TransportException("Accept failed: socket error ${WSAGetLastError()}")
-            }
+            if (client == INVALID_SOCKET_VALUE) failAccept()
             MingwSocketTransport(client)
         }
+
+    private fun failAccept(): Nothing {
+        if (closed.value != 0) throw TransportException("Listener is closed")
+        throw TransportException("Accept failed: socket error ${WSAGetLastError()}")
+    }
 
     override suspend fun close() {
         if (closed.compareAndSet(0, 1)) {

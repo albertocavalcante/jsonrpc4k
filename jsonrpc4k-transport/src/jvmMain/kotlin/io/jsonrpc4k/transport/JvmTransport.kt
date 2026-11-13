@@ -194,12 +194,14 @@ private class UnownedPrintStream(
  */
 public class SocketTransport internal constructor(
     private val socket: Socket,
-) : Transport by StreamTransport(
-        input = socket.getInputStream(),
-        output = socket.getOutputStream(),
-    ) {
+    private val stream: StreamTransport =
+        StreamTransport(
+            input = socket.getInputStream(),
+            output = socket.getOutputStream(),
+        ),
+) : Transport by stream {
     override val isConnected: Boolean
-        get() = socket.isConnected && !socket.isClosed
+        get() = socket.isConnected && !socket.isClosed && stream.isConnected
 
     public companion object {
         /**
