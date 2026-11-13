@@ -58,7 +58,12 @@ internal class MingwTcpListener private constructor(
             if (closed.value != 0) throw TransportException("Listener is closed")
             val client = accept(handle, null, null)
             if (client == INVALID_SOCKET_VALUE) failAccept()
-            MingwSocketTransport(client)
+            try {
+                MingwSocketTransport(client)
+            } catch (e: TransportException) {
+                closesocket(client)
+                throw e
+            }
         }
 
     private fun failAccept(): Nothing {
@@ -67,11 +72,9 @@ internal class MingwTcpListener private constructor(
     }
 
     override suspend fun close() {
-        if (closed.compareAndSet(0, 1)) {
-            withContext(Dispatchers.IO) {
-                closesocket(handle)
-            }
-        }
+        // Called in place rather than through withContext, which would throw before the call when the caller is
+        // already cancelled and leave the port bound with the pending accept blocked.
+        if (closed.compareAndSet(0, 1)) closesocket(handle)
     }
 
     companion object {

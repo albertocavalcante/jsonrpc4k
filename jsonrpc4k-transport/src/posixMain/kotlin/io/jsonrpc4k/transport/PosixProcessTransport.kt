@@ -557,7 +557,7 @@ private fun decodeStatus(status: Int): Int {
 
 /** Waits up to [timeoutMillis] for [events] on [fd]; true when ready (readable, writable or hung up). */
 @OptIn(ExperimentalForeignApi::class)
-private fun pollFd(
+internal fun pollFd(
     fd: Int,
     events: Int,
     timeoutMillis: Int,
