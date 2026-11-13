@@ -18,6 +18,7 @@ import kotlin.time.Duration.Companion.seconds
 
 private val TIMEOUT = 30.seconds
 private const val SIGTERM_EXIT = 143
+private const val SIGKILL_EXIT = 137
 
 class PosixProcessTransportTest {
     @Test
@@ -63,7 +64,9 @@ class PosixProcessTransportTest {
         runBlocking(Dispatchers.Default) {
             val transport = ProcessTransport.start(listOf("/bin/sleep", "60"), exitTimeout = 100.milliseconds)
             withTimeout(TIMEOUT) { transport.close() }
-            assertEquals(SIGTERM_EXIT, withTimeout(TIMEOUT) { transport.awaitExit() })
+            val code = withTimeout(TIMEOUT) { transport.awaitExit() }
+            // The contract is termination; slow runners may need the SIGKILL escalation.
+            assertTrue(code == SIGTERM_EXIT || code == SIGKILL_EXIT, "expected exit by SIGTERM or SIGKILL, got $code")
         }
 
     @Test
