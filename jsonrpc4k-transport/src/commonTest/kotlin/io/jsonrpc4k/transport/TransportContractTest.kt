@@ -93,6 +93,7 @@ abstract class TransportContractTest {
     fun `send after close throws TransportException`() =
         contract { a, b ->
             a.close()
+            b.close()
             assertFailsWith<TransportException> { a.send(byteArrayOf(1)) }
             assertFailsWith<TransportException> { b.send(byteArrayOf(1)) }
         }

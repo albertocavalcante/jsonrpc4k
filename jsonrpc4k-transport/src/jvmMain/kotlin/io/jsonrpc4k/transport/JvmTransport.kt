@@ -2,6 +2,8 @@ package io.jsonrpc4k.transport
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -15,6 +17,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.PrintStream
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -63,6 +66,10 @@ public class StreamTransport(
                 val bytesRead =
                     try {
                         input.read(buffer)
+                    } catch (ignored: SocketTimeoutException) {
+                        // Read timeouts exist so a cancelled collector can stop; keep polling otherwise.
+                        currentCoroutineContext().ensureActive()
+                        continue
                     } catch (e: Exception) {
                         if (connected.get()) throw TransportException("Read failed", e)
                         break
@@ -189,16 +196,23 @@ private class UnownedPrintStream(
     override fun close(): Unit = Unit
 }
 
+private const val READ_POLL_MILLIS = 100
+
+/**
+ * A blocking socket read cannot be interrupted by coroutine cancellation, so reads time out
+ * periodically and [StreamTransport] re-checks cancellation between attempts.
+ */
+private fun pollingStream(socket: Socket): StreamTransport {
+    socket.soTimeout = READ_POLL_MILLIS
+    return StreamTransport(input = socket.getInputStream(), output = socket.getOutputStream())
+}
+
 /**
  * Socket transport for JVM.
  */
 public class SocketTransport internal constructor(
     private val socket: Socket,
-    private val stream: StreamTransport =
-        StreamTransport(
-            input = socket.getInputStream(),
-            output = socket.getOutputStream(),
-        ),
+    private val stream: StreamTransport = pollingStream(socket),
 ) : Transport by stream {
     override val isConnected: Boolean
         get() = socket.isConnected && !socket.isClosed && stream.isConnected

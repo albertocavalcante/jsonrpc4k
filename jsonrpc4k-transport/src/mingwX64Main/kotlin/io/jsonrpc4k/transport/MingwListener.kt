@@ -16,6 +16,7 @@ import kotlinx.coroutines.IO
 import kotlinx.coroutines.withContext
 import platform.posix.WSAGetLastError
 import platform.posix.closesocket
+import platform.posix.sockaddr_in
 import platform.windows.ADDRINFOA
 import platform.windows.AF_INET
 import platform.windows.SOCK_STREAM
@@ -25,7 +26,6 @@ import platform.windows.freeaddrinfo
 import platform.windows.getaddrinfo
 import platform.windows.getsockname
 import platform.windows.listen
-import platform.windows.sockaddr_in
 import platform.windows.socket
 import kotlin.concurrent.AtomicInt
 
