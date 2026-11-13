@@ -2,6 +2,7 @@ package io.jsonrpc4k.transport
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
 import kotlin.test.Test
@@ -10,8 +11,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
-
-private fun isWindowsHost(): Boolean = js("process.platform === 'win32'").unsafeCast<Boolean>()
 
 /**
  * A stand-in for the parent channel of a forked child: an event emitter with `send` and `disconnect`.
@@ -58,6 +57,7 @@ class NodeIpcTransportTest {
             transport.close()
             assertFalse(transport.isConnected)
             assertEquals(false, process.connected)
+            assertTrue(transport.incoming.toList().isEmpty())
             assertFailsWith<TransportException> { transport.send("{}".encodeToByteArray()) }
         }
 
@@ -68,8 +68,11 @@ class NodeIpcTransportTest {
             val transport = NodeIpcTransport(process)
             process.disconnect()
             assertFalse(transport.isConnected)
+            assertTrue(transport.incoming.toList().isEmpty())
         }
 }
+
+private val PAYLOAD = byteArrayOf(1, 2, 3)
 
 class NamedPipeTest {
     @Test
@@ -85,14 +88,14 @@ class NamedPipeTest {
     fun `named pipe round trips bytes on Windows`() =
         runTest {
             if (!isWindowsHost()) return@runTest
-            val name = "jsonrpc4k-test-${(js("Math.random()").unsafeCast<Double>() * 1e9).toLong()}"
+            val name = "jsonrpc4k-test-${randomSuffix()}"
             val listener = NamedPipe.bind(name)
             try {
                 val client = NamedPipe.connect(name)
                 val server = listener.accept()
                 val received = async { server.incoming.first() }
-                client.send(byteArrayOf(7, 8, 9))
-                assertContentEquals(byteArrayOf(7, 8, 9), received.await())
+                client.send(PAYLOAD)
+                assertContentEquals(PAYLOAD, received.await())
                 client.close()
                 server.close()
             } finally {
