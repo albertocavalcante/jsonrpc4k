@@ -19,6 +19,8 @@ import kotlin.coroutines.suspendCoroutine
 internal external object NodeProcess {
     val stdin: dynamic
     val stdout: dynamic
+    val env: dynamic
+    val execPath: String
 }
 
 /**

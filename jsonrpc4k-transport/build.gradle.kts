@@ -37,6 +37,31 @@ kotlin {
             }
         }
 
+        // Native test hierarchy mirrors the main one: nativeTest <- posixTest <- {macos*, linux*}Test.
+        val nativeTest by creating {
+            dependsOn(commonTest.get())
+        }
+
+        val posixTest by creating {
+            dependsOn(nativeTest)
+        }
+
+        macosX64Test {
+            dependsOn(posixTest)
+        }
+        macosArm64Test {
+            dependsOn(posixTest)
+        }
+        linuxX64Test {
+            dependsOn(posixTest)
+        }
+        linuxArm64Test {
+            dependsOn(posixTest)
+        }
+        mingwX64Test {
+            dependsOn(nativeTest)
+        }
+
         // Create native source set hierarchy manually
         // The default hierarchy template doesn't support custom intermediate groups like posixMain
         val nativeMain by creating {
