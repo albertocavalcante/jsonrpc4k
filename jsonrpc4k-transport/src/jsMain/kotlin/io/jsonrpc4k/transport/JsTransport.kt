@@ -5,6 +5,8 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
+import org.khronos.webgl.Int8Array
+import org.khronos.webgl.Uint8Array
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -51,16 +53,12 @@ public class StdioTransport : Transport {
     private val stdin: dynamic = NodeProcess.stdin
     private val stdout: dynamic = NodeProcess.stdout
 
-    init {
-        // Set stdin to binary mode (no encoding)
-        stdin.setEncoding("binary")
-    }
-
     override val incoming: Flow<ByteArray> =
         callbackFlow {
             val dataCallback: (dynamic) -> Unit = { data: dynamic ->
                 if (connected) {
-                    val bytes = bufferToByteArray(data)
+                    // No setEncoding: Node delivers raw Buffer chunks, never strings.
+                    val bytes = bufferToByteArray(data.unsafeCast<Uint8Array>())
                     trySend(bytes)
                 }
             }
@@ -93,7 +91,7 @@ public class StdioTransport : Transport {
         }
         suspendCoroutine { continuation ->
             val buffer = byteArrayToBuffer(data)
-            stdout.write(buffer, "binary") { error: dynamic ->
+            stdout.write(buffer) { error: dynamic ->
                 if (error != null && error != undefined) {
                     continuation.resumeWithException(
                         TransportException("Write failed: ${error.message ?: error}"),
@@ -129,7 +127,8 @@ public class SocketTransport private constructor(
         callbackFlow {
             val dataCallback: (dynamic) -> Unit = { data: dynamic ->
                 if (connected) {
-                    val bytes = bufferToByteArray(data)
+                    // No setEncoding: Node delivers raw Buffer chunks, never strings.
+                    val bytes = bufferToByteArray(data.unsafeCast<Uint8Array>())
                     trySend(bytes)
                 }
             }
@@ -218,18 +217,20 @@ public class SocketTransport private constructor(
 }
 
 /**
- * Convert a Node.js Buffer to a Kotlin ByteArray.
+ * Copy the bytes of a Node.js Buffer chunk (a Uint8Array) into a new ByteArray.
+ *
+ * The chunk may be a slice of a shared, pooled ArrayBuffer, so the view honours its byteOffset and
+ * the result is a fresh copy that never aliases Node's memory. A Kotlin/JS ByteArray is an Int8Array.
  */
-private fun bufferToByteArray(buffer: dynamic): ByteArray {
-    val length = buffer.length as Int
-    val result = ByteArray(length)
-    for (i in 0 until length) {
-        result[i] = (buffer[i] as Number).toByte()
-    }
-    return result
+internal fun bufferToByteArray(chunk: Uint8Array): ByteArray {
+    val view = Int8Array(chunk.buffer, chunk.byteOffset, chunk.length)
+    return Int8Array(view).unsafeCast<ByteArray>()
 }
 
 /**
- * Convert a Kotlin ByteArray to a Node.js Buffer.
+ * Copy a Kotlin ByteArray into a new Node.js Buffer holding the same bytes (0..255).
  */
-private fun byteArrayToBuffer(bytes: ByteArray): dynamic = BufferModule.Buffer.from(bytes)
+internal fun byteArrayToBuffer(bytes: ByteArray): dynamic {
+    val view = bytes.unsafeCast<Int8Array>()
+    return BufferModule.Buffer.from(Uint8Array(view.buffer, view.byteOffset, view.length))
+}
