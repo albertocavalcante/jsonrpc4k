@@ -28,14 +28,19 @@ transports for the JVM, Node.js and Kotlin/Native.
 
 | Transport | JVM | Node.js | Linux and Apple native | Windows native (mingwX64) | Browser |
 |---|---|---|---|---|---|
-| Stdio | yes | yes | yes | yes | unsupported: no stdin or stdout |
+| Stdio | yes | implemented, not executed in CI | implemented, not executed in CI | implemented, not executed in CI | unsupported: no stdin or stdout |
 | TCP client (`TcpSocket`) | yes | yes | yes | yes | unsupported: no raw sockets |
 | TCP listener (`TcpListener`) | yes | yes | yes | yes | unsupported: cannot accept connections |
 | Unix socket (`UnixSocket`) | yes (JDK 16+) | yes, not on Windows | yes | unsupported: not implemented on Windows native | unsupported: no sockets |
 | Named pipe (`NamedPipe`) | unsupported: one synchronous handle cannot read and write at once on Windows | yes, on Windows only | unsupported: Windows concept | unsupported: not implemented | unsupported: no pipes |
-| Node IPC (`NodeIpc`) | unsupported: Node concept | yes, when started with an IPC channel | unsupported: Node concept | unsupported: Node concept | unsupported |
+| Node IPC (`NodeIpc`) | unsupported: Node concept | yes, when started with an IPC channel (tested with a stand-in channel) | unsupported: Node concept | unsupported: Node concept | unsupported |
 | Child process (`ProcessTransport`) | yes | yes | yes, POSIX only | unsupported: not implemented | unsupported: no processes |
 | In memory (`InMemoryTransport.pair`) | yes | yes | yes | yes | yes |
+
+"Implemented, not executed in CI" means the code exists but no test runs it: stdio binds the test
+process's own stdin and stdout, which the test runner owns. Node IPC is tested against a stand-in
+channel (an event emitter with `send` and `disconnect`), because the test process is not a forked child.
+The named pipe round trip is executed only by the Windows job, which filters to the named pipe tests; on other hosts those tests pass without running it.
 
 An unsupported cell throws `UnsupportedTransportException`. The Node.js modules are loaded lazily, so a
 browser bundle that uses only the core APIs and the in-memory transport should not need `net`, `fs`,

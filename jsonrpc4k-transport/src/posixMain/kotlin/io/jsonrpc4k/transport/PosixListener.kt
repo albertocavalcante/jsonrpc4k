@@ -107,7 +107,7 @@ internal class PosixListener(
             if (client >= 0) {
                 // A peer that closed its end must surface as EPIPE, not kill the process.
                 ignoreSigpipeOnce()
-                return PosixSocketTransport(client)
+                return adoptSocket(client)
             }
             checkAcceptError(errno)
         }
