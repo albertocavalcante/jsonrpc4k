@@ -26,13 +26,18 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import platform.posix.AF_INET
 import platform.posix.EAGAIN
 import platform.posix.EINTR
 import platform.posix.EWOULDBLOCK
+import platform.posix.F_GETFL
+import platform.posix.F_SETFL
+import platform.posix.O_NONBLOCK
 import platform.posix.POLLIN
 import platform.posix.POLLOUT
-import platform.posix.SHUT_RDWR
+import platform.posix.SHUT_RD
+import platform.posix.SHUT_WR
 import platform.posix.SIGPIPE
 import platform.posix.SIG_IGN
 import platform.posix.SOCK_STREAM
@@ -42,6 +47,7 @@ import platform.posix.addrinfo
 import platform.posix.close
 import platform.posix.connect
 import platform.posix.errno
+import platform.posix.fcntl
 import platform.posix.freeaddrinfo
 import platform.posix.gai_strerror
 import platform.posix.getaddrinfo
@@ -76,15 +82,17 @@ private val NO_DATA = ByteArray(0)
 /**
  * POSIX implementation of [Transport] over file descriptors: a socket the transport owns, or stdin and stdout.
  *
- * A read waits in `poll()` slices of [READ_POLL_MILLIS] and re-checks [close] and the collector's cancellation
- * between slices, so a collector that stops early (for example `first`) or is cancelled returns within a slice and
- * the transport stays usable; a blocking `read()` would hold the collector until the peer sent more bytes.
+ * Every wait is a `poll()` slice of [READ_POLL_MILLIS] that re-checks [close] and the caller's cancellation in
+ * between, so a collector that stops early (for example `first`) or is cancelled returns within a slice. The
+ * transport stays open afterwards, but the bytes already read for that collector are dropped: the chunk of the slice
+ * in progress and any chunks that `flowOn` buffered ahead of it. An owned socket is non-blocking, so a write that
+ * finds the send buffer full also waits in `POLLOUT` slices and outlives [close] by at most one slice.
  *
- * [close] works from a cancelled coroutine and never waits on the peer. For a socket it calls
- * `shutdown(SHUT_RDWR)` at once, which signals EOF to the peer, ends a pending read and fails a `write()` blocked
- * on a full send buffer, and then closes the descriptor under the read and write locks, so a concurrent read or
- * write never reaches a descriptor number that the process has reused. EOF does not release the socket; [close]
- * does.
+ * [close] works from a cancelled coroutine and never waits on the peer. For a socket it shuts each direction down
+ * separately, which signals EOF to the peer at once, and then closes the descriptor under the read and write locks,
+ * so a concurrent read or write never reaches a descriptor number that the process has reused. EOF does not release
+ * the socket; [close] does. Stdio descriptors are never made non-blocking or closed. macOS `poll()` does not support
+ * devices, so a terminal stdin falls back to a blocking `read()` that only new input or EOF ends.
  *
  * @property ownsSocket true when [readFd] and [writeFd] are one socket that [close] shuts down and closes; false
  * for stdio, whose descriptors [close] leaves open.
@@ -104,6 +112,11 @@ internal class PosixFileDescriptorTransport(
     private val readLock = Mutex()
     private val writeLock = Mutex()
 
+    init {
+        // A write blocked on a full send buffer could outlive close(); when this throws, the caller closes the socket.
+        if (ownsSocket) makeNonBlocking(readFd)
+    }
+
     override val incoming: Flow<ByteArray> =
         flow {
             memScoped {
@@ -112,7 +125,8 @@ internal class PosixFileDescriptorTransport(
                     // Poll slices never suspend, so a cancelled collector (for example `first`) is noticed here.
                     currentCoroutineContext().ensureActive()
                     val chunk = readLock.withLock { readStep(buffer) } ?: break
-                    if (chunk.isNotEmpty()) emit(chunk)
+                    // After a quiet slice, let other work queued on the IO pool run before the next one.
+                    if (chunk.isNotEmpty()) emit(chunk) else yield()
                 }
             }
         }.flowOn(Dispatchers.IO)
@@ -164,7 +178,7 @@ internal class PosixFileDescriptorTransport(
         if (count >= 0) return count.toInt()
         val err = errno
         if (err == EAGAIN || err == EWOULDBLOCK) {
-            // Another process made the descriptor non-blocking (an inherited stdout pipe, say) and it is full.
+            // The socket's send buffer is full, or a stdout that another process made non-blocking is: wait a slice.
             pollFd(writeFd, POLLOUT.convert(), READ_POLL_MILLIS)
         } else if (err != EINTR) {
             val reason = if (closing.value != 0) "Transport is closed" else "Write failed: ${posixErrorMessage(err)}"
@@ -175,10 +189,12 @@ internal class PosixFileDescriptorTransport(
 
     override suspend fun close() {
         if (!closing.compareAndSet(0, 1) || !ownsSocket) return
-        // Signals EOF to the peer now, ends a pending read and fails a write() blocked on a full send buffer.
-        shutdown(writeFd, SHUT_RDWR.convert())
-        // Not cancellable, so the socket is released even when the caller is already cancelled. A reader holds its
-        // lock for at most one poll slice, and the shutdown above has just failed any blocked write.
+        // One direction at a time: once the peer's FIN has arrived, macOS fails SHUT_RDWR with ENOTCONN and leaves the
+        // write side open. SHUT_WR signals EOF to the peer now; SHUT_RD ends a pending read slice early.
+        shutdown(writeFd, SHUT_WR.convert())
+        shutdown(readFd, SHUT_RD.convert())
+        // Not cancellable, so the socket is released even when the caller is already cancelled. The socket is
+        // non-blocking, so a reader or writer holds its lock for at most one poll slice before it sees `closing`.
         withContext(NonCancellable) {
             writeLock.withLock { readLock.withLock { close(writeFd) } }
         }
@@ -271,6 +287,24 @@ internal class PosixSocketTransport internal constructor(
                     }
                 }
             }
+    }
+}
+
+/** A transport that owns the connected socket [fd]; [fd] is closed when the transport cannot be set up. */
+internal fun adoptSocket(fd: Int): PosixSocketTransport =
+    try {
+        PosixSocketTransport(fd)
+    } catch (e: TransportException) {
+        close(fd)
+        throw e
+    }
+
+/** Sets `O_NONBLOCK` on the socket [fd] and keeps its other status flags. */
+@OptIn(ExperimentalForeignApi::class)
+private fun makeNonBlocking(fd: Int) {
+    val flags = fcntl(fd, F_GETFL)
+    if (flags < 0 || fcntl(fd, F_SETFL, flags or O_NONBLOCK) < 0) {
+        throw TransportException("Failed to make the socket non-blocking: ${posixErrorMessage(errno)}")
     }
 }
 

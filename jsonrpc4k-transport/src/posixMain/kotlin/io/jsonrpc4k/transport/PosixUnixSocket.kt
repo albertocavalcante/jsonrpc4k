@@ -111,7 +111,7 @@ internal actual suspend fun connectUnixSocket(path: String): Transport =
             close(fd)
             throw TransportException("Failed to connect to Unix socket $path: ${posixErrorMessage(failure)}")
         }
-        PosixSocketTransport(fd)
+        adoptSocket(fd)
     }
 
 @OptIn(ExperimentalForeignApi::class)
