@@ -9,7 +9,7 @@ import kotlin.coroutines.suspendCoroutine
 
 internal actual fun connectNodeIpc(): Transport {
     if (!isNodeRuntime()) throw UnsupportedTransportException("Node IPC requires Node.js")
-    val process: dynamic = NodeProcess.asDynamic()
+    val process: dynamic = NodeProcess.raw
     if (jsTypeOf(process.send) != "function") {
         throw UnsupportedTransportException(
             "This Node.js process has no IPC channel; start it with child_process.fork or an 'ipc' stdio entry",

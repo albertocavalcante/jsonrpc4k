@@ -18,23 +18,18 @@ import kotlin.time.Duration.Companion.seconds
 private val TERMINATE_TIMEOUT: Duration = 1.seconds
 private const val SIGNAL_EXIT_BASE = 128
 
-/** External declarations for the Node.js child_process module. */
-@JsModule("child_process")
-@JsNonModule
-internal external object ChildProcessModule {
-    @Suppress("UnusedParameter") // external declaration: the parameters describe the JavaScript signature
+/** The Node.js child_process module, resolved on first access. */
+internal object ChildProcessModule {
     fun spawn(
         command: String,
         args: Array<String>,
         options: dynamic,
-    ): dynamic
+    ): dynamic = nodeRequire("child_process").spawn(command, args, options)
 }
 
-/** External declarations for the Node.js os module. */
-@JsModule("os")
-@JsNonModule
-internal external object OsModule {
-    val constants: dynamic
+/** The Node.js os module, resolved on first access. */
+internal object OsModule {
+    val constants: dynamic get() = nodeRequire("os").constants
 }
 
 internal actual suspend fun startProcessTransport(

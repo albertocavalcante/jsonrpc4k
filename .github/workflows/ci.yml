@@ -93,7 +93,41 @@ jobs:
         run: ./gradlew check
 
   # ===========================================================================
-  # Job 3: Coverage Report
+  # Job 3: Windows Native Tests (mingwX64)
+  # ===========================================================================
+  # There is no linuxArm64 job: Kotlin/Native 2.3.0 publishes host toolchains only for
+  # linux-x86_64, macos-aarch64, macos-x86_64 and windows-x86_64, so an arm64 Linux runner
+  # cannot run the Kotlin/Native compiler, so linuxArm64 tests cannot run in CI.
+  windows:
+    name: Windows Native Tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Test mingwX64
+        run: ./gradlew mingwX64Test
+
+  # ===========================================================================
+  # Job 4: Coverage Report
   # ===========================================================================
   coverage:
     name: Coverage

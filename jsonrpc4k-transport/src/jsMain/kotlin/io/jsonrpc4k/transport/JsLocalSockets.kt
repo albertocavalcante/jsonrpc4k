@@ -29,7 +29,7 @@ private fun requireNamedPipes() {
 }
 
 private suspend fun connectPath(path: String): Transport =
-    connectNodeSocket(path) { onConnect -> Net.asDynamic().createConnection(pathOptions(path), onConnect) }
+    connectNodeSocket(path) { onConnect -> Net.raw().createConnection(pathOptions(path), onConnect) }
 
 internal actual suspend fun connectTcp(
     host: String,
@@ -79,7 +79,7 @@ private suspend fun removeStaleSocket(path: String) {
 private suspend fun isServed(path: String): Boolean =
     suspendCoroutine { continuation ->
         var resolved = false
-        val socket: dynamic = Net.asDynamic().createConnection(pathOptions(path))
+        val socket: dynamic = Net.raw().createConnection(pathOptions(path))
         socket.once("connect") {
             socket.destroy()
             if (!resolved) {

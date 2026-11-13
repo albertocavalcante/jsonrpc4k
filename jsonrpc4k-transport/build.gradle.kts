@@ -5,8 +5,8 @@ plugins {
 
 kotlin {
     js {
-        // The JS transports import Node modules (buffer, net, process); a browser
-        // test bundle cannot resolve them, so JS transport tests run on Node only.
+        // The JS transports load Node modules lazily, so a browser bundle can import the
+        // library; the transport tests exercise Node behavior, so they run on Node only.
         browser {
             testTask {
                 enabled = false
@@ -18,7 +18,6 @@ kotlin {
         commonMain {
             dependencies {
                 api(projects.jsonrpc4kCore)
-                api(libs.kotlinx.io.core)
                 api(libs.kotlinx.coroutines.core)
             }
         }
