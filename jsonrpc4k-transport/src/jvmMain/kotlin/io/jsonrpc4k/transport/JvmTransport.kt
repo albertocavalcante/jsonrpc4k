@@ -192,7 +192,7 @@ private class UnownedPrintStream(
 /**
  * Socket transport for JVM.
  */
-public class SocketTransport private constructor(
+public class SocketTransport internal constructor(
     private val socket: Socket,
 ) : Transport by StreamTransport(
         input = socket.getInputStream(),
