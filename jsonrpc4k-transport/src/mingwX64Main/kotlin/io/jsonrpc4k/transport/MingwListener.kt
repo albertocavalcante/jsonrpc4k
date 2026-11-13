@@ -108,15 +108,23 @@ internal class MingwTcpListener private constructor(
                 throw TransportException("Failed to create socket: error ${WSAGetLastError()}")
             }
             try {
-                if (bind(handle, info.ai_addr, info.ai_addrlen.convert()) == SOCKET_ERROR_VALUE ||
-                    listen(handle, LISTEN_BACKLOG) == SOCKET_ERROR_VALUE
-                ) {
-                    throw TransportException("Failed to listen on $host:$port: error ${WSAGetLastError()}")
-                }
+                bindAndListen(handle, info, "$host:$port")
                 return MingwTcpListener(handle, localPort(handle))
             } catch (e: Exception) {
                 closesocket(handle)
                 throw e
+            }
+        }
+
+        private fun bindAndListen(
+            handle: ULong,
+            info: ADDRINFOA,
+            target: String,
+        ) {
+            if (bind(handle, info.ai_addr, info.ai_addrlen.convert()) == SOCKET_ERROR_VALUE ||
+                listen(handle, LISTEN_BACKLOG) == SOCKET_ERROR_VALUE
+            ) {
+                throw TransportException("Failed to listen on $target: error ${WSAGetLastError()}")
             }
         }
 

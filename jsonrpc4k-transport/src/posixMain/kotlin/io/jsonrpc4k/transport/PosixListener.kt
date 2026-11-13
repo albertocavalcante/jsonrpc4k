@@ -1,5 +1,6 @@
 package io.jsonrpc4k.transport
 
+import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.IntVar
@@ -35,7 +36,6 @@ import platform.posix.gai_strerror
 import platform.posix.getaddrinfo
 import platform.posix.getsockname
 import platform.posix.listen
-import platform.posix.poll
 import platform.posix.pollfd
 import platform.posix.setsockopt
 import platform.posix.shutdown
@@ -47,6 +47,13 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.coroutineContext
 
 private const val LISTEN_BACKLOG = 128
+
+/** Polls a single descriptor; split per platform family because poll() takes a platform-width nfds_t. */
+@OptIn(ExperimentalForeignApi::class)
+internal expect fun pollOne(
+    entry: CPointer<pollfd>,
+    timeoutMillis: Int,
+): Int
 
 // How often a waiting accept wakes up to notice close() or coroutine cancellation.
 private const val ACCEPT_POLL_MILLIS = 100
@@ -100,11 +107,14 @@ internal class PosixTcpListener private constructor(
                 ignoreSigpipeOnce()
                 return PosixSocketTransport(client)
             }
-            val err = errno
-            if (closing.value != 0) throw TransportException("Listener is closed")
-            if (err != EINTR && err != EAGAIN && err != ECONNABORTED) {
-                throw TransportException("Accept failed: ${posixErrorMessage(err)}")
-            }
+            checkAcceptError(errno)
+        }
+    }
+
+    private fun checkAcceptError(err: Int) {
+        if (closing.value != 0) throw TransportException("Listener is closed")
+        if (err != EINTR && err != EAGAIN && err != ECONNABORTED) {
+            throw TransportException("Accept failed: ${posixErrorMessage(err)}")
         }
     }
 
@@ -115,7 +125,7 @@ internal class PosixTcpListener private constructor(
             entry.fd = fd
             entry.events = POLLIN.convert()
             entry.revents = 0
-            val ready = poll(entry.ptr, 1.convert(), ACCEPT_POLL_MILLIS)
+            val ready = pollOne(entry.ptr, ACCEPT_POLL_MILLIS)
             if (ready < 0 && errno != EINTR && closing.value == 0) {
                 throw TransportException("Accept failed: ${posixErrorMessage(errno)}")
             }
@@ -174,16 +184,21 @@ internal class PosixTcpListener private constructor(
             }
             try {
                 enableReuseAddress(fd)
-                if (bind(fd, info.ai_addr, info.ai_addrlen) < 0) {
-                    throw TransportException("Failed to listen on $host:$port: ${posixErrorMessage(errno)}")
-                }
-                if (listen(fd, LISTEN_BACKLOG) < 0) {
-                    throw TransportException("Failed to listen on $host:$port: ${posixErrorMessage(errno)}")
-                }
+                bindAndListen(fd, info, "$host:$port")
                 return PosixTcpListener(fd, localPort(fd))
             } catch (e: Exception) {
                 close(fd)
                 throw e
+            }
+        }
+
+        private fun bindAndListen(
+            fd: Int,
+            info: addrinfo,
+            target: String,
+        ) {
+            if (bind(fd, info.ai_addr, info.ai_addrlen) < 0 || listen(fd, LISTEN_BACKLOG) < 0) {
+                throw TransportException("Failed to listen on $target: ${posixErrorMessage(errno)}")
             }
         }
 
