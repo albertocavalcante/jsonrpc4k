@@ -125,7 +125,7 @@ jobs:
 
       # The named pipe round trip needs a Windows host; the other Node tests (Unix sockets) run on the Linux job.
       - name: Test mingwX64 and Node
-        run: ./gradlew mingwX64Test jsNodeTest --tests '*NamedPipeTest*'
+        run: ./gradlew mingwX64Test :jsonrpc4k-transport:jsNodeTest --tests '*NamedPipeTest*'
 
   # ===========================================================================
   # Job 4: Coverage Report
