@@ -123,8 +123,9 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Test mingwX64
-        run: ./gradlew mingwX64Test
+      # jsNodeTest runs the Node tests that need a Windows host, such as the named pipe round trip.
+      - name: Test mingwX64 and Node
+        run: ./gradlew mingwX64Test jsNodeTest
 
   # ===========================================================================
   # Job 4: Coverage Report
