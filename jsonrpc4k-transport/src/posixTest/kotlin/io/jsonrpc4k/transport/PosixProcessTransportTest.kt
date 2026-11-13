@@ -21,7 +21,7 @@ private const val SIGTERM_EXIT = 143
 
 class PosixProcessTransportTest {
     @Test
-    fun `round trips binary payloads through cat`() =
+    fun `round trips binary payloads through cat`(): Unit =
         runBlocking(Dispatchers.Default) {
             val transport = ProcessTransport.start(listOf("/bin/cat"))
             try {
@@ -49,7 +49,7 @@ class PosixProcessTransportTest {
         }
 
     @Test
-    fun `incoming ends normally after close`() =
+    fun `incoming ends normally after close`(): Unit =
         runBlocking(Dispatchers.Default) {
             val transport = ProcessTransport.start(listOf("/bin/cat"))
             val chunks = async { transport.incoming.toList() }
@@ -59,7 +59,7 @@ class PosixProcessTransportTest {
         }
 
     @Test
-    fun `close terminates a child that ignores end of input`() =
+    fun `close terminates a child that ignores end of input`(): Unit =
         runBlocking(Dispatchers.Default) {
             val transport = ProcessTransport.start(listOf("/bin/sleep", "60"), exitTimeout = 100.milliseconds)
             withTimeout(TIMEOUT) { transport.close() }
@@ -67,16 +67,18 @@ class PosixProcessTransportTest {
         }
 
     @Test
-    fun `start fails for a missing program`() =
+    fun `start fails for a missing program`(): Unit =
         runBlocking(Dispatchers.Default) {
             assertFailsWith<TransportException> { ProcessTransport.start(listOf("/nonexistent/jsonrpc4k-program")) }
             assertFailsWith<TransportException> {
                 ProcessTransport.start(listOf("/bin/cat"), workingDirectory = "/nonexistent/jsonrpc4k-directory")
             }
+            assertFailsWith<TransportException> { ProcessTransport.start(listOf("/bin/cat"), workingDirectory = "/bin/sh") }
+            assertFailsWith<TransportException> { ProcessTransport.start(listOf("jsonrpc4k-no-such-program")) }
         }
 
     @Test
-    fun `environment changes reach the child`() =
+    fun `environment changes reach the child`(): Unit =
         runBlocking(Dispatchers.Default) {
             val transport =
                 ProcessTransport.start(
@@ -92,7 +94,21 @@ class PosixProcessTransportTest {
         }
 
     @Test
-    fun `stderr pipe delivers output and discard drops it`() =
+    fun `bare program names are found on PATH and in a changed PATH`(): Unit =
+        runBlocking(Dispatchers.Default) {
+            val plain = ProcessTransport.start(listOf("cat"))
+            val changed = ProcessTransport.start(listOf("cat"), environment = mapOf("PATH" to "/bin:/usr/bin"))
+            try {
+                assertTrue(plain.pid > 0)
+                assertTrue(changed.pid > 0)
+            } finally {
+                plain.close()
+                changed.close()
+            }
+        }
+
+    @Test
+    fun `stderr pipe delivers output and discard drops it`(): Unit =
         runBlocking(Dispatchers.Default) {
             val seen = CompletableDeferred<String>()
             val collected = StringBuilder()

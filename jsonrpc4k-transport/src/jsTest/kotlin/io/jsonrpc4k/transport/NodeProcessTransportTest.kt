@@ -68,6 +68,16 @@ class NodeProcessTransportTest {
         }
 
     @Test
+    fun `incoming collected after close ends`() =
+        runTest(timeout = TIMEOUT) {
+            withContext(Dispatchers.Default) {
+                val transport = ProcessTransport.start(node(ECHO))
+                transport.close()
+                assertEquals(emptyList(), withTimeout(TIMEOUT) { transport.incoming.toList() })
+            }
+        }
+
+    @Test
     fun `close terminates a child that ignores end of input`() =
         runTest(timeout = TIMEOUT) {
             withContext(Dispatchers.Default) {

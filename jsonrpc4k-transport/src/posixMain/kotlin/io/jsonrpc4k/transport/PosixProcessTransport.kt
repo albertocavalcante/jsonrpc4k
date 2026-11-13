@@ -15,10 +15,12 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.set
+import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import kotlinx.cinterop.value
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.NonCancellable
@@ -30,16 +32,21 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import platform.posix.EAGAIN
 import platform.posix.EINTR
+import platform.posix.ENOENT
+import platform.posix.ETIMEDOUT
+import platform.posix.X_OK
 import platform.posix.FD_CLOEXEC
 import platform.posix.F_SETFD
 import platform.posix.F_SETFL
 import platform.posix.O_NONBLOCK
+import platform.posix.O_DIRECTORY
 import platform.posix.O_RDONLY
 import platform.posix.O_WRONLY
 import platform.posix.POLLIN
@@ -49,10 +56,11 @@ import platform.posix.SIGPIPE
 import platform.posix.SIGTERM
 import platform.posix.SIG_DFL
 import platform.posix._exit
+import platform.posix.access
 import platform.posix.close
 import platform.posix.dup2
 import platform.posix.errno
-import platform.posix.execvp
+import platform.posix.execv
 import platform.posix.fchdir
 import platform.posix.fcntl
 import platform.posix.fork
@@ -60,9 +68,8 @@ import platform.posix.kill
 import platform.posix.pipe
 import platform.posix.pollfd
 import platform.posix.read
-import platform.posix.setenv
 import platform.posix.signal
-import platform.posix.unsetenv
+import platform.posix.getenv
 import platform.posix.waitpid
 import platform.posix.write
 import kotlin.concurrent.AtomicInt
@@ -81,7 +88,12 @@ private const val STDIN_FD = 0
 private const val STDOUT_FD = 1
 private const val STDERR_FD = 2
 private const val ERRNO_BYTES = 4
+private const val ENV_PROGRAM = "/usr/bin/env"
+private const val DEFAULT_PATH = "/usr/bin:/bin"
+private val EXEC_REPORT_TIMEOUT: Duration = 10.seconds
 private val NO_DATA = ByteArray(0)
+// Serializes the pipe-then-FD_CLOEXEC sequence against another spawn, so a descriptor is never inherited by a sibling.
+private val spawnLock = Mutex()
 
 private fun failTransport(
     message: String,
@@ -101,7 +113,9 @@ internal actual suspend fun startProcessTransport(
     // Not cancellable: once started, the child is owned, so a caller cancelled meanwhile still ends it below.
     val transport =
         withContext(NonCancellable + Dispatchers.IO) {
-            PosixProcessTransport.spawn(command, environment, workingDirectory, stderr, exitTimeout)
+            spawnLock.withLock {
+                PosixProcessTransport.spawn(command, environment, workingDirectory, stderr, exitTimeout)
+            }
         }
     if (!context.isActive) {
         transport.close()
@@ -183,7 +197,7 @@ private class ChildFds(
                     stderr = if (stderr is StderrMode.Pipe) newPipe() else null,
                     exec = newPipe(),
                     devNull = if (stderr == StderrMode.Discard) newFile("/dev/null", O_WRONLY) else -1,
-                    directory = if (workingDirectory != null) newFile(workingDirectory, O_RDONLY) else -1,
+                    directory = if (workingDirectory != null) newFile(workingDirectory, O_RDONLY or O_DIRECTORY) else -1,
                 )
             } catch (e: TransportException) {
                 opened.forEach { close(it) }
@@ -204,16 +218,22 @@ private class ChildFds(
 }
 
 /**
- * Native [ProcessTransport] for Linux and macOS: `fork` and `execvp` with pipes, a `waitpid` reaper on its own
- * thread, and every wait polled in short slices so that [close] never depends on a thread blocked in a system call.
+ * Native [ProcessTransport] for Linux and macOS: `fork` and `execv` with pipes, a `waitpid` reaper on a dedicated
+ * thread, and every other wait polled in short slices so that [close] never depends on a thread blocked in a system
+ * call.
  *
  * The child inherits this process's environment (plus the requested changes) and descriptors other than the
  * transport's pipes that are not close-on-exec. SIGPIPE is ignored in this process so a write to an exited child
- * fails with `EPIPE`; the child gets the default disposition back. A missing program or working directory makes
- * [ProcessTransport.start] fail: the child reports an `exec` error through a close-on-exec pipe.
+ * fails with `EPIPE`; the child gets the default disposition back. A missing program or an unusable working
+ * directory makes [ProcessTransport.start] fail: the parent resolves the program on `PATH` (the changed `PATH`, when
+ * the environment sets one) and the child reports an `exec` or `fchdir` error through a close-on-exec pipe, which
+ * [ProcessTransport.start] waits for at most ten seconds before killing the child.
  *
- * Between `fork` and `exec` the child runs Kotlin code in a copy of a multithreaded process, so that path is kept to
- * system calls (and, only when the environment is changed, `setenv` string conversions).
+ * A changed environment is applied by executing through `/usr/bin/env`, so the child never touches the environment.
+ * Between `fork` and `exec` the child makes only system calls on memory prepared before the fork (the `execv` path
+ * string conversion is the one small allocation Kotlin/Native imposes), because only the forking thread exists in it;
+ * should it still stall, the start timeout above kills it. Spawns are serialized so that a pipe is not inherited by a concurrent spawn; descriptors
+ * created elsewhere in the process are not covered by that lock.
  */
 @OptIn(ExperimentalForeignApi::class)
 internal class PosixProcessTransport private constructor(
@@ -231,7 +251,20 @@ internal class PosixProcessTransport private constructor(
     private val closed = CompletableDeferred<Unit>()
 
     init {
-        scope.launch { exit.complete(waitForExit(pid.toInt())) }
+        reapOnOwnThread()
+    }
+
+    /** Waits for the child on a dedicated thread, so a blocked `waitpid` never occupies the shared IO pool. */
+    @OptIn(DelicateCoroutinesApi::class)
+    private fun reapOnOwnThread() {
+        val reaper = newSingleThreadContext("jsonrpc4k-reaper-$pid")
+        scope.launch {
+            try {
+                exit.complete(withContext(reaper) { waitForExit(pid.toInt()) })
+            } finally {
+                reaper.close()
+            }
+        }
     }
 
     override val incoming: Flow<ByteArray> =
@@ -318,10 +351,15 @@ internal class PosixProcessTransport private constructor(
     /** Ends the child after its stdin was closed: exit timeout, then `SIGTERM`, then `SIGKILL`. */
     private suspend fun terminate(): Throwable? {
         if (exitsWithin(exitTimeout)) return null
-        kill(pid.toInt(), SIGTERM)
+        signalIfRunning(SIGTERM)
         if (exitsWithin(TERMINATE_TIMEOUT)) return null
-        kill(pid.toInt(), SIGKILL)
+        signalIfRunning(SIGKILL)
         return if (exitsWithin(TERMINATE_TIMEOUT)) null else TransportException("Process $pid did not exit after it was killed")
+    }
+
+    /** Signals the child unless it was already reaped, whose pid could since belong to another process. */
+    private fun signalIfRunning(signal: Int) {
+        if (!exit.isCompleted) kill(pid.toInt(), signal)
     }
 
     private suspend fun exitsWithin(timeout: Duration): Boolean = withTimeoutOrNull(timeout) { exit.join() } != null
@@ -361,14 +399,18 @@ internal class PosixProcessTransport private constructor(
         ): PosixProcessTransport {
             // A peer that closed its end must surface as EPIPE, not kill the process.
             ignoreSigpipeOnce()
+            val plan = ExecPlan.create(command, environment)
             val fds = ChildFds.create(stderr, workingDirectory)
-            val pid = forkAndExec(command, environment, fds)
+            val pid = forkAndExec(plan, fds)
             fds.closeChildSide()
-            // A negative pid is -errno from fork; otherwise the child reports an exec failure through the pipe.
+            // A negative pid is -errno from fork; otherwise the child reports a setup failure through the pipe.
             val reason = if (pid < 0) -pid else readExecError(fds.exec.readEnd)
             if (reason != 0) {
                 fds.closeParentSide()
-                if (pid > 0) waitForExit(pid)
+                if (pid > 0) {
+                    if (reason == ETIMEDOUT) kill(pid, SIGKILL)
+                    waitForExit(pid)
+                }
                 failTransport("Failed to start process ${command.first()}: ${posixErrorMessage(reason)}")
             }
             close(fds.exec.readEnd)
@@ -380,65 +422,117 @@ internal class PosixProcessTransport private constructor(
     }
 }
 
+/** What the child executes: the resolved program path and its argument vector, with `env` prepended for changes. */
+private class ExecPlan(
+    val program: String,
+    val argv: List<String>,
+) {
+    companion object {
+        @OptIn(ExperimentalForeignApi::class)
+        fun create(
+            command: List<String>,
+            environment: Map<String, String?>,
+        ): ExecPlan {
+            require(command.isNotEmpty()) { "command must not be empty" }
+            environment.keys.forEach {
+                val valid = it.isNotEmpty() && '=' !in it && '\u0000' !in it && !it.startsWith("-")
+                require(valid) { "Invalid environment variable name: $it" }
+            }
+            val path = environment["PATH"] ?: if ("PATH" in environment) null else getenv("PATH")?.toKString()
+            val program = resolveProgram(command.first(), path ?: DEFAULT_PATH)
+            if (environment.isEmpty()) return ExecPlan(program, command)
+            val unset = environment.filterValues { it == null }.keys.flatMap { listOf("-u", it) }
+            val assignments = environment.mapNotNull { (name, value) -> value?.let { "$name=$it" } }
+            return ExecPlan(ENV_PROGRAM, listOf(ENV_PROGRAM) + unset + assignments + program + command.drop(1))
+        }
+
+        /** Finds [name] on [path] like `execvp` does; a name with a slash is used as given. */
+        private fun resolveProgram(
+            name: String,
+            path: String,
+        ): String {
+            if ('/' in name) return name
+            val found = path.split(':').map { "${it.ifEmpty { "." }}/$name" }.firstOrNull { access(it, X_OK) == 0 }
+            return found ?: failTransport("Failed to start process $name: ${posixErrorMessage(ENOENT)}")
+        }
+    }
+}
+
 /**
- * Forks and executes [command]; returns the child's pid in the parent, or -errno when `fork` fails.
+ * Forks and executes [plan]; returns the child's pid in the parent, or -errno when `fork` fails.
  *
- * Everything the child needs is prepared before `fork`, and the child only makes system calls and then `execvp`
+ * Everything the child needs is prepared before `fork`, and the child only makes system calls and then `execv`
  * or `_exit`, so it allocates no Kotlin objects while the other threads of this process do not exist in it.
  */
 @OptIn(ExperimentalForeignApi::class)
 private fun forkAndExec(
-    command: List<String>,
-    environment: Map<String, String?>,
+    plan: ExecPlan,
     fds: ChildFds,
 ): Int =
     memScoped {
-        val argv = allocArray<CPointerVar<ByteVar>>(command.size + 1)
-        command.forEachIndexed { index, argument -> argv[index] = argument.cstr.getPointer(this) }
-        argv[command.size] = null
-        val names = environment.keys.toList()
-        val values = environment.values.toList()
+        val argv = allocArray<CPointerVar<ByteVar>>(plan.argv.size + 1)
+        plan.argv.forEachIndexed { index, argument -> argv[index] = argument.cstr.getPointer(this) }
+        argv[plan.argv.size] = null
         val errnoBox = alloc<IntVar>()
         val pid = fork()
-        if (pid == 0) runChild(command.first(), argv, names, values, fds, errnoBox.ptr)
+        if (pid == 0) runChild(plan.program, argv, fds, errnoBox.ptr)
         if (pid < 0) -errno else pid
     }
 
-/** Runs in the forked child: sets up descriptors and environment, then replaces the process. Never returns. */
+/** Runs in the forked child: sets up descriptors, then replaces the process. Never returns. */
 @OptIn(ExperimentalForeignApi::class)
 private fun runChild(
     program: String,
     argv: CPointer<CPointerVar<ByteVar>>,
-    names: List<String>,
-    values: List<String?>,
     fds: ChildFds,
     errnoBox: CPointer<IntVar>,
 ): Nothing {
     dup2(fds.stdin.readEnd, STDIN_FD)
     dup2(fds.stdout.writeEnd, STDOUT_FD)
-    if (fds.stderr != null) dup2(fds.stderr.writeEnd, STDERR_FD) else if (fds.devNull >= 0) dup2(fds.devNull, STDERR_FD)
-    signal(SIGPIPE, SIG_DFL)
-    for (index in 0 until names.size) {
-        val value = values[index]
-        if (value == null) unsetenv(names[index]) else setenv(names[index], value, 1)
+    if (fds.stderr != null) {
+        dup2(fds.stderr.writeEnd, STDERR_FD)
+    } else if (fds.devNull >= 0) {
+        dup2(fds.devNull, STDERR_FD)
     }
-    if (fds.directory >= 0) fchdir(fds.directory)
-    execvp(program, argv)
+    signal(SIGPIPE, SIG_DFL)
+    if (fds.directory >= 0 && fchdir(fds.directory) != 0) reportAndExit(fds, errnoBox)
+    execv(program, argv)
+    reportAndExit(fds, errnoBox)
+}
+
+/** Writes the current errno to the exec pipe and ends the child. */
+@OptIn(ExperimentalForeignApi::class)
+private fun reportAndExit(
+    fds: ChildFds,
+    errnoBox: CPointer<IntVar>,
+): Nothing {
     errnoBox.pointed.value = errno
     write(fds.exec.writeEnd, errnoBox, ERRNO_BYTES.convert())
     while (true) _exit(EXEC_FAILED_STATUS)
 }
 
-/** Reads the errno the child reported through the close-on-exec pipe; 0 when `exec` succeeded (EOF). */
+/**
+ * Reads the errno the child reported through the close-on-exec pipe: 0 when `exec` succeeded (EOF), [ETIMEDOUT] when
+ * the child reported nothing within [EXEC_REPORT_TIMEOUT], or the errno of a failed read.
+ */
 @OptIn(ExperimentalForeignApi::class)
 private fun readExecError(fd: Int): Int =
     memScoped {
+        val deadlineSlices = EXEC_REPORT_TIMEOUT.inWholeMilliseconds / POLL_MILLIS
+        var slices = 0L
+        while (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
+            if (++slices >= deadlineSlices) return@memScoped ETIMEDOUT
+        }
         val box = alloc<IntVar>()
         var count: Long
         do {
             count = read(fd, box.ptr, ERRNO_BYTES.convert())
         } while (count < 0 && errno == EINTR)
-        if (count == ERRNO_BYTES.toLong()) box.value else 0
+        when {
+            count == ERRNO_BYTES.toLong() -> box.value
+            count < 0 -> errno
+            else -> 0
+        }
     }
 
 /** Blocks until [pid] exits and returns its exit code, or 128 plus the signal number when a signal ended it. */

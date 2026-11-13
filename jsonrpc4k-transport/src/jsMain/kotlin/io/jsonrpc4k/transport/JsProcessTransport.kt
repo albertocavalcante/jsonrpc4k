@@ -22,6 +22,7 @@ private const val SIGNAL_EXIT_BASE = 128
 @JsModule("child_process")
 @JsNonModule
 internal external object ChildProcessModule {
+    @Suppress("UnusedParameter") // external declaration: the parameters describe the JavaScript signature
     fun spawn(
         command: String,
         args: Array<String>,
@@ -138,6 +139,11 @@ internal class NodeProcessTransport(
 
     override val incoming: Flow<ByteArray> =
         callbackFlow {
+            if (closing || ended || stdout.destroyed as Boolean) {
+                close()
+                awaitClose()
+                return@callbackFlow
+            }
             val dataCallback: (dynamic) -> Unit = { data: dynamic ->
                 if (!closing) trySend(bufferToByteArray(data.unsafeCast<Uint8Array>()))
             }
