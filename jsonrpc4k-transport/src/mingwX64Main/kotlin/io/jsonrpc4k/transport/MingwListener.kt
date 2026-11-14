@@ -50,10 +50,12 @@ internal actual suspend fun bindTcpListener(
  * TCP listener over a non-blocking Winsock listening socket.
  *
  * [accept] waits in `WSAPoll()` slices of [ACCEPT_POLL_MILLIS] instead of blocking in `accept()`, so it notices
- * [close] and coroutine cancellation within a slice. Each pending accept occupies one `Dispatchers.IO` thread and
- * wakes up ten times per second while no client connects. The handle is only closed once no [accept] is using it,
- * so a concurrent [close] can never make an accepting thread operate on a handle that Winsock has since reused for
- * another socket; a port with a pending accept is therefore released within one slice after [close] returns.
+ * [close] and coroutine cancellation within a slice. Each pending accept occupies one `Dispatchers.IO` thread without
+ * yielding it and wakes up ten times per second while no client connects, so 64 pending accepts (the default size
+ * of `Dispatchers.IO`) starve all other IO work; see [MingwSocketTransport]. The handle is only closed once no
+ * [accept] is using it, so a concurrent [close] can never make an accepting thread operate on a handle that Winsock
+ * has since reused for another socket; a port with a pending accept is therefore released within one slice after
+ * [close] returns.
  *
  * SO_REUSEADDR is deliberately not set: on Windows it lets another process steal the port, and
  * rebinding after a close does not need it.
@@ -90,7 +92,14 @@ internal class MingwTcpListener private constructor(
             context.ensureActive()
             if (!pollSocket(handle, POLLRDNORM, ACCEPT_READY, ACCEPT_POLL_MILLIS)) continue
             val client = accept(handle, null, null)
-            if (client != INVALID_SOCKET_VALUE) return adoptSocket(client)
+            if (client != INVALID_SOCKET_VALUE) {
+                // close() may have returned after the check above; it promises that a pending accept fails.
+                if (closing.value != 0) {
+                    closesocket(client)
+                    throw TransportException("Listener is closed")
+                }
+                return adoptSocket(client)
+            }
             checkAcceptError(WSAGetLastError())
         }
     }

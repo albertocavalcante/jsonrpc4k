@@ -71,8 +71,9 @@ internal actual suspend fun bindTcpListener(
  * make an accepting thread operate on a recycled descriptor. `accept` waits in `poll()` with a short
  * timeout instead of blocking in `accept()`: `shutdown()` on a listening socket wakes a blocked
  * `accept()` on Linux but not on macOS, while the poll loop notices close and cancellation on both.
- * Each pending accept occupies one `Dispatchers.IO` thread and wakes up ten times per second, like
- * the reads of [PosixFileDescriptorTransport]. A `poll()` failure other than `EINTR` fails the accept.
+ * Each pending accept occupies one `Dispatchers.IO` thread without yielding it and wakes up ten
+ * times per second, so 64 pending accepts (the default size of `Dispatchers.IO`) starve all other IO
+ * work; see [PosixFileDescriptorTransport]. A `poll()` failure other than `EINTR` fails the accept.
  */
 @OptIn(ExperimentalForeignApi::class)
 internal class PosixListener(
@@ -108,6 +109,11 @@ internal class PosixListener(
             if (!waitReadable()) continue
             val client = accept(fd, null, null)
             if (client >= 0) {
+                // close() may have returned after the check above; it promises that a pending accept fails.
+                if (closing.value != 0) {
+                    close(client)
+                    throw TransportException("Listener is closed")
+                }
                 // A peer that closed its end must surface as EPIPE, not kill the process.
                 ignoreSigpipeOnce()
                 return adoptSocket(client)
