@@ -28,7 +28,8 @@ import kotlin.time.Duration.Companion.seconds
  * @param maxConcurrentRequests Maximum concurrently running request handlers, from 1 to 64.
  * @param maxQueuedMessages Maximum queued requests and notifications, from 1 to 1024.
  * @param drainTimeout How long [Connection.endInput] waits for admitted work after the end of
- * input before it cancels what remains; finite and not negative.
+ * input before it cancels what remains, and then at most as long again until the cancellation
+ * errors, replies already produced and batch arrays are queued; finite and not negative.
  * @param controlNotifications Notification methods that bypass the barrier, such as
  * `window/workDoneProgress/cancel` or `run/readStdin`. Each is dispatched as soon as it is
  * admitted, in arrival order among themselves, on one lane that runs beside the request handlers,

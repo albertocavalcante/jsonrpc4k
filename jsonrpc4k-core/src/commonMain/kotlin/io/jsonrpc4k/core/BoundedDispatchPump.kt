@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
@@ -23,6 +24,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import kotlin.time.Duration
 
 internal enum class OfferResult { ACCEPTED, TERMINAL_TRANSITION, REJECTED }
 
@@ -65,8 +67,9 @@ internal interface DispatchOutput {
  * [endInput] stops admission and waits for the admitted work, bounded by
  * [BoundedDispatchPolicy.drainTimeout]. After the timeout it cancels the scheduler, the control lane
  * and every request that is still unanswered; a reply that was already claimed, and every batch
- * sender, still finishes, bounded by the connection, so a cancelled batch entry still reaches its
- * array.
+ * sender, still finishes, so a cancelled batch entry still reaches its array. [endInput] then waits,
+ * bounded by the drain timeout again, until those replies and arrays are in the outgoing queue, so a
+ * flush that follows it covers them.
  */
 internal class BoundedDispatchPump(
     private val policy: BoundedDispatchPolicy,
@@ -124,6 +127,9 @@ internal class BoundedDispatchPump(
 
     /** Completed when the admitted work has drained or [abandon] gave up on it. */
     private val settled = CompletableDeferred<Unit>()
+
+    /** Completed once the replies and arrays that [abandon] left running are queued or can no longer be. */
+    private val handedOff = CompletableDeferred<Unit>()
     private val abandoned = MutableStateFlow(false)
     private var inputEnded = false
     private var drain: Job? = null
@@ -171,8 +177,9 @@ internal class BoundedDispatchPump(
      * Stops admission and waits until the admitted work is done: queued messages have run, and every
      * admitted request has been answered and its response dequeued. Returns at once when the pump is
      * closed or an earlier call already settled. When [BoundedDispatchPolicy.drainTimeout] elapses
-     * first, abandons what remains. Must not be called from a handler of this pump, which would wait
-     * for itself until the timeout.
+     * first, abandons what remains and then waits, bounded by the drain timeout again, until the
+     * replies already claimed and the batch arrays are queued. Must not be called from a handler of
+     * this pump, which would wait for itself until the timeout.
      */
     suspend fun endInput() {
         admission.withLock {
@@ -190,14 +197,10 @@ internal class BoundedDispatchPump(
                     }
             }
         }
-        val done =
-            withTimeoutOrNull(policy.drainTimeout) {
-                select<Unit> {
-                    settled.onAwait { }
-                    closed.onAwait { }
-                }
-            }
-        if (done == null && !settled.isCompleted) abandon()
+        if (settled.awaitUnless(closed, policy.drainTimeout) == null) {
+            abandon()
+            handedOff.awaitUnless(closed, policy.drainTimeout)
+        }
     }
 
     fun close() {
@@ -215,8 +218,9 @@ internal class BoundedDispatchPump(
     /**
      * Gives up on the drain: cancels the scheduler, the control lane and the queued messages, and then
      * every admitted request that is still unanswered, as a `$/cancelRequest` would. Request workers
-     * that already claimed their reply and batch senders are left to finish, bounded by the
-     * connection, so replies already produced and every batch array still reach the outgoing queue.
+     * that already claimed their reply and batch senders are left to finish, so replies already
+     * produced and every batch array still reach the outgoing queue; [handedOff] completes once they
+     * have, or once the pump's work is cancelled with the connection. Idempotent.
      */
     private fun abandon() {
         if (!abandoned.compareAndSet(false, true)) return
@@ -227,6 +231,14 @@ internal class BoundedDispatchPump(
         lane.cancel()
         requests.ids.forEach(::cancelRequest)
         settled.complete(Unit)
+        // Every tracked request is now claimed: its replyDone completes once its reply is queued or
+        // in its batch slot, and a batch leaves batchesInFlight once its array is queued.
+        val replies = requests.replies
+        workScope
+            .launch {
+                replies.joinAll()
+                batchesInFlight.first { it == 0 }
+            }.invokeOnCompletion { handedOff.complete(Unit) }
     }
 
     private fun admit(
@@ -288,8 +300,9 @@ internal class BoundedDispatchPump(
         // Constructed from ids and tokens only, so queued output does not retain the batch payload.
         val release = { tracked.forEach { (id, token) -> requests.remove(id, token) } }
         batchesInFlight.update { it + 1 }
+        // Unlike the scheduler, a sender outlives abandon(), so it reports failures while the connection is active.
         val sender =
-            workScope.launchGuarded({ ownsFailures }, output::fail) {
+            workScope.launchGuarded({ connectionJob.isActive }, output::fail) {
                 val responses = slots.mapNotNull { it.await() }
                 if (responses.isEmpty()) release() else output.sendBatch(responses, release)
             }
@@ -337,10 +350,10 @@ internal class BoundedDispatchPump(
                 requests.remove(id, token)
                 return null
             }
-            if (requests.claimReply(id, token) &&
-                reply(id, token, slot, ResponseMessage.error(id, ResponseError(SERVER_BUSY, "Server busy"))) == OfferResult.REJECTED
-            ) {
-                throw JsonRpcProtocolException("Outgoing response queue is full")
+            if (requests.claimReply(id, token)) {
+                val offered = reply(id, token, slot, ResponseMessage.error(id, ResponseError(SERVER_BUSY, "Server busy")))
+                replyDone.complete(Unit)
+                if (offered == OfferResult.REJECTED) throw JsonRpcProtocolException("Outgoing response queue is full")
             }
         }
         return token
@@ -540,6 +553,9 @@ private class AdmittedRequests {
 
     val ids: Set<RequestId> get() = state.value.requests.keys
 
+    /** The reply handoffs of the tracked requests; each completes once its reply is queued or settled. */
+    val replies: List<CompletableDeferred<Unit>> get() = state.value.requests.values.map { it.replyDone }
+
     suspend fun awaitEmpty() {
         state.first { it.requests.isEmpty() }
     }
@@ -641,6 +657,18 @@ private fun CoroutineScope.launchGuarded(
         } catch (fatal: Throwable) {
             if (owned()) fail(fatal)
             throw fatal
+        }
+    }
+
+/** Waits for this or [closed], bounded by [timeout]; null when the timeout elapsed first. */
+private suspend fun Deferred<Unit>.awaitUnless(
+    closed: Deferred<Unit>,
+    timeout: Duration,
+): Unit? =
+    withTimeoutOrNull(timeout) {
+        select<Unit> {
+            onAwait { }
+            closed.onAwait { }
         }
     }
 

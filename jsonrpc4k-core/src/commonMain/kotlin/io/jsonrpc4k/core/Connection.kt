@@ -48,9 +48,9 @@ import kotlin.time.Duration.Companion.seconds
  * so a cancellation reaches only handlers that run concurrently, as in bounded mode. There the request
  * is answered with a Request Cancelled error (-32800) as soon as the cancellation is admitted, whatever
  * the handler does next; for a batch entry that error fills the entry's place in the batch's single
- * array, which is sent once every entry has finished. A caller of [request] that stops waiting sends `$/cancelRequest` for its own
- * request. Request ids and cancellations are scoped to this connection: each connection has its own
- * [PeerDispatcher].
+ * array, which is sent once every entry has finished. A caller of [request] that stops waiting sends
+ * `$/cancelRequest` for its own request. Request ids and cancellations are scoped to this connection:
+ * each connection has its own [PeerDispatcher].
  *
  * When the transport reports the end of inbound input, call [endInput], then [flushOutgoing], then
  * [close], so that requests that were already admitted can still be answered and their responses
@@ -602,18 +602,20 @@ public class Connection(
      * of them has been answered and its response dequeued by the outgoing collector, and until queued
      * notifications and batches have run. When [BoundedDispatchPolicy.drainTimeout] elapses first, it
      * cancels the handlers that remain and offers a Request Cancelled error (-32800) for each request
-     * that is still unanswered, where the outgoing queue accepts it, and returns without waiting for
-     * those errors to be dequeued. A cancelled batch entry gets its error inside the batch's array:
-     * replies that were already produced and every batch array are still sent, bounded by the
-     * connection. It returns at once when the connection is closed or failed, for example because
-     * the outgoing collector stopped, since no response could be written, and when an earlier call
-     * has already finished. Later [receive] calls throw [IllegalStateException].
+     * that is still unanswered, where the outgoing queue accepts it. A cancelled batch entry gets its
+     * error inside the batch's array, and replies that handlers had already produced are still sent.
+     * It then waits, bounded by the drain timeout again, until those errors, replies and batch arrays
+     * are in the outgoing queue, but not until they are dequeued; the timeout path can therefore take
+     * up to twice the drain timeout, and a zero timeout does not wait at all. It returns at once when
+     * the connection is closed or failed, for example because the outgoing collector stopped, since
+     * no response could be written, and when an earlier call has already finished. Later [receive]
+     * calls throw [IllegalStateException].
      *
      * Dequeued is not written: call [flushOutgoing] after this and before [close], so a peer that
-     * closes its output right after its last request still gets the response. The flush also covers
-     * the errors offered on the timeout path and the replies to invalid frames, which were queued
-     * before this call returned. Do not call this from a handler of this connection: it would wait
-     * for that handler until the timeout.
+     * closes its output right after its last request still gets the response. The flush covers every
+     * frame queued before this call returned: the responses, the errors and arrays of the timeout path
+     * unless the second wait also timed out, and the replies to invalid frames. Do not call this from
+     * a handler of this connection: it would wait for that handler until the timeout.
      *
      * The connection stays open either way, so outbound requests and notifications still work;
      * [close] it when done. In the default mode [receive] has already run every handler, so this

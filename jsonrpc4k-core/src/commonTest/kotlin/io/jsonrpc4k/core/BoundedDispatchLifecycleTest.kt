@@ -138,20 +138,7 @@ class BoundedDispatchLifecycleTest {
     @Test
     fun `drain timeout still sends a batch as one array with the stuck entry cancelled`() =
         runTest {
-            val policy = BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds)
-            val modes =
-                listOf<(CoroutineScope) -> Connection>(
-                    { scope -> Connection(policy, scope = scope) },
-                    { scope ->
-                        Connection(
-                            policy,
-                            InboundResourceLimits(maxFrameBodyBytes = 65_536, maxJsonNesting = 32, maxApplicationBodyBytes = 65_536),
-                            OutboundResourceLimits(65_536, 65_536, 8, 8, 65_536, 4, 10_000, 32),
-                            scope,
-                        )
-                    },
-                )
-            for (connect in modes) {
+            for (connect in boundedModesWith(BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds))) {
                 val connection = connect(backgroundScope)
                 val frames = backgroundScope.outgoingFrames(connection)
                 val entered = CompletableDeferred<Unit>()
@@ -183,6 +170,50 @@ class BoundedDispatchLifecycleTest {
                 assertEquals(ConnectionState.Open, connection.state.value)
                 connection.close()
             }
+        }
+
+    @Test
+    fun `end input then flush then close writes the batch array of a drain timeout`() =
+        runTest {
+            for (connect in boundedModesWith(BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds))) {
+                val connection = connect(backgroundScope)
+                val frames = backgroundScope.outgoingFrames(connection)
+                val entered = CompletableDeferred<Unit>()
+                connection.onRequest("slow", runUntilCancelled(entered))
+                connection.onRequest("echo") { params: JsonElement? -> params }
+                connection.onNotification("note") { _: JsonElement? -> }
+                connection.receive(wireFrame(STUCK_BATCH))
+                withTimeout(1.seconds) { entered.await() }
+                // The documented shutdown order, with nothing in between.
+                connection.endInput()
+                connection.flushOutgoing()
+                connection.close()
+                val reply = assertIs<JsonArray>(wireJson(assertIs<ByteArray>(frames.tryReceive().getOrNull())))
+                val byId = reply.associateBy { it.jsonObject.getValue("id") }
+                assertEquals(ResponseError.REQUEST_CANCELLED, byId.getValue(JsonPrimitive("slow")).errorCode())
+                assertEquals(JsonPrimitive("b"), byId.getValue(JsonPrimitive(2)).jsonObject["result"])
+            }
+        }
+
+    @Test
+    fun `a batch array that cannot be sent after a drain timeout fails the connection`() =
+        runTest {
+            val connection =
+                Connection(
+                    BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds),
+                    InboundResourceLimits(maxFrameBodyBytes = 65_536, maxJsonNesting = 32, maxApplicationBodyBytes = 65_536),
+                    OutboundResourceLimits(1_024, 65_536, 8, 8, 65_536, 4, 10_000, 32),
+                    backgroundScope,
+                )
+            backgroundScope.outgoingFrames(connection)
+            val entered = CompletableDeferred<Unit>()
+            connection.onRequest("slow", runUntilCancelled(entered))
+            connection.onRequest("big") { _: JsonElement? -> JsonPrimitive("x".repeat(2_048)) }
+            connection.receive(wireFrame("""[{"jsonrpc":"2.0","method":"slow","id":1},{"jsonrpc":"2.0","method":"big","id":2}]"""))
+            withTimeout(1.seconds) { entered.await() }
+            connection.endInput()
+            // The array exceeds the outbound frame limit; the sender reports it instead of dropping it.
+            assertIs<ConnectionState.Failed>(withTimeout(1.seconds) { connection.state.first { it !is ConnectionState.Open } })
         }
 
     @Test
@@ -445,6 +476,20 @@ class BoundedDispatchLifecycleTest {
                 throw cause
             }
         }
+
+    /** The bounded dispatch modes with [policy]: without limits, and with inbound and outbound resource limits. */
+    private fun boundedModesWith(policy: BoundedDispatchPolicy): List<(CoroutineScope) -> Connection> =
+        listOf(
+            { scope -> Connection(policy, scope = scope) },
+            { scope ->
+                Connection(
+                    policy,
+                    InboundResourceLimits(maxFrameBodyBytes = 65_536, maxJsonNesting = 32, maxApplicationBodyBytes = 65_536),
+                    OutboundResourceLimits(65_536, 65_536, 8, 8, 65_536, 4, 10_000, 32),
+                    scope,
+                )
+            },
+        )
 
     private fun decode(frame: ByteArray): Message = JsonRpcMessageDecoder(codec).feed(frame).messages().single()
 
