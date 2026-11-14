@@ -6,8 +6,10 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -172,6 +174,10 @@ class BoundedDispatchLifecycleTest {
             }
         }
 
+    // A contract test for the documented shutdown order. Its collector writes without suspending, so
+    // under runTest's FIFO dispatcher it also passes when endInput returns before the array is queued:
+    // the collector takes the array right after completing the barrier, before the test resumes. The
+    // next test, whose collector suspends while writing, is the one that needs the handoff wait.
     @Test
     fun `end input then flush then close writes the batch array of a drain timeout`() =
         runTest {
@@ -189,6 +195,39 @@ class BoundedDispatchLifecycleTest {
                 connection.flushOutgoing()
                 connection.close()
                 val reply = assertIs<JsonArray>(wireJson(assertIs<ByteArray>(frames.tryReceive().getOrNull())))
+                val byId = reply.associateBy { it.jsonObject.getValue("id") }
+                assertEquals(ResponseError.REQUEST_CANCELLED, byId.getValue(JsonPrimitive("slow")).errorCode())
+                assertEquals(JsonPrimitive("b"), byId.getValue(JsonPrimitive(2)).jsonObject["result"])
+            }
+        }
+
+    @Test
+    fun `flush after a drain timeout covers the batch array when the collector write suspends`() =
+        runTest {
+            for (connect in boundedModesWith(BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds))) {
+                val connection = connect(backgroundScope)
+                // Like a socket write, each write suspends before it returns.
+                val frames = Channel<ByteArray>(Channel.UNLIMITED)
+                backgroundScope.launch {
+                    connection.outgoing.collect {
+                        delay(10.milliseconds)
+                        frames.send(it)
+                    }
+                }
+                val entered = CompletableDeferred<Unit>()
+                connection.onRequest("slow", runUntilCancelled(entered))
+                connection.onRequest("echo") { params: JsonElement? -> params }
+                connection.onNotification("note") { _: JsonElement? -> }
+                connection.receive(wireFrame(STUCK_BATCH))
+                withTimeout(1.seconds) { entered.await() }
+                connection.endInput()
+                // The barrier must queue behind the array: if endInput returned before the batch
+                // sender handed the array over, the flush completes while the array is still unwritten.
+                connection.flushOutgoing()
+                val written = frames.tryReceive().getOrNull()
+                connection.close()
+                assertIs<ByteArray>(written, "the flush returned before the array was written")
+                val reply = assertIs<JsonArray>(wireJson(written))
                 val byId = reply.associateBy { it.jsonObject.getValue("id") }
                 assertEquals(ResponseError.REQUEST_CANCELLED, byId.getValue(JsonPrimitive("slow")).errorCode())
                 assertEquals(JsonPrimitive("b"), byId.getValue(JsonPrimitive(2)).jsonObject["result"])
