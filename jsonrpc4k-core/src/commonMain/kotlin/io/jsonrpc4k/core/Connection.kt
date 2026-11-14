@@ -116,7 +116,8 @@ public class Connection(
         scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(codec, json, scope, notificationErrorHandler) {
-        installBoundedPump(policy, scope, null)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), null)
     }
 
     /** Creates a bounded connection with additional framed-input and application-byte limits. */
@@ -129,7 +130,8 @@ public class Connection(
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(codec, json, scope, notificationErrorHandler) {
         decoder = JsonRpcMessageDecoder(codec, limits)
-        installBoundedPump(policy, scope, limits)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), limits)
     }
 
     /**
@@ -156,81 +158,68 @@ public class Connection(
                 parentActive = { scope.coroutineContext[Job]?.isActive != false },
                 parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
             )
-        installBoundedPump(policy, scope, inboundLimits)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), inboundLimits)
         if (!connectionJob.isActive) {
             boundedPump?.close()
             boundedOutgoing?.close(IllegalStateException("Connection closed"))
         }
     }
 
-    private fun installBoundedPump(
-        policy: BoundedDispatchPolicy,
-        scope: CoroutineScope,
-        limits: InboundResourceLimits?,
-    ) {
-        boundedPump =
-            BoundedDispatchPump(
-                policy = policy,
-                decoder = decoder,
-                peer = peer,
-                scope = CoroutineScope(scope.coroutineContext + connectionJob),
-                limits = limits,
-                output =
-                    object : DispatchOutput {
-                        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
+    /** Writes the replies of the bounded pump to this connection's outgoing queue. */
+    private inner class PumpOutput : DispatchOutput {
+        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
 
-                        override suspend fun send(
-                            response: ResponseMessage,
-                            onDequeued: () -> Unit,
-                        ) {
-                            val bounded = boundedOutgoing
-                            if (bounded != null) {
-                                bounded.send(response, onDequeued)
-                            } else {
-                                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
-                            }
-                        }
+        override suspend fun send(
+            response: ResponseMessage,
+            onDequeued: () -> Unit,
+        ) {
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.send(response, onDequeued)
+            } else {
+                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+            }
+        }
 
-                        override suspend fun sendBatch(
-                            responses: List<ResponseMessage>,
-                            onDequeued: () -> Unit,
-                        ) {
-                            val bounded = boundedOutgoing
-                            if (bounded != null) {
-                                bounded.sendBatch(responses, onDequeued)
-                            } else {
-                                outgoingMessages.send(OutgoingItem.Batch(responses, onDequeued))
-                            }
-                        }
+        override suspend fun sendBatch(
+            responses: List<ResponseMessage>,
+            onDequeued: () -> Unit,
+        ) {
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.sendBatch(responses, onDequeued)
+            } else {
+                outgoingMessages.send(OutgoingItem.Batch(responses, onDequeued))
+            }
+        }
 
-                        override fun offer(
-                            response: ResponseMessage,
-                            onDequeued: (() -> Unit)?,
-                        ): OfferResult =
-                            boundedOutgoing?.offer(response, onDequeued)
-                                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
-                                    OfferResult.ACCEPTED
-                                } else {
-                                    OfferResult.REJECTED
-                                }
+        override fun offer(
+            response: ResponseMessage,
+            onDequeued: (() -> Unit)?,
+        ): OfferResult =
+            boundedOutgoing?.offer(response, onDequeued)
+                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
+                    OfferResult.ACCEPTED
+                } else {
+                    OfferResult.REJECTED
+                }
 
-                        override fun fail(cause: Throwable) {
-                            if (scope.coroutineContext[Job]?.isActive == false) {
-                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
-                                return
-                            }
-                            if (boundedOutgoing?.claimFailure(cause) == false) return
-                            if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
-                                outgoingDrain.fail(cause)
-                                boundedPump?.close()
-                                peer.pending.close()
-                                boundedOutgoing?.close(cause)
-                                outgoingMessages.cancel()
-                                connectionJob.cancel()
-                            }
-                        }
-                    },
-            )
+        override fun fail(cause: Throwable) {
+            if (scope.coroutineContext[Job]?.isActive == false) {
+                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
+                return
+            }
+            if (boundedOutgoing?.claimFailure(cause) == false) return
+            if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
+                outgoingDrain.fail(cause)
+                boundedPump?.close()
+                peer.pending.close()
+                boundedOutgoing?.close(cause)
+                outgoingMessages.cancel()
+                connectionJob.cancel()
+            }
+        }
     }
 
     init {

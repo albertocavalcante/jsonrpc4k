@@ -88,7 +88,14 @@ class BoundedDispatchLifecycleTest {
             assertEquals(listOf("work 1", "note", "work 2", "work 3"), order)
             assertEquals(JsonPrimitive(1), assertIs<ResponseMessage>(decode(frames.nextFrame())).result)
             val batch = assertIs<JsonArray>(wireJson(frames.nextFrame()))
-            assertEquals(listOf(2, 3), batch.map { it.jsonObject.getValue("result").jsonPrimitive.int })
+            assertEquals(
+                listOf(2, 3),
+                batch.map {
+                    it.jsonObject
+                        .getValue("result")
+                        .jsonPrimitive.int
+                },
+            )
             connection.close()
         }
 
@@ -254,7 +261,9 @@ class BoundedDispatchLifecycleTest {
             withTimeout(1.seconds) { entered.forEach { it.await() } }
             runCurrent()
             // No collector yet, so the array is not dequeued and a reused id is a duplicate.
-            assertTrue(runCatching { connection.receive(codec.encode(RequestMessage(RequestId.of(1), "both", JsonPrimitive(0)))) }.isFailure)
+            assertTrue(
+                runCatching { connection.receive(codec.encode(RequestMessage(RequestId.of(1), "both", JsonPrimitive(0)))) }.isFailure,
+            )
             val failed = assertIs<ConnectionState.Failed>(connection.state.value)
             assertEquals("Duplicate active incoming request ID", failed.cause.message)
         }

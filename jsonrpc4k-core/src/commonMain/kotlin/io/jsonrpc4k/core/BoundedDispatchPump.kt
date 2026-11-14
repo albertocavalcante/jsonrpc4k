@@ -405,12 +405,11 @@ internal class BoundedDispatchPump(
             val response = peer.dispatcher.handleRequest(event.message, inbound = null)
             val id = event.message.id
             val token = event.token
-            if (requests.claimReply(id, token)) {
-                try {
-                    if (event.slot != null) event.slot.complete(response) else output.send(response, requests.removal(id, token))
-                } finally {
-                    event.replyDone.complete(Unit)
-                }
+            if (!requests.claimReply(id, token)) return
+            try {
+                if (event.slot != null) event.slot.complete(response) else output.send(response, requests.removal(id, token))
+            } finally {
+                event.replyDone.complete(Unit)
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -539,7 +538,8 @@ private class AdmittedRequests {
     ): Boolean = update(id, token) { if (it.replied) null else it.copy(replied = true) } != null
 
     /** Claims the reply of the request [id] for a cancellation; returns its entry, or null when already replied. */
-    fun claimCancel(id: RequestId): Entry? = update(id, token = null) { if (it.replied) null else it.copy(cancelled = true, replied = true) }
+    fun claimCancel(id: RequestId): Entry? =
+        update(id, token = null) { if (it.replied) null else it.copy(cancelled = true, replied = true) }
 
     fun attach(
         id: RequestId,

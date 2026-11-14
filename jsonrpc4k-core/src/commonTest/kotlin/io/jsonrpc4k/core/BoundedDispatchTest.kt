@@ -506,7 +506,7 @@ class BoundedDispatchTest {
 
                     override fun fail(cause: Throwable): Unit = throw cause
                 }
-            val pump = BoundedDispatchPump(policy, JsonRpcMessageDecoder(codec), dispatcher.newPeer(), scope, output)
+            val pump = BoundedDispatchPump(policy, JsonRpcMessageDecoder(codec), peer, scope, output)
             pump.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             pump.receive(codec.encode(NotificationMessage("barrier")))
@@ -559,7 +559,7 @@ class BoundedDispatchTest {
                         terminal = cause
                     }
                 }
-            pump = BoundedDispatchPump(BoundedDispatchPolicy(2, 4), JsonRpcMessageDecoder(codec), dispatcher.newPeer(), scope, output)
+            pump = BoundedDispatchPump(BoundedDispatchPolicy(2, 4), JsonRpcMessageDecoder(codec), peer, scope, output)
             pump.receive(codec.encode(RequestMessage(RequestId.of(1), "first")))
             withTimeout(1.seconds) { secondSent.await() }
             assertEquals(null, terminal)
