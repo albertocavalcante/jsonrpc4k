@@ -24,6 +24,17 @@ transports for the JVM, Node.js and Kotlin/Native.
 - `LspLaunchArguments.parse` reads the vscode-languageclient flags `--stdio`, `--pipe=`, `--socket=`,
   `--node-ipc` and `--clientProcessId=`.
 
+## Platform support
+
+| Platform | JVM (17+) | Node.js | Kotlin/Native |
+|---|---|---|---|
+| Linux x64 | tested in CI | tested in CI | tested in CI (`linuxX64`) |
+| Linux ARM64 | tested in CI | tested in CI | tested in CI (`linuxArm64`, cross-compiled on x64, run on an ARM64 runner) |
+| macOS x64 | not tested in CI | not tested in CI | not run in CI |
+| macOS ARM64 | tested in CI | tested in CI | tested in CI (`macosArm64`) |
+| Windows x64 | not tested in CI | named pipe tests in CI | tested in CI (`mingwX64`) |
+| Windows ARM64 | tested in CI | tested in CI | x64 emulation: Kotlin/Native has no Windows ARM64 target, so the `mingwX64` executables run under Windows 11 x64 emulation |
+
 ## Transports by platform
 
 | Transport | JVM | Node.js | Linux and Apple native | Windows native (mingwX64) | Browser |
@@ -132,5 +143,5 @@ JDK 17 or newer is required (the JVM target uses toolchain 17).
 ./gradlew spotlessApply         # format
 ```
 
-CI runs Linux, macOS and Windows jobs. There is no Linux arm64 job: Kotlin/Native 2.3.0 has no
-linux-aarch64 host toolchain.
+CI runs Linux, macOS and Windows jobs, plus Linux ARM64 and Windows ARM64 jobs on hosted ARM64
+runners (see Platform support).

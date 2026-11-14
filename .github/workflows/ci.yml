@@ -274,15 +274,23 @@ jobs:
           echo "PROCESSOR_ARCHITECTURE=$PROCESSOR_ARCHITECTURE"
           java -XshowSettings:properties -version 2>&1 | grep -E 'os.arch|java.version '
 
+      # --continue reports JVM and Node.js failures together instead of stopping at the first.
       - name: JVM and Node.js tests
-        run: ./gradlew jvmTest jsNodeTest
+        run: ./gradlew jvmTest jsNodeTest --continue
+
+      - name: Show failed tests
+        if: failure()
+        shell: bash
+        run: grep -h -A12 '<failure' */build/test-results/*/*.xml | head -150 || true
 
       - name: Download mingwX64 test executables
+        if: ${{ !cancelled() }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: mingw-x64-test-executables
 
       - name: Run mingwX64 native tests (x64 emulation)
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
