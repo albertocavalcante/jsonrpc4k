@@ -291,7 +291,7 @@ internal class JvmUnixListener private constructor(
                     return
                 }
             if (!attributes.isOther) return
-            if (!isSocket(socketFile) || isServed(socketFile)) {
+            if (isSocket(socketFile) == false || isServed(socketFile)) {
                 throw TransportException("$path is not a stale Unix socket (not a socket, or still in use)")
             }
             try {
@@ -301,14 +301,19 @@ internal class JvmUnixListener private constructor(
             }
         }
 
-        private fun isSocket(socketFile: Path): Boolean =
+        /**
+         * Whether [socketFile] is a socket by its POSIX file mode, or null when the file system has no
+         * such mode (Windows): the caller then relies on the connection probe alone, which only a
+         * refused connection to an AF_UNIX socket file passes.
+         */
+        private fun isSocket(socketFile: Path): Boolean? =
             try {
                 val mode = Files.getAttribute(socketFile, "unix:mode", LinkOption.NOFOLLOW_LINKS) as Int
                 (mode and FILE_TYPE_MASK) == FILE_TYPE_SOCKET
             } catch (ignored: UnsupportedOperationException) {
-                false
+                null
             } catch (ignored: IllegalArgumentException) {
-                false
+                null
             } catch (ignored: IOException) {
                 false
             }

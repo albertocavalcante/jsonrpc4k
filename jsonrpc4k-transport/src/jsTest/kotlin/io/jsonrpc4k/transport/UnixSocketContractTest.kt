@@ -11,6 +11,8 @@ private fun tempSocketPath(): String {
 
 /** Runs the shared contract over Node Unix domain sockets (Node on POSIX; Windows has no Unix sockets). */
 class UnixSocketContractTest : TransportContractTest() {
+    override fun isSupportedHere(): Boolean = !isWindowsHost()
+
     override suspend fun createPair(): Pair<Transport, Transport> {
         val path = tempSocketPath()
         val listener = UnixSocket.bind(path)

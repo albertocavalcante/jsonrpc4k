@@ -61,10 +61,10 @@ public class ProcessTransportFixture {
         write(out, "done\n");
     }
 
-    /** Reports the fixture variable, whether PATH is set, and the working directory. */
+    /** Reports the fixture variable, whether the parent's marker variable is set, and the working directory. */
     private static void info(OutputStream out) throws Exception {
-        String path = System.getenv("PATH") == null ? "absent" : "present";
-        write(out, System.getenv("JSONRPC4K_FIXTURE") + "\n" + path + "\n" + System.getProperty("user.dir") + "\n");
+        String marker = System.getenv("JSONRPC4K_PARENT_MARKER") == null ? "absent" : "present";
+        write(out, System.getenv("JSONRPC4K_FIXTURE") + "\n" + marker + "\n" + System.getProperty("user.dir") + "\n");
     }
 
     private static void sleepForever() {

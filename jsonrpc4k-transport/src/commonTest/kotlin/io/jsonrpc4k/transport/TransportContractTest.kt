@@ -33,6 +33,9 @@ abstract class TransportContractTest {
     /** Two connected ends: bytes sent on `first` arrive on `second` and vice versa. */
     abstract suspend fun createPair(): Pair<Transport, Transport>
 
+    /** False on a host where the transport cannot exist; every case then passes without running. */
+    protected open fun isSupportedHere(): Boolean = true
+
     @Test
     fun `bytes flow in both directions`() =
         contract { a, b ->
@@ -138,6 +141,7 @@ abstract class TransportContractTest {
     // fails by name instead of hanging the run.
     private fun contract(body: suspend CoroutineScope.(Transport, Transport) -> Unit): TestResult =
         runTest(timeout = CASE_TIMEOUT) {
+            if (!isSupportedHere()) return@runTest
             val (a, b) = createPair()
             try {
                 body(this, a, b)
