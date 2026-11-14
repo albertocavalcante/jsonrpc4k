@@ -513,6 +513,42 @@ class CodecTest {
         }.message shouldContain "Duplicate"
     }
 
+    // ===== Content-Type charset =====
+
+    private fun decodeWithContentType(contentType: String?): List<Payload> {
+        val content = """{"jsonrpc":"2.0","method":"test"}"""
+        val extra = if (contentType == null) "" else "Content-Type: $contentType\r\n"
+        val input = "Content-Length: ${content.encodeToByteArray().size}\r\n$extra\r\n$content"
+        return JsonRpcMessageDecoder(codec).feed(input)
+    }
+
+    @Test
+    fun `decode accepts absent and utf8 charsets`() {
+        listOf(
+            null,
+            "application/vscode-jsonrpc",
+            "application/vscode-jsonrpc; charset=utf-8",
+            "application/vscode-jsonrpc;charset=UTF-8",
+            "application/vscode-jsonrpc;  charset=utf8  ",
+            "application/vscode-jsonrpc; charset=\"utf-8\"",
+            "application/vscode-jsonrpc; CHARSET=\" UTF8 \"",
+        ).forEach { decodeWithContentType(it) shouldHaveSize 1 }
+    }
+
+    @Test
+    fun `decode rejects non utf8 charsets`() {
+        listOf(
+            "application/vscode-jsonrpc; charset=latin1" to "latin1",
+            "application/vscode-jsonrpc; charset=\"iso-8859-1\"" to "iso-8859-1",
+            "application/vscode-jsonrpc; charset=utf-16" to "utf-16",
+            "application/vscode-jsonrpc; charset=" to "",
+            "application/vscode-jsonrpc; charset=utf-80" to "utf-80",
+        ).forEach { (ct, value) ->
+            val message = assertFailsWith<JsonRpcProtocolException> { decodeWithContentType(ct) }.message
+            message shouldContain "Unsupported Content-Type charset: $value"
+        }
+    }
+
     // ===== JsonRpcProtocolException Tests =====
 
     @Test
