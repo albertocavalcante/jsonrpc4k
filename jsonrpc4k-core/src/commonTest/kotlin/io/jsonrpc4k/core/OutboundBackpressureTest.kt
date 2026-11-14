@@ -450,12 +450,12 @@ class OutboundBackpressureTest {
                 backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
                     connection.request<JsonElement>("waiting", null)
                 }
-            assertEquals(1, connection.dispatcher.pending.count)
+            assertEquals(1, connection.peer.pending.count)
             assertTrue(runCatching { connection.request<JsonElement>("excess", null) }.isFailure)
-            assertEquals(1, connection.dispatcher.pending.count)
+            assertEquals(1, connection.peer.pending.count)
             waiting.cancel()
             runCurrent()
-            assertEquals(0, connection.dispatcher.pending.count)
+            assertEquals(0, connection.peer.pending.count)
             connection.close()
         }
 

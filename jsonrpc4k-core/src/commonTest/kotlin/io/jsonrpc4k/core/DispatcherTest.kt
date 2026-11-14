@@ -32,6 +32,7 @@ private data class DispatcherNotifyParams(
 
 class DispatcherTest {
     private val dispatcher = Dispatcher()
+    private val peer = dispatcher.newPeer()
 
     @Test
     fun `incoming numeric cancellation does not cancel an outbound waiter`() =
@@ -49,10 +50,10 @@ class DispatcherTest {
         id: RequestId,
         wireId: JsonPrimitive,
     ) {
-        val deferred = dispatcher.registerPendingRequest(id)
-        dispatcher.dispatch(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", wireId) }))
+        val deferred = peer.registerPendingRequest(id)
+        peer.dispatch(NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, buildJsonObject { put("id", wireId) }))
         deferred.isActive shouldBe true
-        dispatcher.dispatch(ResponseMessage.success(id, JsonPrimitive("completed")))
+        peer.dispatch(ResponseMessage.success(id, JsonPrimitive("completed")))
         deferred.await() shouldBe JsonPrimitive("completed")
     }
 
@@ -68,7 +69,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/method")
-            dispatcher.dispatch(request)
+            peer.dispatch(request)
 
             handlerCalled shouldBe true
         }
@@ -84,7 +85,7 @@ class DispatcherTest {
 
             val params = buildJsonObject { put("key", JsonPrimitive("value")) }
             val request = RequestMessage(id = RequestId.of(1), method = "test/method", params = params)
-            dispatcher.dispatch(request)
+            peer.dispatch(request)
 
             receivedParams shouldBe params
         }
@@ -97,7 +98,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/method")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.id shouldBe RequestId.of(1)
@@ -113,7 +114,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/void")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.result shouldBe null
@@ -124,7 +125,7 @@ class DispatcherTest {
     fun `unregistered method returns method not found error`() =
         runTest {
             val request = RequestMessage(id = RequestId.of(1), method = "unknown/method")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             val error = response?.error ?: error("Expected method-not-found error")
             error.code shouldBe ResponseError.METHOD_NOT_FOUND
@@ -140,7 +141,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/error")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             val error = response?.error ?: error("Expected internal error")
             error.code shouldBe ResponseError.INTERNAL_ERROR
@@ -155,7 +156,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/jsonrpc-error")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             val error = response?.error ?: error("Expected invalid params error")
             error.code shouldBe ResponseError.INVALID_PARAMS
@@ -171,7 +172,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/jsonrpc-error-data")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.error shouldNotBe null
@@ -189,7 +190,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/method")
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response!!.result shouldBe JsonPrimitive("second")
         }
@@ -209,7 +210,7 @@ class DispatcherTest {
                     put("value", JsonPrimitive(42))
                 }
             val request = RequestMessage(id = RequestId.of(1), method = "test/typed", params = params)
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.result shouldNotBe null
@@ -229,7 +230,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/nullable", params = null)
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.result shouldNotBe null
@@ -250,7 +251,7 @@ class DispatcherTest {
                     put("value", JsonPrimitive(1))
                 }
             val request = RequestMessage(id = RequestId.of(1), method = "test/null-result", params = params)
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response!!.result shouldBe null
@@ -268,7 +269,7 @@ class DispatcherTest {
             }
 
             val notification = NotificationMessage(method = "test/notify")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             handlerCalled shouldBe true
         }
@@ -283,7 +284,7 @@ class DispatcherTest {
 
             val params = buildJsonObject { put("event", JsonPrimitive("something")) }
             val notification = NotificationMessage(method = "test/notify", params = params)
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             receivedParams shouldBe params
         }
@@ -294,7 +295,7 @@ class DispatcherTest {
             dispatcher.onNotification("test/notify") { _: kotlinx.serialization.json.JsonElement? -> }
 
             val notification = NotificationMessage(method = "test/notify")
-            val response = dispatcher.dispatch(notification)
+            val response = peer.dispatch(notification)
 
             response shouldBe null
         }
@@ -303,7 +304,7 @@ class DispatcherTest {
     fun `unregistered notification is silently ignored`() =
         runTest {
             val notification = NotificationMessage(method = "unknown/notification")
-            val response = dispatcher.dispatch(notification)
+            val response = peer.dispatch(notification)
 
             response shouldBe null
         }
@@ -317,7 +318,7 @@ class DispatcherTest {
 
             val notification = NotificationMessage(method = "test/error")
             // Should not throw
-            val response = dispatcher.dispatch(notification)
+            val response = peer.dispatch(notification)
 
             response shouldBe null
         }
@@ -334,7 +335,7 @@ class DispatcherTest {
 
             val params = buildJsonObject { put("message", JsonPrimitive("Hello")) }
             val notification = NotificationMessage(method = "test/typed-notify", params = params)
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             receivedMessage shouldBe "Hello"
         }
@@ -349,7 +350,7 @@ class DispatcherTest {
             }
 
             val notification = NotificationMessage(method = "test/nullable-notify", params = null)
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             handlerCalled shouldBe true
         }
@@ -362,7 +363,7 @@ class DispatcherTest {
             }
 
             val request = RequestMessage(id = RequestId.of(1), method = "test/non-nullable", params = null)
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             val error = response?.error ?: error("Expected invalid params error")
             error.code shouldBe ResponseError.INVALID_PARAMS
@@ -379,7 +380,7 @@ class DispatcherTest {
 
             val notification = NotificationMessage(method = "test/error-notify")
             // Should not throw
-            val response = dispatcher.dispatch(notification)
+            val response = peer.dispatch(notification)
 
             response shouldBe null
         }
@@ -397,13 +398,14 @@ class DispatcherTest {
                             reportedException = exception
                         },
                 )
+            val peer = dispatcher.newPeer()
 
             dispatcher.onNotification("test/error-notify") { _: kotlinx.serialization.json.JsonElement? ->
                 throw IllegalStateException("Handler failed")
             }
 
             val notification = NotificationMessage(method = "test/error-notify")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             reportedMethod shouldBe "test/error-notify"
             reportedException shouldNotBe null
@@ -416,7 +418,7 @@ class DispatcherTest {
     fun `response dispatch returns null`() =
         runTest {
             val response = ResponseMessage.success(id = RequestId.of(1), result = JsonPrimitive("ok"))
-            val result = dispatcher.dispatch(response)
+            val result = peer.dispatch(response)
 
             result shouldBe null
         }
@@ -425,10 +427,10 @@ class DispatcherTest {
     fun `response with pending request completes deferred`() =
         runTest {
             val id = RequestId.of(1)
-            val deferred = dispatcher.registerPendingRequest(id)
+            val deferred = peer.registerPendingRequest(id)
 
             val response = ResponseMessage.success(id = id, result = JsonPrimitive("result"))
-            dispatcher.dispatch(response)
+            peer.dispatch(response)
 
             deferred.isCompleted shouldBe true
             deferred.await() shouldBe JsonPrimitive("result")
@@ -438,14 +440,14 @@ class DispatcherTest {
     fun `response with error completes deferred exceptionally`() =
         runTest {
             val id = RequestId.of(1)
-            val deferred = dispatcher.registerPendingRequest(id)
+            val deferred = peer.registerPendingRequest(id)
 
             val response =
                 ResponseMessage.error(
                     id = id,
                     error = ResponseError.methodNotFound("test/method"),
                 )
-            dispatcher.dispatch(response)
+            peer.dispatch(response)
 
             deferred.isCompleted shouldBe true
             val exception = assertFailsWith<JsonRpcException> { deferred.await() }
@@ -456,7 +458,7 @@ class DispatcherTest {
     fun `response with null id is ignored`() =
         runTest {
             val response = ResponseMessage.error(id = null, error = ResponseError.parseError("Parse error"))
-            val result = dispatcher.dispatch(response)
+            val result = peer.dispatch(response)
 
             result shouldBe null
         }
@@ -465,7 +467,7 @@ class DispatcherTest {
     fun `response for unknown request is ignored`() =
         runTest {
             val response = ResponseMessage.success(id = RequestId.of(999), result = JsonPrimitive("ignored"))
-            val result = dispatcher.dispatch(response)
+            val result = peer.dispatch(response)
 
             result shouldBe null
         }
@@ -476,7 +478,7 @@ class DispatcherTest {
     fun `registerPendingRequest creates deferred`() =
         runTest {
             val id = RequestId.of(1)
-            val deferred = dispatcher.registerPendingRequest(id)
+            val deferred = peer.registerPendingRequest(id)
 
             deferred.isCompleted shouldBe false
             deferred.isActive shouldBe true
@@ -486,9 +488,9 @@ class DispatcherTest {
     fun `cancelPendingRequest cancels the deferred`() =
         runTest {
             val id = RequestId.of(1)
-            val deferred = dispatcher.registerPendingRequest(id)
+            val deferred = peer.registerPendingRequest(id)
 
-            dispatcher.cancelPendingRequest(id)
+            peer.cancelPendingRequest(id)
 
             deferred.isCancelled shouldBe true
         }
@@ -497,7 +499,7 @@ class DispatcherTest {
     fun `cancelPendingRequest for unknown id does nothing`() =
         runTest {
             // Should not throw
-            dispatcher.cancelPendingRequest(RequestId.of(999))
+            peer.cancelPendingRequest(RequestId.of(999))
         }
 
     @Test
@@ -506,19 +508,19 @@ class DispatcherTest {
             val id1 = RequestId.of(1)
             val id2 = RequestId.of(2)
 
-            val deferred1 = dispatcher.registerPendingRequest(id1)
-            val deferred2 = dispatcher.registerPendingRequest(id2)
+            val deferred1 = peer.registerPendingRequest(id1)
+            val deferred2 = peer.registerPendingRequest(id2)
 
             // Complete only the first one
             val response1 = ResponseMessage.success(id = id1, result = JsonPrimitive("result1"))
-            dispatcher.dispatch(response1)
+            peer.dispatch(response1)
 
             deferred1.isCompleted shouldBe true
             deferred2.isCompleted shouldBe false
 
             // Complete the second one
             val response2 = ResponseMessage.success(id = id2, result = JsonPrimitive("result2"))
-            dispatcher.dispatch(response2)
+            peer.dispatch(response2)
 
             deferred2.isCompleted shouldBe true
             deferred1.await() shouldBe JsonPrimitive("result1")
@@ -577,7 +579,7 @@ class DispatcherTest {
             }
 
             val message: Message = RequestMessage(id = RequestId.of(1), method = "test/method")
-            val response = dispatcher.dispatch(message)
+            val response = peer.dispatch(message)
 
             response shouldNotBe null
             response.shouldBeInstanceOf<ResponseMessage>()
@@ -592,7 +594,7 @@ class DispatcherTest {
             }
 
             val message: Message = NotificationMessage(method = "test/notify")
-            val response = dispatcher.dispatch(message)
+            val response = peer.dispatch(message)
 
             response shouldBe null
             called shouldBe true
@@ -602,10 +604,10 @@ class DispatcherTest {
     fun `dispatch handles response message`() =
         runTest {
             val id = RequestId.of(1)
-            val deferred = dispatcher.registerPendingRequest(id)
+            val deferred = peer.registerPendingRequest(id)
 
             val message: Message = ResponseMessage.success(id = id, result = JsonPrimitive("result"))
-            val response = dispatcher.dispatch(message)
+            val response = peer.dispatch(message)
 
             response shouldBe null
             deferred.await() shouldBe JsonPrimitive("result")
@@ -633,7 +635,7 @@ class DispatcherTest {
                     )
                 }
             val request = RequestMessage(id = RequestId.of(1), method = "test/nested", params = params)
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response!!.result shouldBe JsonPrimitive(42)
         }
@@ -652,9 +654,9 @@ class DispatcherTest {
             val request2 = RequestMessage(id = RequestId.of(2), method = "test/method", params = JsonPrimitive(20))
             val request3 = RequestMessage(id = RequestId.of(3), method = "test/method", params = JsonPrimitive(30))
 
-            val response1 = dispatcher.dispatch(request1)
-            val response2 = dispatcher.dispatch(request2)
-            val response3 = dispatcher.dispatch(request3)
+            val response1 = peer.dispatch(request1)
+            val response2 = peer.dispatch(request2)
+            val response3 = peer.dispatch(request3)
 
             response1!!.result shouldBe JsonPrimitive(20)
             response2!!.result shouldBe JsonPrimitive(40)

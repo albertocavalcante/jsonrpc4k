@@ -250,14 +250,19 @@ internal class BoundedOutgoing(
         }
     }
 
-    /** Sends [messages] as one JSON-RPC 2.0 batch frame; the frame limits apply to the whole array. */
-    suspend fun sendBatch(messages: List<Message>) =
-        withProducer {
-            admitted {
-                val bytes = encoder.encode(messages)
-                transfer(Item.Frame(bytes, null, reserveOrdinary(bytes.size)))
-            }
+    /**
+     * Sends [messages] as one JSON-RPC 2.0 batch frame; the frame limits apply to the whole array.
+     * [onDequeued] runs when the collector dequeues the frame.
+     */
+    suspend fun sendBatch(
+        messages: List<Message>,
+        onDequeued: (() -> Unit)? = null,
+    ) = withProducer {
+        admitted {
+            val bytes = encoder.encode(messages)
+            transfer(Item.Frame(bytes, onDequeued, reserveOrdinary(bytes.size)))
         }
+    }
 
     suspend fun barrier(
         completion: CompletableDeferred<Unit>,

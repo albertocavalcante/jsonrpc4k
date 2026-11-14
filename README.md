@@ -110,6 +110,27 @@ val connection = Connection(
 
 - Requests run concurrently up to `maxConcurrentRequests`; notifications are barriers that run after
   earlier requests and before later messages.
+- `controlNotifications` lists notification methods that bypass that barrier, such as
+  `window/workDoneProgress/cancel` or `run/readStdin`. They run as soon as they arrive, in arrival order
+  among themselves, on one lane beside the request handlers, so a running handler can observe them.
+- Each entry of a batch is dispatched as its own message under the same limits: request entries run
+  concurrently and can be cancelled, notification entries are barriers (or control notifications), and
+  the batch is still answered with one array once every entry has finished. The rules that fail the
+  connection also apply per entry: a batch with more notification entries than free queue slots, or
+  with a request id that repeats inside the batch or matches a request still active, fails the
+  connection instead of being answered.
+- When the transport reports EOF, call `connection.endInput()`, then `connection.flushOutgoing()`, then
+  `close()`. `endInput()` waits until the requests already admitted are answered and their responses
+  dequeued by the outgoing collector; `flushOutgoing()` waits until the collector has written them, so a
+  peer that closes its output right after its last request still gets the reply. After `drainTimeout`
+  (default 5 s) `endInput()` cancels what remains and offers Request Cancelled (-32800) for each request
+  still unanswered, inside its array for a batch entry. It then waits, for up to `drainTimeout` again,
+  until those errors, the replies that handlers had already produced and every batch array are in the
+  outgoing queue, but not until they are dequeued, which is why the flush matters. So the timeout path
+  can take up to twice `drainTimeout`; with a zero timeout it does not wait at all, and an array still
+  being assembled can be lost when `close()` follows. It returns at once when the connection has
+  already closed or failed, for example because the output side is gone. Do not call it from a handler
+  of the same connection.
 - A request that arrives with the queue full receives a server-busy error. A notification overflow or
   a duplicate active request id fails the connection (`Connection.state` becomes `Failed`).
 - `InboundResourceLimits` bounds the frame body, JSON nesting and queued application bytes.
@@ -124,13 +145,18 @@ val connection = Connection(
 ## Cancellation
 
 - Inbound `$/cancelRequest` cancels the handler of the request it names, which is then answered with a
-  Request Cancelled error (-32800).
+  Request Cancelled error (-32800). Request ids are scoped to one peer: each `Connection` has its own
+  state, and a `Dispatcher` is a routing table that several peers can share, each through its own
+  `PeerDispatcher` from `dispatcher.newPeer()`. One peer's cancel never reaches another peer's request
+  with the same id.
 - **Default-mode limitation:** the default mode runs each handler to completion inside `receive`, before
   the next message is read, so an inbound cancel cannot interrupt a handler that is already running. It
   only takes effect for handlers that run concurrently, that is, in bounded mode. Use bounded mode when
   handlers must be cancellable.
 - A caller of `request` that stops waiting (timeout or cancellation) sends `$/cancelRequest` for its own
-  request. Requests inside a bounded-mode batch cannot be cancelled.
+  request.
+- In bounded mode a request inside a batch can be cancelled like any other: its entry in the array is
+  then the Request Cancelled error.
 
 ## Build
 

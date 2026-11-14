@@ -39,17 +39,22 @@ import kotlin.time.Duration.Companion.seconds
  * invalid entry; a batch of only notifications or responses is answered with nothing. A frame that
  * is not valid JSON is answered with a Parse error, and an empty array or any other value that is
  * not a message object with an Invalid Request, each as a single response with a null id. The
- * connection stays open after both. In bounded mode a batch is one ordered unit: it starts after
- * earlier requests finish, runs its entries in order before later messages, and its requests cannot
- * be cancelled with `$/cancelRequest`. A batch that cannot be queued fails the connection, as a
- * notification does.
+ * connection stays open after both. In bounded mode each batch entry is dispatched as its own
+ * message under the same limits (see [BoundedDispatchPolicy]): its requests run concurrently and can
+ * be cancelled with `$/cancelRequest`, and the array is sent once every entry has finished.
  *
  * An inbound `$/cancelRequest` (LSP base protocol) cancels the handler of the request that it names.
  * The default mode runs each handler to completion inside [receive] before it reads the next message,
  * so a cancellation reaches only handlers that run concurrently, as in bounded mode. There the request
  * is answered with a Request Cancelled error (-32800) as soon as the cancellation is admitted, whatever
- * the handler does next. A caller of [request] that stops waiting sends `$/cancelRequest` for its own
- * request.
+ * the handler does next; for a batch entry that error fills the entry's place in the batch's single
+ * array, which is sent once every entry has finished. A caller of [request] that stops waiting sends
+ * `$/cancelRequest` for its own request. Request ids and cancellations are scoped to this connection:
+ * each connection has its own [PeerDispatcher].
+ *
+ * When the transport reports the end of inbound input, call [endInput], then [flushOutgoing], then
+ * [close], so that requests that were already admitted can still be answered and their responses
+ * written before the outgoing flow stops.
  */
 public class Connection(
     private val codec: JsonRpcCodec = JsonRpcCodec.Default,
@@ -58,6 +63,7 @@ public class Connection(
     notificationErrorHandler: NotificationErrorHandler? = null,
 ) {
     @PublishedApi internal val dispatcher: Dispatcher = Dispatcher(json, notificationErrorHandler)
+    internal val peer: PeerDispatcher = dispatcher.newPeer()
     private val requestIds = RequestIds()
 
     private sealed interface OutgoingItem {
@@ -68,6 +74,7 @@ public class Connection(
 
         data class Batch(
             val messages: List<Message>,
+            val onDequeued: () -> Unit,
         ) : OutgoingItem
 
         data class Barrier(
@@ -86,7 +93,7 @@ public class Connection(
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Open)
     private val cancellationSignal = CompletableDeferred<Unit>(connectionJob)
     private val outboundCancellation =
-        OutboundCancellation(dispatcher.pending) { notification, onDequeued ->
+        OutboundCancellation(peer.pending) { notification, onDequeued ->
             val bounded = boundedOutgoing
             if (bounded != null) {
                 bounded.trySend(notification, onDequeued)
@@ -111,7 +118,8 @@ public class Connection(
         scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(codec, json, scope, notificationErrorHandler) {
-        installBoundedPump(policy, scope, null)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), null)
     }
 
     /** Creates a bounded connection with additional framed-input and application-byte limits. */
@@ -124,7 +132,8 @@ public class Connection(
         notificationErrorHandler: NotificationErrorHandler? = null,
     ) : this(codec, json, scope, notificationErrorHandler) {
         decoder = JsonRpcMessageDecoder(codec, limits)
-        installBoundedPump(policy, scope, limits)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), limits)
     }
 
     /**
@@ -146,80 +155,73 @@ public class Connection(
                 fail = { cause -> boundedPump?.outputInterrupted(cause) },
                 haltIngress = {
                     boundedPump?.close()
-                    dispatcher.pending.close()
+                    peer.pending.close()
                 },
                 parentActive = { scope.coroutineContext[Job]?.isActive != false },
                 parentInactive = { transitionClosed(mutableState, boundedOutgoing, outgoingDrain) },
             )
-        installBoundedPump(policy, scope, inboundLimits)
+        boundedPump =
+            BoundedDispatchPump(policy, decoder, peer, CoroutineScope(scope.coroutineContext + connectionJob), PumpOutput(), inboundLimits)
         if (!connectionJob.isActive) {
             boundedPump?.close()
             boundedOutgoing?.close(IllegalStateException("Connection closed"))
         }
     }
 
-    private fun installBoundedPump(
-        policy: BoundedDispatchPolicy,
-        scope: CoroutineScope,
-        limits: InboundResourceLimits?,
-    ) {
-        boundedPump =
-            BoundedDispatchPump(
-                policy = policy,
-                decoder = decoder,
-                dispatcher = dispatcher,
-                scope = CoroutineScope(scope.coroutineContext + connectionJob),
-                limits = limits,
-                output =
-                    object : DispatchOutput {
-                        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
+    /** Writes the replies of the bounded pump to this connection's outgoing queue. */
+    private inner class PumpOutput : DispatchOutput {
+        override val isTerminating: Boolean get() = boundedOutgoing?.isTerminating == true
 
-                        override suspend fun send(
-                            response: ResponseMessage,
-                            onDequeued: () -> Unit,
-                        ) {
-                            val bounded = boundedOutgoing
-                            if (bounded != null) {
-                                bounded.send(response, onDequeued)
-                            } else {
-                                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
-                            }
-                        }
+        override suspend fun send(
+            response: ResponseMessage,
+            onDequeued: () -> Unit,
+        ) {
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.send(response, onDequeued)
+            } else {
+                outgoingMessages.send(OutgoingItem.Frame(response, onDequeued))
+            }
+        }
 
-                        override suspend fun sendBatch(responses: List<ResponseMessage>) {
-                            if (responses.isEmpty()) return
-                            val bounded = boundedOutgoing
-                            if (bounded != null) bounded.sendBatch(responses) else outgoingMessages.send(OutgoingItem.Batch(responses))
-                        }
+        override suspend fun sendBatch(
+            responses: List<ResponseMessage>,
+            onDequeued: () -> Unit,
+        ) {
+            val bounded = boundedOutgoing
+            if (bounded != null) {
+                bounded.sendBatch(responses, onDequeued)
+            } else {
+                outgoingMessages.send(OutgoingItem.Batch(responses, onDequeued))
+            }
+        }
 
-                        override fun offer(
-                            response: ResponseMessage,
-                            onDequeued: (() -> Unit)?,
-                        ): OfferResult =
-                            boundedOutgoing?.offer(response, onDequeued)
-                                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
-                                    OfferResult.ACCEPTED
-                                } else {
-                                    OfferResult.REJECTED
-                                }
+        override fun offer(
+            response: ResponseMessage,
+            onDequeued: (() -> Unit)?,
+        ): OfferResult =
+            boundedOutgoing?.offer(response, onDequeued)
+                ?: if (outgoingMessages.trySend(OutgoingItem.Frame(response, onDequeued)).isSuccess) {
+                    OfferResult.ACCEPTED
+                } else {
+                    OfferResult.REJECTED
+                }
 
-                        override fun fail(cause: Throwable) {
-                            if (scope.coroutineContext[Job]?.isActive == false) {
-                                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
-                                return
-                            }
-                            if (boundedOutgoing?.claimFailure(cause) == false) return
-                            if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
-                                outgoingDrain.fail(cause)
-                                boundedPump?.close()
-                                dispatcher.pending.close()
-                                boundedOutgoing?.close(cause)
-                                outgoingMessages.cancel()
-                                connectionJob.cancel()
-                            }
-                        }
-                    },
-            )
+        override fun fail(cause: Throwable) {
+            if (scope.coroutineContext[Job]?.isActive == false) {
+                transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
+                return
+            }
+            if (boundedOutgoing?.claimFailure(cause) == false) return
+            if (mutableState.compareAndSet(ConnectionState.Open, ConnectionState.Failed(cause))) {
+                outgoingDrain.fail(cause)
+                boundedPump?.close()
+                peer.pending.close()
+                boundedOutgoing?.close(cause)
+                outgoingMessages.cancel()
+                connectionJob.cancel()
+            }
+        }
     }
 
     init {
@@ -227,7 +229,7 @@ public class Connection(
             if (!connectionJob.isActive) {
                 transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
                 boundedPump?.close()
-                dispatcher.pending.close()
+                peer.pending.close()
                 outgoingMessages.cancel()
             }
         }
@@ -281,7 +283,10 @@ public class Connection(
                             item.onDequeued?.invoke()
                             emit(codec.encode(item.message))
                         }
-                        is OutgoingItem.Batch -> emit(codec.encode(item.messages))
+                        is OutgoingItem.Batch -> {
+                            item.onDequeued()
+                            emit(codec.encode(item.messages))
+                        }
                         is OutgoingItem.Barrier -> item.completion.complete(Unit)
                     }
                 }
@@ -440,12 +445,12 @@ public class Connection(
                     val (id, deferred) =
                         bounded.withProducer {
                             val requestId = RequestId.of(requestIds.next())
-                            val waiter = dispatcher.registerPendingRequest(requestId)
+                            val waiter = peer.registerPendingRequest(requestId)
                             try {
                                 bounded.sendRegistered(RequestMessage(id = requestId, method = method, params = params))
                                 requestId to waiter
                             } catch (cause: Throwable) {
-                                dispatcher.pending.cancel(requestId, waiter)
+                                peer.pending.cancel(requestId, waiter)
                                 throw cause
                             }
                         }
@@ -461,7 +466,7 @@ public class Connection(
 
         val id = RequestId.of(requestIds.next())
         val request = RequestMessage(id = id, method = method, params = params)
-        val deferred = dispatcher.registerPendingRequest(id)
+        val deferred = peer.registerPendingRequest(id)
         // A send cancelled while it waits for queue space may still hand the request over; such a
         // request gets no cancellation, which is the best-effort limit of this path.
         var sent = false
@@ -472,7 +477,7 @@ public class Connection(
             if (result == null) requestTimedOut(method)
             result.value
         } finally {
-            if (sent) outboundCancellation.abandon(id, deferred) else dispatcher.pending.cancel(id, deferred)
+            if (sent) outboundCancellation.abandon(id, deferred) else peer.pending.cancel(id, deferred)
         }
     }
 
@@ -576,10 +581,10 @@ public class Connection(
                 // TODO(#49): Bound ingress and support ordered full-duplex dispatch and recovery.
                 for (payload in decoder.feed(data)) {
                     when (payload) {
-                        is Payload.Single -> dispatcher.dispatch(payload.message)?.let { outgoingMessages.send(OutgoingItem.Frame(it)) }
+                        is Payload.Single -> peer.dispatch(payload.message)?.let { outgoingMessages.send(OutgoingItem.Frame(it)) }
                         is Payload.Batch -> {
-                            val responses = dispatcher.dispatch(payload)
-                            if (responses.isNotEmpty()) outgoingMessages.send(OutgoingItem.Batch(responses))
+                            val responses = peer.dispatch(payload)
+                            if (responses.isNotEmpty()) outgoingMessages.send(OutgoingItem.Batch(responses) {})
                         }
                         is Payload.Invalid -> outgoingMessages.send(OutgoingItem.Frame(payload.response))
                     }
@@ -588,6 +593,37 @@ public class Connection(
                 completion.dispose()
             }
         }
+
+    /**
+     * Tells the connection that the transport delivered its last inbound byte, and waits for the
+     * inbound work that was already admitted.
+     *
+     * In bounded mode, admitted requests keep running after the end of input. This waits until each
+     * of them has been answered and its response dequeued by the outgoing collector, and until queued
+     * notifications and batches have run. When [BoundedDispatchPolicy.drainTimeout] elapses first, it
+     * cancels the handlers that remain and offers a Request Cancelled error (-32800) for each request
+     * that is still unanswered, where the outgoing queue accepts it. A cancelled batch entry gets its
+     * error inside the batch's array, and replies that handlers had already produced are still sent.
+     * It then waits, bounded by the drain timeout again, until those errors, replies and batch arrays
+     * are in the outgoing queue, but not until they are dequeued; the timeout path can therefore take
+     * up to twice the drain timeout, and a zero timeout does not wait at all. It returns at once when
+     * the connection is closed or failed, for example because the outgoing collector stopped, since
+     * no response could be written, and when an earlier call has already finished. Later [receive]
+     * calls throw [IllegalStateException].
+     *
+     * Dequeued is not written: call [flushOutgoing] after this and before [close], so a peer that
+     * closes its output right after its last request still gets the response. The flush covers every
+     * frame queued before this call returned: the responses, the errors and arrays of the timeout path
+     * unless the second wait also timed out, and the replies to invalid frames. Do not call this from
+     * a handler of this connection: it would wait for that handler until the timeout.
+     *
+     * The connection stays open either way, so outbound requests and notifications still work;
+     * [close] it when done. In the default mode [receive] has already run every handler, so this
+     * returns at once and has no effect.
+     */
+    public suspend fun endInput() {
+        boundedPump?.endInput()
+    }
 
     /**
      * Feed incoming data from the transport.
@@ -602,7 +638,7 @@ public class Connection(
     public fun close() {
         transitionClosed(mutableState, boundedOutgoing, outgoingDrain)
         boundedPump?.close()
-        dispatcher.pending.close()
+        peer.pending.close()
         outgoingMessages.cancel()
         connectionJob.cancel()
     }
