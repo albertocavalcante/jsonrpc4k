@@ -82,6 +82,10 @@ private const val WRITE_READY = POLLWRNORM or POLLERR or POLLNVAL
 // Returned by a poll slice that found nothing to read.
 private val NO_DATA = ByteArray(0)
 
+// Largest single send() call. On windows-latest one non-blocking send of 64 MiB to a peer that did not read ended
+// at once instead of waiting for buffer space; one default send buffer per call keeps the waits in poll slices.
+private const val MAX_SEND_BYTES = 64 * 1024
+
 // CRT file descriptors for the process stdio streams, and the _setmode failure value.
 private const val STDIN_FD = 0
 private const val STDOUT_FD = 1
@@ -318,7 +322,7 @@ internal class MingwSocketTransport internal constructor(
                     var offset = 0
                     while (offset < data.size) {
                         if (closing.value != 0) throw TransportException("Transport is closed")
-                        offset += sendSome(pinned.addressOf(offset), data.size - offset)
+                        offset += sendSome(pinned.addressOf(offset), minOf(data.size - offset, MAX_SEND_BYTES))
                     }
                 }
             }

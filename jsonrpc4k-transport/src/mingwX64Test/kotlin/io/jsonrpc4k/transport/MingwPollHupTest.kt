@@ -9,7 +9,9 @@ import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.value
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -64,14 +66,14 @@ class MingwPollHupTest {
                 accepted = transport
                 val sending = detached.async { runCatching { transport.send(ByteArray(FLOOD_BYTES)) } }
                 delay(SETTLE_MILLIS)
-                assertTrue(sending.isActive, "the send should be waiting for buffer space")
+                assertTrue(sending.isActive, "the send should be waiting for buffer space, but ended with ${outcome(sending)}")
                 // The peer sends FIN but keeps its socket open and never reads: WSAPoll now reports POLLHUP.
                 shutdown(peer, SD_SEND)
                 delay(SETTLE_MILLIS)
                 val before = processCpuMillis()
                 delay(MEASURE_MILLIS)
                 val used = processCpuMillis() - before
-                assertTrue(sending.isActive, "the send should still be waiting for buffer space")
+                assertTrue(sending.isActive, "the send should still be waiting, but ended with ${outcome(sending)}")
                 assertTrue(used < CPU_BUDGET_MILLIS, "the waiting send used $used ms of CPU in $MEASURE_MILLIS ms")
                 transport.close()
                 val failure = withTimeoutOrNull(CLOSE_BOUND) { sending.await() }?.exceptionOrNull()
@@ -84,6 +86,10 @@ class MingwPollHupTest {
             }
         }
 }
+
+@OptIn(ExperimentalCoroutinesApi::class)
+private fun outcome(sending: Deferred<Result<Unit>>): String =
+    if (sending.isActive) "nothing yet" else sending.getCompleted().fold({ "success" }, { "$it" })
 
 /** User plus kernel CPU time of this process so far, in milliseconds. */
 @OptIn(ExperimentalForeignApi::class)
