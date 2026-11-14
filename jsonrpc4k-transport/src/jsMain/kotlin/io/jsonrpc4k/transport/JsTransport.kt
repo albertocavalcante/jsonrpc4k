@@ -64,6 +64,52 @@ internal object Net {
 }
 
 /**
+ * Keeps an "error" listener on every Node.js stream in [streams] for as long as the streams live.
+ *
+ * A Node.js EventEmitter that emits "error" with no listener throws, which ends the whole process. A
+ * listener tied to one `incoming` collection leaves gaps: before collection starts, after it ends,
+ * and after a once-listener fired. On Windows, closing a socket that holds unread data sends a reset,
+ * so the peer gets ECONNRESET at a moment nobody listens. This sink attaches at construction and is
+ * never removed. It records the first failure, runs [onFirstFailure] and the active observers, and
+ * swallows every later error.
+ */
+internal class NodeStreamErrors(
+    private val kind: String,
+    streams: List<dynamic>,
+    private val onFirstFailure: () -> Unit,
+) {
+    /** The first error any stream raised, or null while all are healthy. */
+    var failure: TransportException? = null
+        private set
+
+    private val observers = mutableListOf<(TransportException) -> Unit>()
+
+    init {
+        for (stream in streams) {
+            stream.on("error") { error: dynamic -> record(error) }
+        }
+    }
+
+    private fun record(error: dynamic) {
+        if (failure != null) return
+        val recorded = TransportException("$kind error: ${error?.message ?: error}")
+        failure = recorded
+        onFirstFailure()
+        for (observer in observers.toList()) observer(recorded)
+    }
+
+    /** Calls [observer] on the first failure, at once when one already happened. Returns a function that stops it. */
+    fun observe(observer: (TransportException) -> Unit): () -> Unit {
+        failure?.let(observer)
+        observers.add(observer)
+        return { observers.remove(observer) }
+    }
+
+    /** The exception a send fails with once the transport is unusable. */
+    fun closedException(): TransportException = failure ?: TransportException("Transport is closed")
+}
+
+/**
  * Stdio transport for JS/Node.js.
  * Uses process.stdin for reading and process.stdout for writing.
  */
@@ -71,6 +117,7 @@ public class StdioTransport : Transport {
     private var connected = true
     private val stdin: dynamic = NodeProcess.stdin
     private val stdout: dynamic = NodeProcess.stdout
+    private val errors = NodeStreamErrors("Stream", listOf(stdin, stdout)) { connected = false }
 
     override val incoming: Flow<ByteArray> =
         callbackFlow {
@@ -87,26 +134,21 @@ public class StdioTransport : Transport {
                 close()
             }
 
-            val errorCallback: (dynamic) -> Unit = { error: dynamic ->
-                connected = false
-                close(TransportException("Stream error: ${error?.message ?: error}"))
-            }
-
             stdin.on("data", dataCallback)
             stdin.once("end", endCallback)
-            stdin.once("error", errorCallback)
+            val stopObserving = errors.observe { failure -> close(failure) }
             stdin.resume()
 
             awaitClose {
                 stdin.removeListener("data", dataCallback)
                 stdin.removeListener("end", endCallback)
-                stdin.removeListener("error", errorCallback)
+                stopObserving()
             }
         }.buffer(Channel.UNLIMITED)
 
     override suspend fun send(data: ByteArray) {
         if (!connected) {
-            throw TransportException("Transport is closed")
+            throw errors.closedException()
         }
         suspendCoroutine { continuation ->
             val buffer = byteArrayToBuffer(data)
@@ -141,6 +183,11 @@ public class SocketTransport internal constructor(
     private val socket: dynamic,
 ) : Transport {
     private var connected = true
+    private val errors =
+        NodeStreamErrors("Socket", listOf(socket)) {
+            connected = false
+            socket.destroy()
+        }
 
     override val incoming: Flow<ByteArray> =
         callbackFlow {
@@ -157,27 +204,22 @@ public class SocketTransport internal constructor(
                 close()
             }
 
-            val errorCallback: (dynamic) -> Unit = { error: dynamic ->
-                connected = false
-                close(TransportException("Socket error: ${error?.message ?: error}"))
-            }
-
             socket.on("data", dataCallback)
             socket.once("end", endCallback)
             socket.once("close", endCallback)
-            socket.once("error", errorCallback)
+            val stopObserving = errors.observe { failure -> close(failure) }
 
             awaitClose {
                 socket.removeListener("data", dataCallback)
                 socket.removeListener("end", endCallback)
                 socket.removeListener("close", endCallback)
-                socket.removeListener("error", errorCallback)
+                stopObserving()
             }
         }.buffer(Channel.UNLIMITED)
 
     override suspend fun send(data: ByteArray) {
         if (!connected) {
-            throw TransportException("Transport is closed")
+            throw errors.closedException()
         }
         suspendCoroutine { continuation ->
             val buffer = byteArrayToBuffer(data)
@@ -234,7 +276,9 @@ internal suspend fun connectNodeSocket(
                 }
             }
 
-        socketRef.once("error") { error: dynamic ->
+        // Permanent, not once: a socket that fails again after this point must not throw. Once it
+        // connected, the SocketTransport has its own listener; this one only reports connect failures.
+        socketRef.on("error") { error: dynamic ->
             if (!resolved) {
                 resolved = true
                 continuation.resumeWithException(

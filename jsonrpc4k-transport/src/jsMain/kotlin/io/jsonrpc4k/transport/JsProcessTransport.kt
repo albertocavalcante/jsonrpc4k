@@ -128,6 +128,8 @@ internal class NodeProcessTransport(
         // Without listeners, a failed kill or write would be an uncaught exception.
         child.on("error") { _: dynamic -> }
         stdin.on("error") { _: dynamic -> }
+        // The incoming flow reports stdout errors while collected; this keeps one for the whole lifetime.
+        stdout.on("error") { _: dynamic -> }
     }
 
     override val pid: Long = (child.pid as Int).toLong()
