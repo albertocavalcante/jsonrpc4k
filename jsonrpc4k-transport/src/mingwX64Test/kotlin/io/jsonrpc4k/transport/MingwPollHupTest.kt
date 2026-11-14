@@ -110,9 +110,6 @@ private fun FILETIME.ticks(): Long = (dwHighDateTime.toLong() shl HIGH_WORD_SHIF
 
 /** A plain Winsock socket connected to 127.0.0.1:[port], so the test controls its half-close directly. */
 @OptIn(ExperimentalForeignApi::class)
-internal fun connectProbeSocket(port: Int): ULong = connectPlainSocket(port)
-
-@OptIn(ExperimentalForeignApi::class)
 private fun connectPlainSocket(port: Int): ULong =
     memScoped {
         val hints = alloc<ADDRINFOA>()

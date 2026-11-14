@@ -82,8 +82,10 @@ private const val WRITE_READY = POLLWRNORM or POLLERR or POLLNVAL
 // Returned by a poll slice that found nothing to read.
 private val NO_DATA = ByteArray(0)
 
-// Largest single send() call. On windows-latest one non-blocking send of 64 MiB to a peer that did not read ended
-// at once instead of waiting for buffer space; one default send buffer per call keeps the waits in poll slices.
+// Largest single send() call. On windows-latest one non-blocking send() of 64 MiB to a peer that never reads succeeds
+// at once and reports all 64 MiB sent: Winsock buffers the whole payload in kernel memory, past the send buffer size.
+// Capping each call at one default send buffer bounds that memory and keeps a full buffer waiting in poll slices,
+// where close() and the POLLHUP handling apply.
 private const val MAX_SEND_BYTES = 64 * 1024
 
 // CRT file descriptors for the process stdio streams, and the _setmode failure value.
@@ -243,8 +245,8 @@ internal class MingwStdioTransport(
  * turns and latency grows. A send waiting for buffer space does not yield, and neither does a pending accept on a
  * listener: 64 of them hold every `Dispatchers.IO` thread until they finish, which starves all other IO work. When
  * the peer that would drain those sends is a reader in the same process that also needs `Dispatchers.IO`, that is a
- * deadlock, not just added latency. A `WSAPoll`
- * failure ends [incoming] or fails [send] with [TransportException] instead of being retried.
+ * deadlock, not just added latency. A `WSAPoll` failure ends [incoming] or fails [send] with [TransportException]
+ * instead of being retried.
  *
  * [close] works from a cancelled coroutine. It sends FIN with `shutdown(SD_SEND)` at once, so the peer sees EOF
  * after the bytes already sent, and then closes the socket under the read and write locks, so a concurrent read or
