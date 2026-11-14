@@ -308,6 +308,7 @@ public class JsonRpcMessageDecoder(
 
         val headerSection = byteBuffer.copyOfRange(0, headerEndIndex).decodeToString()
         expectedContentLength = parseHeaderLength(headerSection)
+        validateContentTypeCharset(headerSection)
         limits?.let {
             if (checkNotNull(expectedContentLength) > it.maxFrameBodyBytes) {
                 throw JsonRpcProtocolException("Frame body exceeds ${it.maxFrameBodyBytes} bytes")
@@ -329,6 +330,28 @@ public class JsonRpcMessageDecoder(
         }
         return codec.parseContentLength(lengthHeaders.single())
             ?: throw JsonRpcProtocolException("Invalid Content-Length header")
+    }
+
+    /** Rejects a Content-Type header that declares any charset other than UTF-8 (or legacy utf8). */
+    private fun validateContentTypeCharset(headerSection: String) {
+        for (line in headerSection.split(JsonRpcCodec.LINE_DELIMITER)) {
+            val trimmed = line.trim()
+            if (!trimmed.startsWith("Content-Type:", ignoreCase = true)) continue
+            val params = trimmed.substringAfter(':').split(';').drop(1)
+            for (param in params) {
+                val name = param.substringBefore('=', "").trim()
+                if (!name.equals("charset", ignoreCase = true) || !param.contains('=')) continue
+                val value =
+                    param
+                        .substringAfter('=')
+                        .trim()
+                        .removeSurrounding("\"")
+                        .trim()
+                if (!value.equals("utf-8", ignoreCase = true) && !value.equals("utf8", ignoreCase = true)) {
+                    throw JsonRpcProtocolException("Unsupported Content-Type charset: $value")
+                }
+            }
+        }
     }
 
     /**
