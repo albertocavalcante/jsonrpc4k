@@ -239,7 +239,11 @@ internal class MingwStdioTransport(
  *
  * Cost of the slices: a collector, or a send waiting for buffer space, occupies one [Dispatchers.IO] thread for as long
  * as it waits and wakes up ten times per second while the peer is quiet. `Dispatchers.IO` allows 64 threads by
- * default, so beyond that many concurrently waiting transports the slices take turns and latency grows. A `WSAPoll`
+ * default. A collector yields its thread after each quiet slice, so beyond 64 waiting collectors the slices take
+ * turns and latency grows. A send waiting for buffer space does not yield, and neither does a pending accept on a
+ * listener: 64 of them hold every `Dispatchers.IO` thread until they finish, which starves all other IO work. When
+ * the peer that would drain those sends is a reader in the same process that also needs `Dispatchers.IO`, that is a
+ * deadlock, not just added latency. A `WSAPoll`
  * failure ends [incoming] or fails [send] with [TransportException] instead of being retried.
  *
  * [close] works from a cancelled coroutine. It sends FIN with `shutdown(SD_SEND)` at once, so the peer sees EOF

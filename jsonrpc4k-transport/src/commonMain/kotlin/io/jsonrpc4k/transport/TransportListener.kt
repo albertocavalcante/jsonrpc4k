@@ -18,7 +18,9 @@ public interface TransportListener {
      *
      * Fails with [TransportException] when the listener is closed, including when it is closed while
      * this call is waiting. Cancelling the calling coroutine abandons the wait without closing the
-     * listener, except on Windows where only [close] unblocks a pending accept.
+     * listener. On native targets the wait is a series of 100 ms poll slices, so a cancelled or closed
+     * accept ends within one slice, and a port with a pending accept is released up to one slice after
+     * [close] returns.
      */
     public suspend fun accept(): Transport
 
