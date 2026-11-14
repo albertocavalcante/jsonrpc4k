@@ -116,7 +116,10 @@ class ProcessTransportTest {
         runBlocking {
             val directory = Files.createTempDirectory("jsonrpc4k-cwd-")
             try {
-                val environment = mapOf("JSONRPC4K_FIXTURE" to "fixture-value", "PATH" to null)
+                // The build sets the marker in the test JVM's environment (see build.gradle.kts), so null must remove it.
+                // Only Gradle Test tasks set it: run this test through Gradle, not a bare IDE runner.
+                assertEquals("parent", System.getenv("JSONRPC4K_PARENT_MARKER"))
+                val environment = mapOf("JSONRPC4K_FIXTURE" to "fixture-value", "JSONRPC4K_PARENT_MARKER" to null)
                 val transport = startFixture("info", environment = environment, workingDirectory = directory.toString())
                 try {
                     val lines = Received(this, transport).awaitEnd().decodeToString().lines()

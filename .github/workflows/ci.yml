@@ -95,9 +95,7 @@ jobs:
   # ===========================================================================
   # Job 3: Windows Native Tests (mingwX64)
   # ===========================================================================
-  # There is no linuxArm64 job: Kotlin/Native 2.3.0 publishes host toolchains only for
-  # linux-x86_64, macos-aarch64, macos-x86_64 and windows-x86_64, so an arm64 Linux runner
-  # cannot run the Kotlin/Native compiler, so linuxArm64 tests cannot run in CI.
+  # It also builds the mingwX64 test executables that the Windows ARM64 job runs under x64 emulation.
   windows:
     name: Windows Native Tests
     runs-on: windows-latest
@@ -127,8 +125,188 @@ jobs:
       - name: Test mingwX64 and Node
         run: ./gradlew mingwX64Test :jsonrpc4k-transport:jsNodeTest --tests '*NamedPipeTest*'
 
+      # Test executables are tiny; one day is enough for the Windows ARM64 job that consumes them.
+      - name: Upload mingwX64 test executables
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mingw-x64-test-executables
+          path: '*/build/bin/mingwX64/debugTest/test.exe'
+          if-no-files-found: error
+          retention-days: 1
+
   # ===========================================================================
-  # Job 4: Coverage Report
+  # Job 4: Linux ARM64 build (cross-compile)
+  # ===========================================================================
+  # Kotlin/Native has no linux-aarch64 host compiler: linuxArm64 is a cross target that an x64
+  # Linux (or macOS) host builds. The executables are run on a real ARM64 runner by linux-arm64.
+  linux-arm64-build:
+    name: Linux ARM64 Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Link linuxArm64 test executables
+        run: ./gradlew linkDebugTestLinuxArm64
+
+      - name: Upload linuxArm64 test executables
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-arm64-test-executables
+          path: '*/build/bin/linuxArm64/debugTest/test.kexe'
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # Job 5: Linux ARM64 tests (native ARM64 runner)
+  # ===========================================================================
+  linux-arm64:
+    name: Linux ARM64 Tests
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    needs: linux-arm64-build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The Kotlin/Native toolchain has no linux-aarch64 build, so Gradle skips the native targets on
+      # this host (kotlin.native.ignoreDisabledTargets=true) and only the JVM and Node.js tests run here.
+      - name: Set up JDK 17 (aarch64)
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Verify ARM64 host
+        run: |
+          uname -m
+          java -XshowSettings:properties -version 2>&1 | grep -E 'os.arch|java.version '
+
+      # --continue reports JVM and Node.js failures together instead of stopping at the first.
+      - name: JVM and Node.js tests
+        run: ./gradlew jvmTest jsNodeTest --continue
+
+      - name: Download linuxArm64 test executables
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-arm64-test-executables
+
+      # Run each executable from its module directory, as the Gradle native test task does.
+      # Artifacts do not keep the executable bit.
+      - name: Run linuxArm64 native tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for exe in */build/bin/linuxArm64/debugTest/test.kexe; do
+            found=$((found + 1))
+            module="${exe%%/*}"
+            chmod +x "$exe"
+            file "$exe"
+            echo "::group::$module test.kexe"
+            (cd "$module" && ./build/bin/linuxArm64/debugTest/test.kexe)
+            echo "::endgroup::"
+          done
+          test "$found" -ge 2
+
+  # ===========================================================================
+  # Job 6: Windows ARM64 tests (native ARM64 runner)
+  # ===========================================================================
+  # Kotlin/Native has no Windows ARM64 target (only mingwX64), so the native tests run as x64
+  # executables under Windows 11 x64 emulation. JVM and Node.js run natively on ARM64.
+  windows-arm64:
+    name: Windows ARM64 Tests
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+    needs: windows
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17 (aarch64)
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: '17'
+          distribution: microsoft
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Verify ARM64 host
+        shell: bash
+        run: |
+          echo "PROCESSOR_ARCHITECTURE=$PROCESSOR_ARCHITECTURE"
+          java -XshowSettings:properties -version 2>&1 | grep -E 'os.arch|java.version '
+
+      # --continue reports JVM and Node.js failures together instead of stopping at the first.
+      - name: JVM and Node.js tests
+        run: ./gradlew jvmTest jsNodeTest --continue
+
+      - name: Show failed tests
+        if: failure()
+        shell: bash
+        run: grep -h -A12 '<failure' */build/test-results/*/*.xml | head -150 || true
+
+      - name: Download mingwX64 test executables
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mingw-x64-test-executables
+
+      - name: Run mingwX64 native tests (x64 emulation)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for exe in */build/bin/mingwX64/debugTest/test.exe; do
+            found=$((found + 1))
+            module="${exe%%/*}"
+            echo "::group::$module test.exe"
+            (cd "$module" && ./build/bin/mingwX64/debugTest/test.exe)
+            echo "::endgroup::"
+          done
+          test "$found" -ge 2
+
+  # ===========================================================================
+  # Job 7: Coverage Report
   # ===========================================================================
   coverage:
     name: Coverage

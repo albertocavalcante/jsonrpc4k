@@ -3,6 +3,12 @@ plugins {
     id("publishing-convention")
 }
 
+// A variable that only the build sets, so a test can prove that a null environment value removes
+// it from the child; PATH is unusable because a Windows child still saw it after removal.
+tasks.withType<Test>().configureEach {
+    environment("JSONRPC4K_PARENT_MARKER", "parent")
+}
+
 kotlin {
     js {
         // The JS transports load Node modules lazily, so a browser bundle can import the
