@@ -43,11 +43,15 @@ class NodeErrorListenerTest {
                 val listener = TcpListener.bind("127.0.0.1", 0)
                 try {
                     val (raw, transport, peer) = connectRaw(listener)
-                    emitError(raw, "boom before collection")
-                    assertFalse(transport.isConnected)
-                    val failure = assertFailsWith<TransportException> { transport.send(SOME_BYTES) }
-                    assertTrue(failure.message!!.contains("boom before collection"), "failure was $failure")
-                    peer.close()
+                    try {
+                        emitError(raw, "boom before collection")
+                        assertFalse(transport.isConnected)
+                        val failure = assertFailsWith<TransportException> { transport.send(SOME_BYTES) }
+                        assertTrue(failure.message!!.contains("boom before collection"), "failure was $failure")
+                    } finally {
+                        transport.close()
+                        peer.close()
+                    }
                 } finally {
                     listener.close()
                 }
@@ -61,13 +65,18 @@ class NodeErrorListenerTest {
                 val listener = TcpListener.bind("127.0.0.1", 0)
                 try {
                     val (raw, transport, peer) = connectRaw(listener)
-                    val collected = async { transport.incoming.toList() }
-                    peer.close()
-                    assertTrue(withTimeout(10.seconds) { collected.await() }.isEmpty())
-                    emitError(raw, "first after completion")
-                    emitError(raw, "second after completion")
-                    val failure = assertFailsWith<TransportException> { transport.send(SOME_BYTES) }
-                    assertTrue(failure.message!!.contains("first after completion"), "failure was $failure")
+                    try {
+                        val collected = async { transport.incoming.toList() }
+                        peer.close()
+                        assertTrue(withTimeout(10.seconds) { collected.await() }.isEmpty())
+                        emitError(raw, "first after completion")
+                        emitError(raw, "second after completion")
+                        val failure = assertFailsWith<TransportException> { transport.send(SOME_BYTES) }
+                        assertTrue(failure.message!!.contains("first after completion"), "failure was $failure")
+                    } finally {
+                        transport.close()
+                        peer.close()
+                    }
                 } finally {
                     listener.close()
                 }
@@ -81,13 +90,39 @@ class NodeErrorListenerTest {
                 val listener = TcpListener.bind("127.0.0.1", 0)
                 try {
                     val (raw, transport, peer) = connectRaw(listener)
-                    val collected = async { runCatching { transport.incoming.toList() } }
-                    // Give the collector a turn to attach before the error arrives.
-                    delay(50)
-                    emitError(raw, "boom while collecting")
-                    val failure = withTimeout(10.seconds) { collected.await() }.exceptionOrNull()
-                    assertTrue(failure is TransportException, "incoming ended with $failure")
-                    peer.close()
+                    try {
+                        val collected = async { runCatching { transport.incoming.toList() } }
+                        // Give the collector a turn to attach before the error arrives.
+                        delay(50)
+                        emitError(raw, "boom while collecting")
+                        val failure = withTimeout(10.seconds) { collected.await() }.exceptionOrNull()
+                        assertTrue(failure is TransportException, "incoming ended with $failure")
+                    } finally {
+                        transport.close()
+                        peer.close()
+                    }
+                } finally {
+                    listener.close()
+                }
+            }
+        }
+
+    @Test
+    fun `error after a deliberate close is swallowed and send reports the closed transport`() =
+        runTest(timeout = 30.seconds) {
+            withContext(Dispatchers.Default) {
+                val listener = TcpListener.bind("127.0.0.1", 0)
+                try {
+                    val (raw, transport, peer) = connectRaw(listener)
+                    try {
+                        transport.close()
+                        emitError(raw, "late error after close")
+                        val failure = assertFailsWith<TransportException> { transport.send(SOME_BYTES) }
+                        assertTrue(failure.message!!.contains("closed"), "failure was $failure")
+                        assertFalse(failure.message!!.contains("late error"), "failure was $failure")
+                    } finally {
+                        peer.close()
+                    }
                 } finally {
                     listener.close()
                 }

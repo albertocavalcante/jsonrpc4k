@@ -83,6 +83,7 @@ internal class NodeStreamErrors(
         private set
 
     private val observers = mutableListOf<(TransportException) -> Unit>()
+    private var closedDeliberately = false
 
     init {
         for (stream in streams) {
@@ -90,8 +91,13 @@ internal class NodeStreamErrors(
         }
     }
 
+    /** Call when the owner closes the streams itself: later errors are swallowed without becoming the send failure. */
+    fun markClosed() {
+        closedDeliberately = true
+    }
+
     private fun record(error: dynamic) {
-        if (failure != null) return
+        if (failure != null || closedDeliberately) return
         val recorded = TransportException("$kind error: ${error?.message ?: error}")
         failure = recorded
         onFirstFailure()
@@ -167,6 +173,7 @@ public class StdioTransport : Transport {
     override suspend fun close() {
         if (connected) {
             connected = false
+            errors.markClosed()
             stdin.destroy()
             stdout.end()
         }
@@ -238,6 +245,7 @@ public class SocketTransport internal constructor(
     override suspend fun close() {
         if (connected) {
             connected = false
+            errors.markClosed()
             socket.destroy()
         }
     }
