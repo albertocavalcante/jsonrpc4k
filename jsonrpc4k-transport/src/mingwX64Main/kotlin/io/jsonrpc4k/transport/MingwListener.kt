@@ -153,9 +153,6 @@ internal class MingwTcpListener private constructor(
             }
             try {
                 bindAndListen(handle, info, "$host:$port")
-                if (!setNonBlocking(handle)) {
-                    throw TransportException("Failed to make the listener non-blocking: socket error ${WSAGetLastError()}")
-                }
                 return MingwTcpListener(handle, localPort(handle))
             } catch (e: Exception) {
                 closesocket(handle)
@@ -172,6 +169,10 @@ internal class MingwTcpListener private constructor(
                 listen(handle, LISTEN_BACKLOG) == SOCKET_ERROR_VALUE
             ) {
                 throw TransportException("Failed to listen on $target: error ${WSAGetLastError()}")
+            }
+            // accept() waits in WSAPoll slices, so it must never block on a connection that was reset meanwhile.
+            if (!setNonBlocking(handle)) {
+                throw TransportException("Failed to make the listener non-blocking: socket error ${WSAGetLastError()}")
             }
         }
 
