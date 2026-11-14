@@ -26,6 +26,7 @@ import kotlinx.coroutines.IO
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -385,28 +386,43 @@ internal class PosixProcessTransport private constructor(
         scope.launch {
             memScoped {
                 val buffer = allocArray<ByteVar>(BUFFER_SIZE)
+                var pollFailed = false
                 while (true) {
-                    // A failing poll() would fail again on every retry, so draining stops.
-                    val readable =
-                        try {
-                            pollFd(fd, POLLIN.convert(), POLL_MILLIS)
-                        } catch (ignored: PollFailedException) {
-                            break
+                    if (pollFailed) {
+                        delay(POLL_MILLIS.toLong())
+                    } else {
+                        val readable = pollStderr(fd)
+                        if (readable == null) {
+                            // Retrying poll() would spin, and closing the pipe would make the child's next stderr
+                            // write fail with EPIPE or kill it with SIGPIPE. Fall back to non-blocking reads paced
+                            // by delay, ten per second, until EOF or until the child is gone and the pipe is quiet.
+                            pollFailed = true
+                            fcntl(fd, F_SETFL, O_NONBLOCK)
+                        } else if (!readable) {
+                            if (exit.isCompleted) break else continue
                         }
-                    if (!readable) {
-                        if (exit.isCompleted) break else continue
                     }
                     val count = read(fd, buffer, BUFFER_SIZE.convert())
-                    if (count > 0) {
-                        deliver(onData, ByteArray(count.toInt()) { buffer[it] })
-                    } else if (count == 0L || (errno != EINTR && errno != EAGAIN)) {
-                        break
+                    val err = errno
+                    when {
+                        count > 0 -> deliver(onData, ByteArray(count.toInt()) { buffer[it] })
+                        count == 0L -> break
+                        err == EAGAIN -> if (exit.isCompleted) break
+                        err != EINTR -> break
                     }
                 }
             }
             close(fd)
         }
     }
+
+    /** Waits one slice for stderr data: true when readable or hung up, false when quiet, null when poll() failed. */
+    private fun pollStderr(fd: Int): Boolean? =
+        try {
+            pollFd(fd, POLLIN.convert(), POLL_MILLIS)
+        } catch (ignored: PollFailedException) {
+            null
+        }
 
     companion object {
         /** Starts the child. Runs blocking system calls; call it on [Dispatchers.IO]. */
@@ -428,7 +444,9 @@ internal class PosixProcessTransport private constructor(
             if (reason != 0) {
                 fds.closeParentSide()
                 if (pid > 0) {
-                    if (reason == ETIMEDOUT) kill(pid, SIGKILL)
+                    // The child may still be running: it may have exec'd while the report timed out or poll or read
+                    // failed. It has not been reaped yet, so its pid cannot belong to another process.
+                    kill(pid, SIGKILL)
                     waitForExit(pid)
                 }
                 failTransport("Failed to start process ${command.first()}: ${posixErrorMessage(reason)}")
