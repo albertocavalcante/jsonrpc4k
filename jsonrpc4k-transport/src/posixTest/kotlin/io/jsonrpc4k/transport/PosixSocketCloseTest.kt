@@ -48,8 +48,10 @@ class PosixSocketCloseTest {
             val detached = CoroutineScope(Dispatchers.Default + SupervisorJob())
             val listener = TcpListener.bind("127.0.0.1", 0)
             val peer = connectPlainSocket(listener.port)
+            var accepted: Transport? = null
             try {
                 val transport = withTimeout(TIMEOUT) { listener.accept() }
+                accepted = transport
                 val sending = detached.async { runCatching { transport.send(ByteArray(FLOOD_BYTES)) } }
                 delay(SETTLE_MILLIS)
                 assertTrue(sending.isActive, "the send should be waiting for buffer space")
@@ -62,6 +64,8 @@ class PosixSocketCloseTest {
                 val failure = withTimeoutOrNull(CLOSE_BOUND) { sending.await() }?.exceptionOrNull()
                 assertTrue(failure is TransportException, "the waiting send ended with $failure")
             } finally {
+                // Releases the socket and the waiting send even when an assertion above failed.
+                accepted?.close()
                 close(peer)
                 listener.close()
                 detached.cancel()

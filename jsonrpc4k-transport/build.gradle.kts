@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+
 plugins {
     id("jsonrpc4k.multiplatform")
     id("publishing-convention")
@@ -105,5 +107,12 @@ kotlin {
         mingwX64Main {
             dependsOn(nativeMain)
         }
+    }
+}
+
+// Native test failures print only the exception class by default; the message is what tells socket timing apart.
+tasks.withType<AbstractTestTask>().configureEach {
+    testLogging {
+        exceptionFormat = TestExceptionFormat.FULL
     }
 }

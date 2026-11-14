@@ -44,7 +44,6 @@ import platform.posix.socket
 import platform.posix.socklen_tVar
 import kotlin.concurrent.AtomicInt
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.coroutineContext
 
 internal const val LISTEN_BACKLOG = 128
 
@@ -72,6 +71,9 @@ internal actual suspend fun bindTcpListener(
  * make an accepting thread operate on a recycled descriptor. `accept` waits in `poll()` with a short
  * timeout instead of blocking in `accept()`: `shutdown()` on a listening socket wakes a blocked
  * `accept()` on Linux but not on macOS, while the poll loop notices close and cancellation on both.
+ * Each pending accept occupies one `Dispatchers.IO` thread without yielding it and wakes up ten
+ * times per second, so 64 pending accepts (the default size of `Dispatchers.IO`) starve all other IO
+ * work; see [PosixFileDescriptorTransport]. A `poll()` failure other than `EINTR` fails the accept.
  */
 @OptIn(ExperimentalForeignApi::class)
 internal class PosixListener(
@@ -88,10 +90,12 @@ internal class PosixListener(
     private val acceptors = AtomicInt(0)
 
     override suspend fun accept(): Transport =
-        withContext(Dispatchers.IO) {
+        openOnIo { context ->
+            // Counted before `closing` is checked, and close() sets `closing` before it checks the count, so the
+            // descriptor is never released while this accept can still use it.
             acceptors.incrementAndGet()
             try {
-                acceptBlocking(coroutineContext)
+                acceptBlocking(context)
             } finally {
                 acceptors.decrementAndGet()
                 releaseIfUnused()
@@ -105,6 +109,11 @@ internal class PosixListener(
             if (!waitReadable()) continue
             val client = accept(fd, null, null)
             if (client >= 0) {
+                // close() may have returned after the check above; it promises that a pending accept fails.
+                if (closing.value != 0) {
+                    close(client)
+                    throw TransportException("Listener is closed")
+                }
                 // A peer that closed its end must surface as EPIPE, not kill the process.
                 ignoreSigpipeOnce()
                 return adoptSocket(client)
@@ -122,16 +131,11 @@ internal class PosixListener(
 
     /** Returns true when the descriptor is readable (or hung up), false on timeout or EINTR. */
     private fun waitReadable(): Boolean =
-        memScoped {
-            val entry = alloc<pollfd>()
-            entry.fd = fd
-            entry.events = POLLIN.convert()
-            entry.revents = 0
-            val ready = pollOne(entry.ptr, ACCEPT_POLL_MILLIS)
-            if (ready < 0 && errno != EINTR && closing.value == 0) {
-                throw TransportException("Accept failed: ${posixErrorMessage(errno)}")
-            }
-            ready > 0
+        try {
+            pollFd(fd, POLLIN.convert(), ACCEPT_POLL_MILLIS)
+        } catch (e: PollFailedException) {
+            if (closing.value != 0) throw TransportException("Listener is closed")
+            throw TransportException("Accept failed: ${e.message}", e)
         }
 
     override suspend fun close() {

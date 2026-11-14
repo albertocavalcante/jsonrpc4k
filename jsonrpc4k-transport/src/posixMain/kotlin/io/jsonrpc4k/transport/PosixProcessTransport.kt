@@ -26,6 +26,7 @@ import kotlinx.coroutines.IO
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -42,6 +43,7 @@ import platform.posix.EINTR
 import platform.posix.ENOENT
 import platform.posix.ETIMEDOUT
 import platform.posix.FD_CLOEXEC
+import platform.posix.F_GETFL
 import platform.posix.F_SETFD
 import platform.posix.F_SETFL
 import platform.posix.O_DIRECTORY
@@ -288,7 +290,13 @@ internal class PosixProcessTransport private constructor(
     /** Returns the next chunk, [NO_DATA] after a poll slice without data, or null at EOF or after close. */
     private fun readStep(buffer: CPointer<ByteVar>): ByteArray? {
         if (closing.value != 0) return null
-        if (!pollFd(stdoutFd, POLLIN.convert(), POLL_MILLIS)) return NO_DATA
+        val readable =
+            try {
+                pollFd(stdoutFd, POLLIN.convert(), POLL_MILLIS)
+            } catch (e: PollFailedException) {
+                return failRead(e)
+            }
+        if (!readable) return NO_DATA
         val count = read(stdoutFd, buffer, BUFFER_SIZE.convert())
         return when {
             count > 0 -> ByteArray(count.toInt()) { buffer[it] }
@@ -298,12 +306,16 @@ internal class PosixProcessTransport private constructor(
             }
             else -> {
                 val err = errno
-                if (err == EINTR || err == EAGAIN) return NO_DATA
-                if (closing.value != 0) return null
-                eof.value = 1
-                failTransport("Read failed: ${posixErrorMessage(err)}")
+                if (err == EINTR || err == EAGAIN) NO_DATA else failRead(TransportException("Read failed: ${posixErrorMessage(err)}"))
             }
         }
+    }
+
+    /** Ends incoming: quietly once closing, otherwise by marking EOF and throwing [failure]. */
+    private fun failRead(failure: TransportException): ByteArray? {
+        if (closing.value != 0) return null
+        eof.value = 1
+        throw failure
     }
 
     override suspend fun send(data: ByteArray): Unit =
@@ -375,21 +387,65 @@ internal class PosixProcessTransport private constructor(
         scope.launch {
             memScoped {
                 val buffer = allocArray<ByteVar>(BUFFER_SIZE)
+                var pollFailed = false
+                var paced = false
                 while (true) {
-                    if (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
-                        if (exit.isCompleted) break else continue
+                    if (pollFailed) {
+                        // A blocking fallback read waits by itself; only non-blocking reads need the delay.
+                        if (paced) delay(POLL_MILLIS.toLong())
+                    } else {
+                        val readable = pollStderr(fd)
+                        if (readable == null) {
+                            // Retrying poll() would spin, and closing the pipe would make the child's next stderr
+                            // write fail with EPIPE or kill it with SIGPIPE. Fall back to non-blocking reads paced
+                            // by delay, ten per second, until EOF or until the child is gone and the pipe is quiet.
+                            // If fcntl fails, the pipe stays blocking and each read waits for data or EOF: that holds
+                            // one IO thread but loses no output and still never closes the child's stderr.
+                            pollFailed = true
+                            paced = makePipeNonBlocking(fd)
+                        } else if (!readable) {
+                            if (exit.isCompleted) break else continue
+                        }
                     }
-                    val count = read(fd, buffer, BUFFER_SIZE.convert())
-                    if (count > 0) {
-                        deliver(onData, ByteArray(count.toInt()) { buffer[it] })
-                    } else if (count == 0L || (errno != EINTR && errno != EAGAIN)) {
-                        break
-                    }
+                    if (!readStderr(fd, buffer, onData)) break
                 }
             }
             close(fd)
         }
     }
+
+    /** Adds `O_NONBLOCK` to the status flags of [fd], keeping the others; false when `fcntl` fails. */
+    private fun makePipeNonBlocking(fd: Int): Boolean {
+        val flags = fcntl(fd, F_GETFL)
+        return flags >= 0 && fcntl(fd, F_SETFL, flags or O_NONBLOCK) >= 0
+    }
+
+    /** Reads once from stderr and delivers what arrived; false at EOF, on a read error, or once quiet after exit. */
+    private fun readStderr(
+        fd: Int,
+        buffer: CPointer<ByteVar>,
+        onData: (ByteArray) -> Unit,
+    ): Boolean {
+        val count = read(fd, buffer, BUFFER_SIZE.convert())
+        val err = errno
+        return when {
+            count > 0 -> {
+                deliver(onData, ByteArray(count.toInt()) { buffer[it] })
+                true
+            }
+            count == 0L -> false
+            err == EAGAIN -> !exit.isCompleted
+            else -> err == EINTR
+        }
+    }
+
+    /** Waits one slice for stderr data: true when readable or hung up, false when quiet, null when poll() failed. */
+    private fun pollStderr(fd: Int): Boolean? =
+        try {
+            pollFd(fd, POLLIN.convert(), POLL_MILLIS)
+        } catch (ignored: PollFailedException) {
+            null
+        }
 
     companion object {
         /** Starts the child. Runs blocking system calls; call it on [Dispatchers.IO]. */
@@ -411,7 +467,9 @@ internal class PosixProcessTransport private constructor(
             if (reason != 0) {
                 fds.closeParentSide()
                 if (pid > 0) {
-                    if (reason == ETIMEDOUT) kill(pid, SIGKILL)
+                    // The child may still be running: it may have exec'd while the report timed out or poll or read
+                    // failed. It has not been reaped yet, so its pid cannot belong to another process.
+                    kill(pid, SIGKILL)
                     waitForExit(pid)
                 }
                 failTransport("Failed to start process ${command.first()}: ${posixErrorMessage(reason)}")
@@ -523,8 +581,12 @@ private fun readExecError(fd: Int): Int =
     memScoped {
         val deadlineSlices = EXEC_REPORT_TIMEOUT.inWholeMilliseconds / POLL_MILLIS
         var slices = 0L
-        while (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
-            if (++slices >= deadlineSlices) return@memScoped ETIMEDOUT
+        try {
+            while (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
+                if (++slices >= deadlineSlices) return@memScoped ETIMEDOUT
+            }
+        } catch (e: PollFailedException) {
+            return@memScoped e.errno
         }
         val box = alloc<IntVar>()
         var count: Long
@@ -555,19 +617,35 @@ private fun decodeStatus(status: Int): Int {
     return if (signal == 0) (status shr EXIT_SHIFT) and EXIT_MASK else SIGNAL_EXIT_BASE + signal
 }
 
-/** Waits up to [timeoutMillis] for [events] on [fd]; true when ready (readable, writable or hung up). */
+/** A `poll()` failure other than `EINTR`; [errno] is its reason. */
+internal class PollFailedException(
+    val errno: Int,
+) : TransportException("Poll failed: ${posixErrorMessage(errno)}")
+
+/**
+ * Waits up to [timeoutMillis] for [events] on [fd]; true when ready (readable, writable or hung up), false on timeout
+ * or when a signal interrupted the wait (`EINTR`), so the caller retries. Any other failure throws
+ * [PollFailedException]: it does not go away on retry, and retrying would spin. [poll] is the system call, replaced
+ * only by tests.
+ */
 @OptIn(ExperimentalForeignApi::class)
 internal fun pollFd(
     fd: Int,
     events: Int,
     timeoutMillis: Int,
+    poll: (CPointer<pollfd>, Int) -> Int = ::pollOne,
 ): Boolean =
     memScoped {
         val entry = alloc<pollfd>()
         entry.fd = fd
         entry.events = events.convert()
         entry.revents = 0
-        pollOne(entry.ptr, timeoutMillis) > 0
+        val ready = poll(entry.ptr, timeoutMillis)
+        if (ready < 0) {
+            val err = errno
+            if (err != EINTR) throw PollFailedException(err)
+        }
+        ready > 0
     }
 
 private fun deliver(

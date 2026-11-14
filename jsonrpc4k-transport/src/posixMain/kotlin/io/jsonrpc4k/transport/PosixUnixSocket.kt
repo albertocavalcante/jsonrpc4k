@@ -103,7 +103,7 @@ private fun connectUnix(
 
 @OptIn(ExperimentalForeignApi::class)
 internal actual suspend fun connectUnixSocket(path: String): Transport =
-    withContext(Dispatchers.IO) {
+    openOnIo {
         checkUnixPath(path)
         val fd = newUnixSocket()
         val failure = connectUnix(fd, path)

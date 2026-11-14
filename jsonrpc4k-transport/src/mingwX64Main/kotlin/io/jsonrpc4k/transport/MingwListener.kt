@@ -13,7 +13,12 @@ import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.value
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import platform.posix.POLLRDNORM
+import platform.posix.WSAECONNRESET
+import platform.posix.WSAEINTR
+import platform.posix.WSAEWOULDBLOCK
 import platform.posix.WSAGetLastError
 import platform.posix.closesocket
 import platform.posix.sockaddr_in
@@ -28,8 +33,12 @@ import platform.windows.getsockname
 import platform.windows.listen
 import platform.windows.socket
 import kotlin.concurrent.AtomicInt
+import kotlin.coroutines.CoroutineContext
 
 private const val LISTEN_BACKLOG = 128
+
+// How often a waiting accept wakes up to notice close() or coroutine cancellation.
+private const val ACCEPT_POLL_MILLIS = 100
 
 @OptIn(ExperimentalForeignApi::class)
 internal actual suspend fun bindTcpListener(
@@ -38,9 +47,15 @@ internal actual suspend fun bindTcpListener(
 ): TransportListener = MingwTcpListener.bind(host, port)
 
 /**
- * TCP listener over a Winsock listening socket. `closesocket` from another thread makes a blocked
- * `accept` fail with an error, which is how [close] wakes a pending [accept]. A pending accept is not
- * interrupted by coroutine cancellation on Windows; call [close] to release it.
+ * TCP listener over a non-blocking Winsock listening socket.
+ *
+ * [accept] waits in `WSAPoll()` slices of [ACCEPT_POLL_MILLIS] instead of blocking in `accept()`, so it notices
+ * [close] and coroutine cancellation within a slice. Each pending accept occupies one `Dispatchers.IO` thread without
+ * yielding it and wakes up ten times per second while no client connects, so 64 pending accepts (the default size
+ * of `Dispatchers.IO`) starve all other IO work; see [MingwSocketTransport]. The handle is only closed once no
+ * [accept] is using it, so a concurrent [close] can never make an accepting thread operate on a handle that Winsock
+ * has since reused for another socket; a port with a pending accept is therefore released within one slice after
+ * [close] returns.
  *
  * SO_REUSEADDR is deliberately not set: on Windows it lets another process steal the port, and
  * rebinding after a close does not need it.
@@ -50,31 +65,64 @@ internal class MingwTcpListener private constructor(
     private val handle: ULong,
     override val port: Int,
 ) : TransportListener {
-    // 0 = open, 1 = closed
-    private val closed = AtomicInt(0)
+    // 0 = open, 1 = close requested
+    private val closing = AtomicInt(0)
+
+    // 0 = handle still open, 1 = handle released
+    private val released = AtomicInt(0)
+
+    private val acceptors = AtomicInt(0)
 
     override suspend fun accept(): Transport =
-        withContext(Dispatchers.IO) {
-            if (closed.value != 0) throw TransportException("Listener is closed")
-            val client = accept(handle, null, null)
-            if (client == INVALID_SOCKET_VALUE) failAccept()
+        openOnIo { context ->
+            // Counted before `closing` is checked, and close() sets `closing` before it checks the count, so the
+            // handle is never released while this accept can still use it.
+            acceptors.incrementAndGet()
             try {
-                MingwSocketTransport(client)
-            } catch (e: TransportException) {
-                closesocket(client)
-                throw e
+                acceptBlocking(context)
+            } finally {
+                acceptors.decrementAndGet()
+                releaseIfUnused()
             }
         }
 
-    private fun failAccept(): Nothing {
-        if (closed.value != 0) throw TransportException("Listener is closed")
-        throw TransportException("Accept failed: socket error ${WSAGetLastError()}")
+    private fun acceptBlocking(context: CoroutineContext): MingwSocketTransport {
+        while (true) {
+            if (closing.value != 0) throw TransportException("Listener is closed")
+            context.ensureActive()
+            if (!pollSocket(handle, POLLRDNORM, ACCEPT_READY, ACCEPT_POLL_MILLIS)) continue
+            val client = accept(handle, null, null)
+            if (client != INVALID_SOCKET_VALUE) {
+                // close() may have returned after the check above; it promises that a pending accept fails.
+                if (closing.value != 0) {
+                    closesocket(client)
+                    throw TransportException("Listener is closed")
+                }
+                return adoptSocket(client)
+            }
+            checkAcceptError(WSAGetLastError())
+        }
+    }
+
+    private fun checkAcceptError(error: Int) {
+        if (closing.value != 0) throw TransportException("Listener is closed")
+        // The pending connection was reset before it was accepted, or another accept took it first.
+        if (error != WSAEWOULDBLOCK && error != WSAEINTR && error != WSAECONNRESET) {
+            throw TransportException("Accept failed: socket error $error")
+        }
     }
 
     override suspend fun close() {
-        // Called in place rather than through withContext, which would throw before the call when the caller is
-        // already cancelled and leave the port bound with the pending accept blocked.
-        if (closed.compareAndSet(0, 1)) closesocket(handle)
+        // Runs in place rather than through withContext, which would throw before the call when the caller is
+        // already cancelled and leave the port bound.
+        closing.compareAndSet(0, 1)
+        releaseIfUnused()
+    }
+
+    private fun releaseIfUnused() {
+        if (closing.value != 0 && acceptors.value == 0 && released.compareAndSet(0, 1)) {
+            closesocket(handle)
+        }
     }
 
     companion object {
@@ -131,6 +179,10 @@ internal class MingwTcpListener private constructor(
             ) {
                 throw TransportException("Failed to listen on $target: error ${WSAGetLastError()}")
             }
+            // accept() waits in WSAPoll slices, so it must never block on a connection that was reset meanwhile.
+            if (!setNonBlocking(handle)) {
+                throw TransportException("Failed to make the listener non-blocking: socket error ${WSAGetLastError()}")
+            }
         }
 
         private fun localPort(handle: ULong): Int =
@@ -145,3 +197,13 @@ internal class MingwTcpListener private constructor(
             }
     }
 }
+
+/** A transport that owns the accepted socket [client]; [client] is closed when the transport cannot be set up. */
+@OptIn(ExperimentalForeignApi::class)
+private fun adoptSocket(client: ULong): MingwSocketTransport =
+    try {
+        MingwSocketTransport(client)
+    } catch (e: TransportException) {
+        closesocket(client)
+        throw e
+    }

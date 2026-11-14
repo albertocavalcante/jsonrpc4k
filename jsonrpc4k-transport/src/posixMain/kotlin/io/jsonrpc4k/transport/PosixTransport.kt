@@ -88,6 +88,20 @@ private val NO_DATA = ByteArray(0)
  * in progress and any chunks that `flowOn` buffered ahead of it. An owned socket is non-blocking, so a write that
  * finds the send buffer full also waits in `POLLOUT` slices and outlives [close] by at most one slice.
  *
+ * Cost of the slices: a collector, or a send waiting for buffer space, occupies one [Dispatchers.IO] thread for as long
+ * as it waits and wakes up ten times per second while the peer is quiet. `Dispatchers.IO` allows 64 threads by
+ * default. A collector yields its thread after each quiet slice, so beyond 64 waiting collectors the slices take
+ * turns and latency grows. A send waiting for buffer space does not yield, and neither does a pending accept on a
+ * listener: 64 of them hold every `Dispatchers.IO` thread until they finish, which starves all other IO work. When
+ * the peer that would drain those sends is a reader in the same process that also needs `Dispatchers.IO`, that is a
+ * deadlock, not just added latency. A wake-up pipe alone would not fix this: [close] could write to it, but a
+ * cancelled collector has no public hook to do the same without an extra coroutine per wait, and every waiter would
+ * still occupy its thread. Freeing the threads needs one shared poller thread that resumes suspended readers and
+ * writers.
+ *
+ * A `poll()` failure other than `EINTR` ends [incoming] or fails [send] with [TransportException] instead of being
+ * retried.
+ *
  * [close] works from a cancelled coroutine and never waits on the peer. For a socket it shuts each direction down
  * separately, which signals EOF to the peer at once, and then closes the descriptor under the read and write locks,
  * so a concurrent read or write never reaches a descriptor number that the process has reused. EOF does not release
@@ -134,7 +148,13 @@ internal class PosixFileDescriptorTransport(
     /** Returns the next chunk, [NO_DATA] after a quiet poll slice, or null at EOF or once closed. */
     private fun readStep(buffer: CPointer<ByteVar>): ByteArray? {
         if (closing.value != 0 || eof.value != 0) return null
-        if (!pollFd(readFd, POLLIN.convert(), READ_POLL_MILLIS)) return NO_DATA
+        val readable =
+            try {
+                pollFd(readFd, POLLIN.convert(), READ_POLL_MILLIS)
+            } catch (e: PollFailedException) {
+                return failRead(e)
+            }
+        if (!readable) return NO_DATA
         val count = read(readFd, buffer, bufferSize.convert())
         return when {
             // Closing ends incoming quietly, including a read that returns only after close().
@@ -149,9 +169,14 @@ internal class PosixFileDescriptorTransport(
 
     private fun readFailure(err: Int): ByteArray? {
         if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK) return NO_DATA
+        return failRead(TransportException("Read failed: ${posixErrorMessage(err)}"))
+    }
+
+    /** Ends incoming: quietly once closing, otherwise by marking EOF and throwing [failure]. */
+    private fun failRead(failure: TransportException): ByteArray? {
         if (closing.value != 0) return null
         eof.value = 1
-        throw TransportException("Read failed: ${posixErrorMessage(err)}")
+        throw failure
     }
 
     override suspend fun send(data: ByteArray) {
@@ -235,7 +260,7 @@ internal class PosixSocketTransport internal constructor(
             host: String,
             port: Int,
         ): PosixSocketTransport =
-            withContext(Dispatchers.Default) {
+            openOnIo {
                 // A peer that closed its end must surface as EPIPE, not kill the process.
                 ignoreSigpipeOnce()
                 memScoped {
