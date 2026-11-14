@@ -82,12 +82,17 @@ private suspend fun spawnChild(
                 continuation.resumeWithException(TransportException("Failed to start process ${command.first()}", e))
                 return@suspendCancellableCoroutine
             }
-        child.once("error") { error: dynamic ->
+        // Permanent listeners from the moment of spawn: the coroutine resumes later, and an "error" from the
+        // child or its pipes in between (or a second one afterwards) must never go unhandled.
+        child.on("error") { error: dynamic ->
             if (continuation.isActive) {
                 continuation.resumeWithException(
                     TransportException("Failed to start process ${command.first()}: ${error?.message ?: error}"),
                 )
             }
+        }
+        for (stream in arrayOf(child.stdin, child.stdout, child.stderr)) {
+            if (stream != null && stream != undefined) stream.on("error") { _: dynamic -> }
         }
         child.once("spawn") { _: dynamic ->
             if (continuation.isActive) continuation.resume(child)
@@ -106,7 +111,6 @@ private fun drainStderr(
             // A failing callback must not stop draining, or the child could block on a full pipe.
         }
     }
-    stream.on("error") { _: dynamic -> }
 }
 
 /** Node.js [ProcessTransport] over `child_process.spawn` with piped stdin and stdout. */
@@ -125,9 +129,8 @@ internal class NodeProcessTransport(
         child.on("exit") { code: dynamic, signal: dynamic ->
             exit.complete(if (code != null) (code as Int) else SIGNAL_EXIT_BASE + signalNumber(signal as String))
         }
-        // Without listeners, a failed kill or write would be an uncaught exception.
-        child.on("error") { _: dynamic -> }
-        stdin.on("error") { _: dynamic -> }
+        // The "error" listeners on the child and its pipes were attached in spawnChild and stay for the whole
+        // lifetime; without them a failed kill or write would be an uncaught exception.
     }
 
     override val pid: Long = (child.pid as Int).toLong()

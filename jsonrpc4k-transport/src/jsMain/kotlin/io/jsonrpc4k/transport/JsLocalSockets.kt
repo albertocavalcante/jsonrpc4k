@@ -87,7 +87,7 @@ private suspend fun isServed(path: String): Boolean =
                 continuation.resume(true)
             }
         }
-        socket.once("error") { error: dynamic ->
+        socket.on("error") { error: dynamic ->
             if (!resolved) {
                 resolved = true
                 if (error?.code == ECONNREFUSED) {
