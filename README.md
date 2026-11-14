@@ -115,12 +115,18 @@ val connection = Connection(
   among themselves, on one lane beside the request handlers, so a running handler can observe them.
 - Each entry of a batch is dispatched as its own message under the same limits: request entries run
   concurrently and can be cancelled, notification entries are barriers (or control notifications), and
-  the batch is still answered with one array once every entry has finished.
-- When the transport reports EOF, call `connection.endInput()` before `close()`. It waits until the
-  requests already admitted are answered and their responses dequeued, so a peer that closes its output
-  right after its last request still gets the reply. After `drainTimeout` (default 5 s) it cancels what
-  remains and answers those requests with Request Cancelled (-32800). It returns at once when the
-  connection has already closed or failed, for example because the output side is gone.
+  the batch is still answered with one array once every entry has finished. The rules that fail the
+  connection also apply per entry: a batch with more notification entries than free queue slots, or
+  with a request id that repeats inside the batch or matches a request still active, fails the
+  connection instead of being answered.
+- When the transport reports EOF, call `connection.endInput()`, then `connection.flushOutgoing()`, then
+  `close()`. `endInput()` waits until the requests already admitted are answered and their responses
+  dequeued by the outgoing collector; `flushOutgoing()` waits until the collector has written them, so a
+  peer that closes its output right after its last request still gets the reply. After `drainTimeout`
+  (default 5 s) `endInput()` cancels what remains and offers Request Cancelled (-32800) for each request
+  still unanswered (inside its array for a batch entry) without waiting for it to be dequeued, which is
+  why the flush matters. It returns at once when the connection has already closed or failed, for
+  example because the output side is gone. Do not call it from a handler of the same connection.
 - A request that arrives with the queue full receives a server-busy error. A notification overflow or
   a duplicate active request id fails the connection (`Connection.state` becomes `Failed`).
 - `InboundResourceLimits` bounds the frame body, JSON nesting and queued application bytes.

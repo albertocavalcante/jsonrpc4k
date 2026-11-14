@@ -20,7 +20,10 @@ import kotlin.time.Duration.Companion.seconds
  * limits: a request entry takes a queue slot and a concurrency permit, can be cancelled, and is
  * answered with server busy when the queue is full, while a notification entry is a barrier or a
  * control notification. The batch is still answered with exactly one array, sent once every entry
- * has finished, and with nothing when it holds no request and no invalid entry.
+ * has finished, and with nothing when it holds no request and no invalid entry. The rules that fail
+ * the connection apply per entry too: a batch whose notification entries outnumber the free queue
+ * slots, or whose request entries repeat an id, among themselves or with any request still active,
+ * closes the connection with a [ConnectionState.Failed] cause instead of being answered.
  *
  * @param maxConcurrentRequests Maximum concurrently running request handlers, from 1 to 64.
  * @param maxQueuedMessages Maximum queued requests and notifications, from 1 to 1024.
@@ -31,6 +34,9 @@ import kotlin.time.Duration.Companion.seconds
  * admitted, in arrival order among themselves, on one lane that runs beside the request handlers,
  * so a running handler can observe it. They still count toward [maxQueuedMessages] and the inbound
  * byte budget while they wait. `$/cancelRequest` keeps its own handling whether or not it is listed.
+ * A connection copies this set when it is created, so changing a mutable set afterwards does not
+ * affect it; as in any data class, though, equality and the hash code read the set as it is now,
+ * so pass an immutable set.
  */
 public data class BoundedDispatchPolicy(
     val maxConcurrentRequests: Int,

@@ -63,7 +63,10 @@ internal interface DispatchOutput {
  * answered at admission through the control reserve, as a busy reply is.
  *
  * [endInput] stops admission and waits for the admitted work, bounded by
- * [BoundedDispatchPolicy.drainTimeout], and then cancels what remains.
+ * [BoundedDispatchPolicy.drainTimeout]. After the timeout it cancels the scheduler, the control lane
+ * and every request that is still unanswered; a reply that was already claimed, and every batch
+ * sender, still finishes, bounded by the connection, so a cancelled batch entry still reaches its
+ * array.
  */
 internal class BoundedDispatchPump(
     private val policy: BoundedDispatchPolicy,
@@ -100,8 +103,9 @@ internal class BoundedDispatchPump(
     private val connectionJob = checkNotNull(scope.coroutineContext[Job])
     private val work = SupervisorJob(connectionJob)
     private val workScope = CoroutineScope(scope.coroutineContext + work)
-    private val queued = Channel<Event>(policy.maxQueuedMessages, onUndeliveredElement = { it.reservation?.release() })
-    private val lane = Channel<Event.Notification>(policy.maxQueuedMessages, onUndeliveredElement = { it.reservation?.release() })
+    private val controlNotifications = policy.controlNotifications.toSet()
+    private val queued = Channel<Event>(policy.maxQueuedMessages, onUndeliveredElement = ::discard)
+    private val lane = Channel<Event.Notification>(policy.maxQueuedMessages, onUndeliveredElement = ::discard)
     private val bytes = ApplicationBytes(limits?.maxApplicationBodyBytes)
     internal val retainedApplicationBytes: Int get() = bytes.retained
     private val queueSlots = Semaphore(policy.maxQueuedMessages)
@@ -109,9 +113,12 @@ internal class BoundedDispatchPump(
     private val permits = Channel<Unit>(policy.maxConcurrentRequests)
     private val batchesInFlight = MutableStateFlow(0)
     private val closed = CompletableDeferred<Unit>()
-    private val drained = CompletableDeferred<Unit>()
+
+    /** Completed when the admitted work has drained or [abandon] gave up on it. */
+    private val settled = CompletableDeferred<Unit>()
     private val abandoned = MutableStateFlow(false)
     private var inputEnded = false
+    private var drain: Job? = null
 
     /** Whether a failure of pump work is still this pump's to report. */
     private val ownsFailures: Boolean get() = connectionJob.isActive && !abandoned.value
@@ -155,7 +162,9 @@ internal class BoundedDispatchPump(
     /**
      * Stops admission and waits until the admitted work is done: queued messages have run, and every
      * admitted request has been answered and its response dequeued. Returns at once when the pump is
-     * closed. When [BoundedDispatchPolicy.drainTimeout] elapses first, cancels what remains.
+     * closed or an earlier call already settled. When [BoundedDispatchPolicy.drainTimeout] elapses
+     * first, abandons what remains. Must not be called from a handler of this pump, which would wait
+     * for itself until the timeout.
      */
     suspend fun endInput() {
         admission.withLock {
@@ -163,23 +172,24 @@ internal class BoundedDispatchPump(
                 inputEnded = true
                 queued.close()
                 lane.close()
-                workScope.launch {
-                    scheduler.join()
-                    controlLane.join()
-                    batchesInFlight.first { it == 0 }
-                    requests.awaitEmpty()
-                    drained.complete(Unit)
-                }
+                drain =
+                    workScope.launch {
+                        scheduler.join()
+                        controlLane.join()
+                        batchesInFlight.first { it == 0 }
+                        requests.awaitEmpty()
+                        settled.complete(Unit)
+                    }
             }
         }
-        val settled =
+        val done =
             withTimeoutOrNull(policy.drainTimeout) {
                 select<Unit> {
-                    drained.onAwait { }
+                    settled.onAwait { }
                     closed.onAwait { }
                 }
             }
-        if (settled == null && !drained.isCompleted) abandon()
+        if (done == null && !settled.isCompleted) abandon()
     }
 
     fun close() {
@@ -194,13 +204,27 @@ internal class BoundedDispatchPump(
 
     fun outputInterrupted(cause: Throwable) = output.fail(cause)
 
-    /** Cancels every admitted request as a `$/cancelRequest` would, then all remaining pump work. */
+    /**
+     * Gives up on the drain: cancels the scheduler, the control lane and the queued messages, and then
+     * every admitted request that is still unanswered, as a `$/cancelRequest` would. Request workers
+     * that already claimed their reply and batch senders are left to finish, bounded by the
+     * connection, so replies already produced and every batch array still reach the outgoing queue.
+     */
     private fun abandon() {
-        abandoned.value = true
-        requests.ids.forEach(::cancelRequest)
-        work.cancel()
+        if (!abandoned.compareAndSet(false, true)) return
+        drain?.cancel()
+        scheduler.cancel()
+        controlLane.cancel()
         queued.cancel()
         lane.cancel()
+        requests.ids.forEach(::cancelRequest)
+        settled.complete(Unit)
+    }
+
+    /** Releases a message that never ran; a notification batch entry has nothing to put in the array. */
+    private fun discard(event: Event) {
+        event.reservation?.release()
+        if (event is Event.Notification) event.slot?.complete(null)
     }
 
     private fun admit(
@@ -231,7 +255,7 @@ internal class BoundedDispatchPump(
             is NotificationMessage ->
                 when (message.method) {
                     Dispatcher.CANCEL_REQUEST_METHOD -> cancelledRequestId(message.params)?.let(::cancelRequest)
-                    in policy.controlNotifications -> admitNotification(lane, message, bodyBytes, slot)
+                    in controlNotifications -> admitNotification(lane, message, bodyBytes, slot)
                     else -> admitNotification(queued, message, bodyBytes, slot)
                 }
         }

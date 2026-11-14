@@ -1,6 +1,7 @@
 package io.jsonrpc4k.core
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -127,6 +128,110 @@ class BoundedDispatchLifecycleTest {
             assertTrue(frames.isEmpty)
             assertFalse(queuedStarted)
             assertEquals(ConnectionState.Open, connection.state.value)
+            // A later call does not wait for the timeout again.
+            val again = currentTime
+            connection.endInput()
+            assertEquals(again, currentTime)
+            connection.close()
+        }
+
+    @Test
+    fun `drain timeout still sends a batch as one array with the stuck entry cancelled`() =
+        runTest {
+            val policy = BoundedDispatchPolicy(2, 8, drainTimeout = 2.seconds)
+            val modes =
+                listOf<(CoroutineScope) -> Connection>(
+                    { scope -> Connection(policy, scope = scope) },
+                    { scope ->
+                        Connection(
+                            policy,
+                            InboundResourceLimits(maxFrameBodyBytes = 65_536, maxJsonNesting = 32, maxApplicationBodyBytes = 65_536),
+                            OutboundResourceLimits(65_536, 65_536, 8, 8, 65_536, 4, 10_000, 32),
+                            scope,
+                        )
+                    },
+                )
+            for (connect in modes) {
+                val connection = connect(backgroundScope)
+                val frames = backgroundScope.outgoingFrames(connection)
+                val entered = CompletableDeferred<Unit>()
+                val observed = CompletableDeferred<Unit>()
+                val notes = mutableListOf<JsonElement?>()
+                connection.onRequest("slow", runUntilCancelled(entered, observed))
+                connection.onRequest("echo") { params: JsonElement? -> params }
+                connection.onNotification("note") { params: JsonElement? -> notes.add(params) }
+                connection.receive(wireFrame(STUCK_BATCH))
+                withTimeout(1.seconds) { entered.await() }
+                runCurrent()
+                assertTrue(frames.isEmpty, "the array waits for the stuck entry")
+                val start = currentTime
+                connection.endInput()
+                assertEquals(2_000L, currentTime - start)
+                withTimeout(1.seconds) { observed.await() }
+                val reply = assertIs<JsonArray>(wireJson(frames.nextFrame()))
+                val byId = reply.associateBy { it.jsonObject.getValue("id") }
+                assertEquals(4, reply.size)
+                assertEquals(setOf(JsonPrimitive(1), JsonPrimitive("slow"), JsonPrimitive(2), JsonNull), byId.keys)
+                assertEquals(JsonPrimitive("a"), byId.getValue(JsonPrimitive(1)).jsonObject["result"])
+                assertEquals(ResponseError.REQUEST_CANCELLED, byId.getValue(JsonPrimitive("slow")).errorCode())
+                assertEquals(JsonPrimitive("b"), byId.getValue(JsonPrimitive(2)).jsonObject["result"])
+                assertEquals(ResponseError.INVALID_REQUEST, byId.getValue(JsonNull).errorCode())
+                assertEquals(listOf<JsonElement?>(JsonPrimitive("n")), notes)
+                connection.flushOutgoing()
+                runCurrent()
+                assertTrue(frames.isEmpty, "a batch is answered with exactly one frame")
+                assertEquals(ConnectionState.Open, connection.state.value)
+                connection.close()
+            }
+        }
+
+    @Test
+    fun `a batch that repeats a request id fails the connection`() =
+        runTest {
+            val connection = Connection(BoundedDispatchPolicy(2, 8), scope = backgroundScope)
+            connection.onRequest("echo") { params: JsonElement? -> params }
+            val frame = wireFrame("""[{"jsonrpc":"2.0","method":"echo","id":1},{"jsonrpc":"2.0","method":"echo","id":1}]""")
+            assertTrue(runCatching { connection.receive(frame) }.isFailure)
+            val failed = assertIs<ConnectionState.Failed>(connection.state.value)
+            assertEquals("Duplicate active incoming request ID", failed.cause.message)
+        }
+
+    @Test
+    fun `a batch with more notifications than free queue slots fails the connection`() =
+        runTest {
+            val connection = Connection(BoundedDispatchPolicy(1, 1), scope = backgroundScope)
+            connection.onNotification("note") { _: JsonElement? -> }
+            val frame = wireFrame("""[{"jsonrpc":"2.0","method":"note"},{"jsonrpc":"2.0","method":"note"}]""")
+            assertTrue(runCatching { connection.receive(frame) }.isFailure)
+            val failed = assertIs<ConnectionState.Failed>(connection.state.value)
+            assertEquals("Incoming ordered queue is full or closed", failed.cause.message)
+        }
+
+    @Test
+    fun `changing the control set after the connection is created has no effect`() =
+        runTest {
+            val control = mutableSetOf("control")
+            val connection = Connection(BoundedDispatchPolicy(1, 4, controlNotifications = control), scope = backgroundScope)
+            control.clear()
+            control.add("ordinary")
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val order = mutableListOf<String>()
+            connection.onRequest("wait") { _: JsonElement? ->
+                entered.complete(Unit)
+                release.await()
+                null
+            }
+            connection.onNotification("control") { _: JsonElement? -> order.add("control") }
+            connection.onNotification("ordinary") { _: JsonElement? -> order.add("ordinary") }
+            backgroundScope.outgoingFrames(connection)
+            connection.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
+            withTimeout(1.seconds) { entered.await() }
+            connection.receive(codec.encode(NotificationMessage("ordinary")))
+            connection.receive(codec.encode(NotificationMessage("control")))
+            runCurrent()
+            assertEquals(listOf("control"), order)
+            release.complete(Unit)
             connection.close()
         }
 
@@ -357,6 +462,11 @@ class BoundedDispatchLifecycleTest {
         const val MIXED_BATCH =
             """[{"jsonrpc":"2.0","method":"slow","id":"slow"},{"jsonrpc":"2.0","method":"note","params":"n"},""" +
                 """{"jsonrpc":"2.0","method":"echo","params":"b","id":2},7]"""
+
+        /** A quick request, a notification, a request that never finishes, another quick request and an invalid entry. */
+        const val STUCK_BATCH =
+            """[{"jsonrpc":"2.0","method":"echo","params":"a","id":1},{"jsonrpc":"2.0","method":"note","params":"n"},""" +
+                """{"jsonrpc":"2.0","method":"slow","id":"slow"},{"jsonrpc":"2.0","method":"echo","params":"b","id":2},7]"""
 
         /** The bounded dispatch modes: without limits, and with inbound and outbound resource limits. */
         val boundedModes = dispatchModes.drop(1)
