@@ -332,7 +332,14 @@ public class JsonRpcMessageDecoder(
             ?: throw JsonRpcProtocolException("Invalid Content-Length header")
     }
 
-    /** Rejects a Content-Type header that declares any charset other than UTF-8 (or legacy utf8). */
+    /**
+     * Rejects a Content-Type header that declares any charset other than UTF-8 (or legacy utf8).
+     *
+     * Parameters are split on semicolons without honouring quoted strings. That is sufficient for
+     * LSP, whose Content-Type is a media type plus an optional charset; a quoted parameter value
+     * containing a semicolon is not supported. Every Content-Type header and every charset
+     * parameter present is validated, so the strictest one wins.
+     */
     private fun validateContentTypeCharset(headerSection: String) {
         for (line in headerSection.split(JsonRpcCodec.LINE_DELIMITER)) {
             val trimmed = line.trim()

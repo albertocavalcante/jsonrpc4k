@@ -538,13 +538,14 @@ class CodecTest {
     @Test
     fun `decode rejects non utf8 charsets`() {
         listOf(
-            "application/vscode-jsonrpc; charset=latin1",
-            "application/vscode-jsonrpc; charset=\"iso-8859-1\"",
-            "application/vscode-jsonrpc; charset=utf-16",
-            "application/vscode-jsonrpc; charset=",
-            "application/vscode-jsonrpc; charset=utf-80",
-        ).forEach { ct ->
-            assertFailsWith<JsonRpcProtocolException> { decodeWithContentType(ct) }.message shouldContain "charset"
+            "application/vscode-jsonrpc; charset=latin1" to "latin1",
+            "application/vscode-jsonrpc; charset=\"iso-8859-1\"" to "iso-8859-1",
+            "application/vscode-jsonrpc; charset=utf-16" to "utf-16",
+            "application/vscode-jsonrpc; charset=" to "",
+            "application/vscode-jsonrpc; charset=utf-80" to "utf-80",
+        ).forEach { (ct, value) ->
+            val message = assertFailsWith<JsonRpcProtocolException> { decodeWithContentType(ct) }.message
+            message shouldContain "Unsupported Content-Type charset: $value"
         }
     }
 
