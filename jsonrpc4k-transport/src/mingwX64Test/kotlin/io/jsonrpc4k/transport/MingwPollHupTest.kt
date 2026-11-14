@@ -2,14 +2,11 @@ package io.jsonrpc4k.transport
 
 import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
-import kotlinx.cinterop.reinterpret
-import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.value
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -29,12 +26,9 @@ import platform.windows.FILETIME
 import platform.windows.GetCurrentProcess
 import platform.windows.GetProcessTimes
 import platform.windows.SOCK_STREAM
-import platform.windows.SOL_SOCKET
-import platform.windows.SO_RCVBUF
 import platform.windows.connect
 import platform.windows.freeaddrinfo
 import platform.windows.getaddrinfo
-import platform.windows.setsockopt
 import platform.windows.socket
 import kotlin.test.Test
 import kotlin.test.assertTrue
@@ -50,8 +44,6 @@ private const val CPU_BUDGET_MILLIS = MEASURE_MILLIS / 2
 
 // Far more than loopback send and receive buffers hold, so the send keeps waiting while the peer does not read.
 private const val FLOOD_BYTES = 64 * 1024 * 1024
-
-private const val PEER_RECEIVE_BUFFER_BYTES = 4096
 
 private const val FILETIME_TICKS_PER_MILLI = 10_000L
 private const val HIGH_WORD_SHIFT = 32
@@ -123,12 +115,6 @@ private fun connectPlainSocket(port: Int): ULong =
         try {
             val handle = socket(info.pointed.ai_family, info.pointed.ai_socktype, info.pointed.ai_protocol)
             check(handle != INVALID_SOCKET_VALUE) { "socket failed" }
-            // A small receive window, set before connecting, keeps Windows from absorbing the whole flood.
-            val size = alloc<IntVar>()
-            size.value = PEER_RECEIVE_BUFFER_BYTES
-            check(setsockopt(handle, SOL_SOCKET, SO_RCVBUF, size.ptr.reinterpret(), sizeOf<IntVar>().convert()) == 0) {
-                "setsockopt failed"
-            }
             check(connect(handle, info.pointed.ai_addr, info.pointed.ai_addrlen.convert()) == 0) { "connect failed" }
             handle
         } finally {
