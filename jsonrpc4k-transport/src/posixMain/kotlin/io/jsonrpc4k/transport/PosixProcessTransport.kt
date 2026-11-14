@@ -402,17 +402,29 @@ internal class PosixProcessTransport private constructor(
                             if (exit.isCompleted) break else continue
                         }
                     }
-                    val count = read(fd, buffer, BUFFER_SIZE.convert())
-                    val err = errno
-                    when {
-                        count > 0 -> deliver(onData, ByteArray(count.toInt()) { buffer[it] })
-                        count == 0L -> break
-                        err == EAGAIN -> if (exit.isCompleted) break
-                        err != EINTR -> break
-                    }
+                    if (!readStderr(fd, buffer, onData)) break
                 }
             }
             close(fd)
+        }
+    }
+
+    /** Reads once from stderr and delivers what arrived; false at EOF, on a read error, or once quiet after exit. */
+    private fun readStderr(
+        fd: Int,
+        buffer: CPointer<ByteVar>,
+        onData: (ByteArray) -> Unit,
+    ): Boolean {
+        val count = read(fd, buffer, BUFFER_SIZE.convert())
+        val err = errno
+        return when {
+            count > 0 -> {
+                deliver(onData, ByteArray(count.toInt()) { buffer[it] })
+                true
+            }
+            count == 0L -> false
+            err == EAGAIN -> !exit.isCompleted
+            else -> err == EINTR
         }
     }
 
