@@ -554,7 +554,9 @@ private class AdmittedRequests {
     val ids: Set<RequestId> get() = state.value.requests.keys
 
     /** The reply handoffs of the tracked requests; each completes once its reply is queued or settled. */
-    val replies: List<CompletableDeferred<Unit>> get() = state.value.requests.values.map { it.replyDone }
+    val replies: List<CompletableDeferred<Unit>> get() =
+        state.value.requests.values
+            .map { it.replyDone }
 
     suspend fun awaitEmpty() {
         state.first { it.requests.isEmpty() }
