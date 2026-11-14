@@ -233,6 +233,7 @@ class PerformanceTest {
     fun `dispatcher lookup with many registered handlers`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val handlerCount = 100
 
             // Register many handlers
@@ -254,7 +255,7 @@ class PerformanceTest {
                                 id = RequestId.of(i.toLong()),
                                 method = "method$methodIndex",
                             )
-                        val response = dispatcher.dispatch(request)
+                        val response = peer.dispatch(request)
                         if (response != null) responseCount++
                     }
                 }
@@ -270,6 +271,7 @@ class PerformanceTest {
     fun `dispatcher with typed handlers - serialization overhead`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             @kotlinx.serialization.Serializable
             data class TestParams(
@@ -306,7 +308,7 @@ class PerformanceTest {
                                         put("name", "user$i")
                                     },
                             )
-                        val response = dispatcher.dispatch(request)
+                        val response = peer.dispatch(request)
                         if (response?.error == null) successCount++
                     }
                 }
@@ -416,6 +418,7 @@ class PerformanceTest {
     fun `concurrent request dispatch - measure contention`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var handlerCallCount = 0
             val countMutex = kotlinx.coroutines.sync.Mutex()
 
@@ -437,7 +440,7 @@ class PerformanceTest {
                                             id = RequestId.of(i.toLong()),
                                             method = "test/concurrent",
                                         )
-                                    dispatcher.dispatch(request)
+                                    peer.dispatch(request)
                                 }
                             }
                         jobs.awaitAll()
@@ -455,6 +458,7 @@ class PerformanceTest {
     fun `pending request management under load`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val requestCount = 10_000
 
             // Register many pending requests
@@ -462,7 +466,7 @@ class PerformanceTest {
             val registerDuration =
                 measureTime {
                     repeat(requestCount) { i ->
-                        deferreds.add(dispatcher.registerPendingRequest(RequestId.of(i.toLong())))
+                        deferreds.add(peer.registerPendingRequest(RequestId.of(i.toLong())))
                     }
                 }
 
@@ -475,7 +479,7 @@ class PerformanceTest {
                                 id = RequestId.of(i.toLong()),
                                 result = JsonPrimitive("result$i"),
                             )
-                        dispatcher.dispatch(response)
+                        peer.dispatch(response)
                     }
                 }
 

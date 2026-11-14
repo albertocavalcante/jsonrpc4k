@@ -86,9 +86,9 @@ class ConnectionTest {
             val connection = Connection()
             val request = launch { connection.request<JsonPrimitive>("never", null) }
             runCurrent()
-            connection.dispatcher.pending.count shouldBe 1
+            connection.peer.pending.count shouldBe 1
             request.cancelAndJoin()
-            connection.dispatcher.pending.count shouldBe 0
+            connection.peer.pending.count shouldBe 0
             connection.close()
         }
 
@@ -100,10 +100,10 @@ class ConnectionTest {
             repeat(64) { connection.notify("fill", null) }
             val request = launch { runCatching { connection.request<JsonPrimitive>("never", null) } }
             runCurrent()
-            connection.dispatcher.pending.count shouldBe 1
+            connection.peer.pending.count shouldBe 1
             connection.close()
             request.join()
-            connection.dispatcher.pending.count shouldBe 0
+            connection.peer.pending.count shouldBe 0
             assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
         }
 
@@ -111,17 +111,18 @@ class ConnectionTest {
     fun `cancel all remains reusable while close seals the registry`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val id = RequestId.of(1)
-            val first = dispatcher.registerPendingRequest(id)
-            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
-            dispatcher.cancelAllPendingRequests()
+            val first = peer.registerPendingRequest(id)
+            assertFailsWith<IllegalStateException> { peer.registerPendingRequest(id) }
+            peer.cancelAllPendingRequests()
             first.isCancelled shouldBe true
-            val second = dispatcher.registerPendingRequest(id)
-            dispatcher.pending.cancel(id, first)
-            dispatcher.pending.count shouldBe 1
-            dispatcher.pending.close()
+            val second = peer.registerPendingRequest(id)
+            peer.pending.cancel(id, first)
+            peer.pending.count shouldBe 1
+            peer.pending.close()
             second.isCancelled shouldBe true
-            assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(id) }
+            assertFailsWith<IllegalStateException> { peer.registerPendingRequest(id) }
         }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -132,10 +133,10 @@ class ConnectionTest {
             val connection = Connection(scope = CoroutineScope(parent))
             val request = launch { connection.request<JsonPrimitive>("never", null) }
             runCurrent()
-            connection.dispatcher.pending.count shouldBe 1
+            connection.peer.pending.count shouldBe 1
             parent.cancel()
             request.join()
-            connection.dispatcher.pending.count shouldBe 0
+            connection.peer.pending.count shouldBe 0
             assertFailsWith<IllegalStateException> { connection.request<JsonPrimitive>("closed", null) }
         }
 
@@ -144,13 +145,14 @@ class ConnectionTest {
         runTest {
             repeat(100) {
                 val dispatcher = Dispatcher()
-                val registration = async(Dispatchers.Default) { runCatching { dispatcher.registerPendingRequest(RequestId.of(1)) } }
-                val close = async(Dispatchers.Default) { dispatcher.pending.close() }
+                val peer = dispatcher.newPeer()
+                val registration = async(Dispatchers.Default) { runCatching { peer.registerPendingRequest(RequestId.of(1)) } }
+                val close = async(Dispatchers.Default) { peer.pending.close() }
                 val deferred = registration.await().getOrNull()
                 close.await()
-                dispatcher.pending.count shouldBe 0
+                peer.pending.count shouldBe 0
                 if (deferred != null) deferred.isCancelled shouldBe true
-                assertFailsWith<IllegalStateException> { dispatcher.registerPendingRequest(RequestId.of(2)) }
+                assertFailsWith<IllegalStateException> { peer.registerPendingRequest(RequestId.of(2)) }
             }
         }
 
@@ -180,7 +182,7 @@ class ConnectionTest {
             val connection = Connection()
             val error = assertFailsWith<JsonRpcException> { connection.request<JsonPrimitive>("never", null, 10.milliseconds) }
             error.code shouldBe ResponseError.REQUEST_CANCELLED
-            connection.dispatcher.pending.count shouldBe 0
+            connection.peer.pending.count shouldBe 0
             connection.close()
         }
 
@@ -193,7 +195,7 @@ class ConnectionTest {
                     connection.request<JsonPrimitive>("never", null)
                 }
             }
-            connection.dispatcher.pending.count shouldBe 0
+            connection.peer.pending.count shouldBe 0
             connection.close()
         }
 

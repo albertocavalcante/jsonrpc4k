@@ -34,22 +34,24 @@ class CancellationTest {
     fun `cancel request stops a running handler and answers request cancelled`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             val observed = CompletableDeferred<Unit>()
             dispatcher.onRequest("slow", runUntilCancelled(entered, observed))
-            val response = async { dispatcher.dispatch(RequestMessage(RequestId.of(1), "slow")) }
+            val response = async { peer.dispatch(RequestMessage(RequestId.of(1), "slow")) }
             entered.await()
-            assertEquals(1, dispatcher.inbound.count)
-            assertNull(dispatcher.dispatch(cancel(RequestId.of(1))))
+            assertEquals(1, peer.inbound.count)
+            assertNull(peer.dispatch(cancel(RequestId.of(1))))
             assertEquals(ResponseMessage.error(RequestId.of(1), ResponseError.requestCancelled()), response.await())
             assertTrue(observed.isCompleted)
-            assertEquals(0, dispatcher.inbound.count)
+            assertEquals(0, peer.inbound.count)
         }
 
     @Test
     fun `cancel request for an unknown or malformed id leaves the handler running`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
             dispatcher.onRequest(
@@ -60,7 +62,7 @@ class CancellationTest {
                     JsonPrimitive("done")
                 },
             )
-            val response = async { dispatcher.dispatch(RequestMessage(RequestId.of(1), "wait")) }
+            val response = async { peer.dispatch(RequestMessage(RequestId.of(1), "wait")) }
             entered.await()
             val ignored =
                 listOf(
@@ -69,8 +71,8 @@ class CancellationTest {
                     NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD),
                     NotificationMessage(Dispatcher.CANCEL_REQUEST_METHOD, JsonObject(mapOf("id" to JsonPrimitive(true)))),
                 )
-            ignored.forEach { assertNull(dispatcher.dispatch(it)) }
-            assertEquals(1, dispatcher.inbound.count)
+            ignored.forEach { assertNull(peer.dispatch(it)) }
+            assertEquals(1, peer.inbound.count)
             release.complete(Unit)
             assertEquals(ResponseMessage.success(RequestId.of(1), JsonPrimitive("done")), response.await())
         }
@@ -79,16 +81,17 @@ class CancellationTest {
     fun `inbound cancel never completes an outbound waiter with the same id`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val id = RequestId.of(7)
-            val waiter = dispatcher.registerPendingRequest(id)
+            val waiter = peer.registerPendingRequest(id)
             val entered = CompletableDeferred<Unit>()
             dispatcher.onRequest("slow", runUntilCancelled(entered))
-            val incoming = async { dispatcher.dispatch(RequestMessage(id, "slow")) }
+            val incoming = async { peer.dispatch(RequestMessage(id, "slow")) }
             entered.await()
-            dispatcher.dispatch(cancel(id))
+            peer.dispatch(cancel(id))
             assertEquals(ResponseError.REQUEST_CANCELLED, incoming.await()?.error?.code)
             assertTrue(waiter.isActive)
-            dispatcher.dispatch(ResponseMessage.success(id, JsonPrimitive("outbound")))
+            peer.dispatch(ResponseMessage.success(id, JsonPrimitive("outbound")))
             assertEquals(JsonPrimitive("outbound"), waiter.await())
         }
 
@@ -96,6 +99,7 @@ class CancellationTest {
     fun `cancelled handler may answer with its own error`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             val partial = JsonPrimitive("partial")
             dispatcher.onRequest(
@@ -109,9 +113,9 @@ class CancellationTest {
                     }
                 },
             )
-            val response = async { dispatcher.dispatch(RequestMessage(RequestId.of(3), "partial")) }
+            val response = async { peer.dispatch(RequestMessage(RequestId.of(3), "partial")) }
             entered.await()
-            dispatcher.dispatch(cancel(RequestId.of(3)))
+            peer.dispatch(cancel(RequestId.of(3)))
             assertEquals(ResponseError(ResponseError.REQUEST_CANCELLED, "Stopped early", partial), response.await()?.error)
         }
 
@@ -119,6 +123,7 @@ class CancellationTest {
     fun `a value returned after cancellation is discarded`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             dispatcher.onRequest(
                 "stubborn",
@@ -131,9 +136,9 @@ class CancellationTest {
                     }
                 },
             )
-            val response = async { dispatcher.dispatch(RequestMessage(RequestId.of(5), "stubborn")) }
+            val response = async { peer.dispatch(RequestMessage(RequestId.of(5), "stubborn")) }
             entered.await()
-            dispatcher.dispatch(cancel(RequestId.of(5)))
+            peer.dispatch(cancel(RequestId.of(5)))
             assertEquals(ResponseMessage.error(RequestId.of(5), ResponseError.requestCancelled()), response.await())
         }
 
@@ -141,21 +146,23 @@ class CancellationTest {
     fun `caller cancellation wins over a remote cancellation`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             dispatcher.onRequest("slow", runUntilCancelled(entered))
             val outcome = CompletableDeferred<Result<ResponseMessage?>>()
-            val caller = launch { outcome.complete(runCatching { dispatcher.dispatch(RequestMessage(RequestId.of(4), "slow")) }) }
+            val caller = launch { outcome.complete(runCatching { peer.dispatch(RequestMessage(RequestId.of(4), "slow")) }) }
             entered.await()
-            dispatcher.dispatch(cancel(RequestId.of(4)))
+            peer.dispatch(cancel(RequestId.of(4)))
             caller.cancel()
             assertIs<CancellationException>(outcome.await().exceptionOrNull())
-            assertEquals(0, dispatcher.inbound.count)
+            assertEquals(0, peer.inbound.count)
         }
 
     @Test
     fun `cancelled id may be reused while the old handler is still finishing`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val oldEntered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
             dispatcher.onRequest(
@@ -172,18 +179,18 @@ class CancellationTest {
             val newEntered = CompletableDeferred<Unit>()
             dispatcher.onRequest("new", runUntilCancelled(newEntered))
             val id = RequestId.of("same")
-            val old = async { dispatcher.dispatch(RequestMessage(id, "old")) }
+            val old = async { peer.dispatch(RequestMessage(id, "old")) }
             oldEntered.await()
-            dispatcher.dispatch(cancel(id))
-            val new = async { dispatcher.dispatch(RequestMessage(id, "new")) }
+            peer.dispatch(cancel(id))
+            val new = async { peer.dispatch(RequestMessage(id, "new")) }
             newEntered.await()
             release.complete(Unit)
             assertEquals(ResponseError.REQUEST_CANCELLED, old.await()?.error?.code)
             // The old handler finished last, but the reused id still names the new one.
-            assertEquals(1, dispatcher.inbound.count)
-            dispatcher.dispatch(cancel(id))
+            assertEquals(1, peer.inbound.count)
+            peer.dispatch(cancel(id))
             assertEquals(ResponseError.REQUEST_CANCELLED, new.await()?.error?.code)
-            assertEquals(0, dispatcher.inbound.count)
+            assertEquals(0, peer.inbound.count)
         }
 
     @Test
@@ -231,7 +238,7 @@ class CancellationTest {
                 call.cancel()
                 assertEquals(cancel(RequestId.of(1)), decode(frames.nextFrame()))
                 assertFailsWith<CancellationException> { call.await() }
-                assertEquals(0, connection.dispatcher.pending.count)
+                assertEquals(0, connection.peer.pending.count)
                 // A late response finds no waiter and is ignored.
                 connection.receive(codec.encode(ResponseMessage.success(RequestId.of(1), JsonPrimitive("late"))))
                 assertEquals(ConnectionState.Open, connection.state.value)
@@ -249,7 +256,7 @@ class CancellationTest {
                 assertEquals(ResponseError.REQUEST_CANCELLED, error.code)
                 assertEquals(RequestId.of(1), assertIs<RequestMessage>(decode(frames.nextFrame())).id)
                 assertEquals(cancel(RequestId.of(1)), decode(frames.nextFrame()))
-                assertEquals(0, connection.dispatcher.pending.count)
+                assertEquals(0, connection.peer.pending.count)
                 connection.close()
             }
         }
@@ -277,13 +284,13 @@ class CancellationTest {
             // Nothing collects yet, so these fill the outgoing queue and the request waits to be queued.
             repeat(64) { connection.notify("fill", null) }
             val call = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("late", null) }
-            assertEquals(1, connection.dispatcher.pending.count)
+            assertEquals(1, connection.peer.pending.count)
             call.cancel()
             // Drain the queue before the caller's finally block runs, so a wrongly sent cancellation would fit.
             val frames = Channel<ByteArray>(Channel.UNLIMITED)
             backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { connection.outgoing.collect { frames.send(it) } }
             runCurrent()
-            assertEquals(0, connection.dispatcher.pending.count)
+            assertEquals(0, connection.peer.pending.count)
             repeat(64) { assertEquals("fill", assertIs<NotificationMessage>(decode(frames.nextFrame())).method) }
             assertTrue(frames.tryReceive().isFailure)
             connection.close()
@@ -303,7 +310,7 @@ class CancellationTest {
             val call = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.request<JsonElement>("slow", null) }
             call.cancel()
             runCurrent()
-            assertEquals(0, connection.dispatcher.pending.count)
+            assertEquals(0, connection.peer.pending.count)
             // The cancellation found no capacity and was dropped, so the single producer slot is still free.
             val after = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { connection.notify("after", null) }
             assertTrue(after.isActive)

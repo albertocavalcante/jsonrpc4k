@@ -465,6 +465,7 @@ class BoundedDispatchTest {
             val job = SupervisorJob(backgroundScope.coroutineContext[Job])
             val scope = CoroutineScope(backgroundScope.coroutineContext + job)
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val entered = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
             val notification = CompletableDeferred<Unit>()
@@ -486,7 +487,10 @@ class BoundedDispatchTest {
                         offered.add(response)
                     }
 
-                    override suspend fun sendBatch(responses: List<ResponseMessage>): Unit = error("Unexpected batch: $responses")
+                    override suspend fun sendBatch(
+                        responses: List<ResponseMessage>,
+                        onDequeued: () -> Unit,
+                    ): Unit = error("Unexpected batch: $responses")
 
                     override fun offer(
                         response: ResponseMessage,
@@ -502,7 +506,7 @@ class BoundedDispatchTest {
 
                     override fun fail(cause: Throwable): Unit = throw cause
                 }
-            val pump = BoundedDispatchPump(policy, JsonRpcMessageDecoder(codec), dispatcher, scope, output)
+            val pump = BoundedDispatchPump(policy, JsonRpcMessageDecoder(codec), dispatcher.newPeer(), scope, output)
             pump.receive(codec.encode(RequestMessage(RequestId.of(1), "wait")))
             withTimeout(1.seconds) { entered.await() }
             pump.receive(codec.encode(NotificationMessage("barrier")))
@@ -519,6 +523,7 @@ class BoundedDispatchTest {
             val job = SupervisorJob(backgroundScope.coroutineContext[Job])
             val scope = CoroutineScope(backgroundScope.coroutineContext + job)
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val secondSent = CompletableDeferred<Unit>()
             val releaseFirst = CompletableDeferred<Unit>()
             var terminal: Throwable? = null
@@ -540,7 +545,10 @@ class BoundedDispatchTest {
                         }
                     }
 
-                    override suspend fun sendBatch(responses: List<ResponseMessage>): Unit = error("Unexpected batch: $responses")
+                    override suspend fun sendBatch(
+                        responses: List<ResponseMessage>,
+                        onDequeued: () -> Unit,
+                    ): Unit = error("Unexpected batch: $responses")
 
                     override fun offer(
                         response: ResponseMessage,
@@ -551,7 +559,7 @@ class BoundedDispatchTest {
                         terminal = cause
                     }
                 }
-            pump = BoundedDispatchPump(BoundedDispatchPolicy(2, 4), JsonRpcMessageDecoder(codec), dispatcher, scope, output)
+            pump = BoundedDispatchPump(BoundedDispatchPolicy(2, 4), JsonRpcMessageDecoder(codec), dispatcher.newPeer(), scope, output)
             pump.receive(codec.encode(RequestMessage(RequestId.of(1), "first")))
             withTimeout(1.seconds) { secondSent.await() }
             assertEquals(null, terminal)

@@ -21,6 +21,7 @@ class DispatcherBehaviorTest {
     fun `onRequest registers and dispatches request handler`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var called = false
 
             dispatcher.onRequest("test/method") { _: JsonElement? ->
@@ -33,7 +34,7 @@ class DispatcherBehaviorTest {
                     id = RequestId.of(1),
                     method = "test/method",
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             called shouldBe true
             response shouldNotBe null
@@ -43,6 +44,7 @@ class DispatcherBehaviorTest {
     fun `onNotification registers and dispatches notification handler`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var called = false
 
             dispatcher.onNotification("test/notification") { _: JsonElement? ->
@@ -50,7 +52,7 @@ class DispatcherBehaviorTest {
             }
 
             val notification = NotificationMessage(method = "test/notification")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             called shouldBe true
         }
@@ -59,13 +61,14 @@ class DispatcherBehaviorTest {
     fun `unhandled request returns method not found error`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             val request =
                 RequestMessage(
                     id = RequestId.of(1),
                     method = "unknown/method",
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response shouldNotBe null
             response?.error?.code shouldBe ResponseError.METHOD_NOT_FOUND
@@ -75,10 +78,11 @@ class DispatcherBehaviorTest {
     fun `unhandled notification is silently ignored`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             // Should not throw
             val notification = NotificationMessage(method = "unknown/notification")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
         }
 
     // ==================== Typed Handler Tests ====================
@@ -99,6 +103,7 @@ class DispatcherBehaviorTest {
     fun `typed onRequest deserializes params and serializes result`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             dispatcher.onRequest<TestParams, TestResult>("test/typed") { params ->
                 TestResult(
@@ -117,7 +122,7 @@ class DispatcherBehaviorTest {
                             put("name", "World")
                         },
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response?.error shouldBe null
             response?.result?.toString() shouldBe """{"computed":20,"message":"Hello World"}"""
@@ -127,6 +132,7 @@ class DispatcherBehaviorTest {
     fun `typed onNotification deserializes params`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var receivedParams: TestParams? = null
 
             dispatcher.onNotification<TestParams>("test/typedNotification") { params ->
@@ -142,7 +148,7 @@ class DispatcherBehaviorTest {
                             put("name", "Test")
                         },
                 )
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             receivedParams shouldNotBe null
             receivedParams?.value shouldBe 42
@@ -153,6 +159,7 @@ class DispatcherBehaviorTest {
     fun `typed handler with invalid params returns error`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             dispatcher.onRequest<TestParams, TestResult>("test/typed") { params ->
                 TestResult(params.value, params.name)
@@ -168,7 +175,7 @@ class DispatcherBehaviorTest {
                             put("wrongField", "value")
                         },
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response?.error shouldNotBe null
         }
@@ -179,6 +186,7 @@ class DispatcherBehaviorTest {
     fun `request handler exception returns internal error`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             dispatcher.onRequest("test/throws") { _: JsonElement? ->
                 throw IllegalStateException("Handler error")
@@ -189,7 +197,7 @@ class DispatcherBehaviorTest {
                     id = RequestId.of(1),
                     method = "test/throws",
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response?.error shouldNotBe null
             response?.error?.code shouldBe ResponseError.INTERNAL_ERROR
@@ -199,6 +207,7 @@ class DispatcherBehaviorTest {
     fun `notification handler exception does not propagate without error handler`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             dispatcher.onNotification("test/throws") { _: JsonElement? ->
                 throw IllegalStateException("Handler error")
@@ -206,7 +215,7 @@ class DispatcherBehaviorTest {
 
             // Should not throw
             val notification = NotificationMessage(method = "test/throws")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
         }
 
     @Test
@@ -222,13 +231,14 @@ class DispatcherBehaviorTest {
                             reportedException = exception
                         },
                 )
+            val peer = dispatcher.newPeer()
 
             dispatcher.onNotification("test/throws") { _: JsonElement? ->
                 throw IllegalStateException("Handler error")
             }
 
             val notification = NotificationMessage(method = "test/throws")
-            dispatcher.dispatch(notification)
+            peer.dispatch(notification)
 
             reportedMethod shouldBe "test/throws"
             reportedException shouldNotBe null
@@ -239,6 +249,7 @@ class DispatcherBehaviorTest {
     fun `JsonRpcException is properly serialized`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             dispatcher.onRequest("test/jsonrpcError") { _: JsonElement? ->
                 throw JsonRpcException(
@@ -252,7 +263,7 @@ class DispatcherBehaviorTest {
                     id = RequestId.of(1),
                     method = "test/jsonrpcError",
                 )
-            val response = dispatcher.dispatch(request)
+            val response = peer.dispatch(request)
 
             response?.error?.code shouldBe ResponseError.INVALID_PARAMS
             response?.error?.message shouldBe "Custom error"
@@ -264,7 +275,8 @@ class DispatcherBehaviorTest {
     fun `registerPendingRequest creates deferred`() =
         runTest {
             val dispatcher = Dispatcher()
-            val deferred = dispatcher.registerPendingRequest(RequestId.of(1))
+            val peer = dispatcher.newPeer()
+            val deferred = peer.registerPendingRequest(RequestId.of(1))
 
             deferred.isCompleted shouldBe false
         }
@@ -273,14 +285,15 @@ class DispatcherBehaviorTest {
     fun `response completes pending request`() =
         runTest {
             val dispatcher = Dispatcher()
-            val deferred = dispatcher.registerPendingRequest(RequestId.of(1))
+            val peer = dispatcher.newPeer()
+            val deferred = peer.registerPendingRequest(RequestId.of(1))
 
             val response =
                 ResponseMessage.success(
                     id = RequestId.of(1),
                     result = JsonPrimitive("result"),
                 )
-            dispatcher.dispatch(response)
+            peer.dispatch(response)
 
             deferred.isCompleted shouldBe true
             deferred.await() shouldBe JsonPrimitive("result")
@@ -290,14 +303,15 @@ class DispatcherBehaviorTest {
     fun `error response completes pending request with exception`() =
         runTest {
             val dispatcher = Dispatcher()
-            val deferred = dispatcher.registerPendingRequest(RequestId.of(1))
+            val peer = dispatcher.newPeer()
+            val deferred = peer.registerPendingRequest(RequestId.of(1))
 
             val response =
                 ResponseMessage.error(
                     id = RequestId.of(1),
                     error = ResponseError.invalidParams("Error message"),
                 )
-            dispatcher.dispatch(response)
+            peer.dispatch(response)
 
             deferred.isCompleted shouldBe true
             try {
@@ -312,6 +326,7 @@ class DispatcherBehaviorTest {
     fun `response for unknown request is ignored`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
 
             // No pending request registered
             val response =
@@ -321,7 +336,7 @@ class DispatcherBehaviorTest {
                 )
 
             // Should not throw
-            dispatcher.dispatch(response)
+            peer.dispatch(response)
         }
 
     // ==================== Multiple Handlers Tests ====================
@@ -330,6 +345,7 @@ class DispatcherBehaviorTest {
     fun `multiple handlers can be registered`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             val called = mutableListOf<String>()
 
             dispatcher.onRequest("method1") { _: JsonElement? ->
@@ -344,9 +360,9 @@ class DispatcherBehaviorTest {
                 called.add("notify1")
             }
 
-            dispatcher.dispatch(RequestMessage(id = RequestId.of(1), method = "method1"))
-            dispatcher.dispatch(RequestMessage(id = RequestId.of(2), method = "method2"))
-            dispatcher.dispatch(NotificationMessage(method = "notify1"))
+            peer.dispatch(RequestMessage(id = RequestId.of(1), method = "method1"))
+            peer.dispatch(RequestMessage(id = RequestId.of(2), method = "method2"))
+            peer.dispatch(NotificationMessage(method = "notify1"))
 
             called shouldBe listOf("method1", "method2", "notify1")
         }
@@ -355,6 +371,7 @@ class DispatcherBehaviorTest {
     fun `replacing handler overwrites previous`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var firstCalled = false
             var secondCalled = false
 
@@ -372,7 +389,7 @@ class DispatcherBehaviorTest {
                     id = RequestId.of(1),
                     method = "test/method",
                 )
-            dispatcher.dispatch(request)
+            peer.dispatch(request)
 
             firstCalled shouldBe false
             secondCalled shouldBe true
@@ -384,6 +401,7 @@ class DispatcherBehaviorTest {
     fun `handler receives params correctly`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var receivedParams: JsonElement? = null
 
             dispatcher.onRequest("test/params") { params: JsonElement? ->
@@ -402,7 +420,7 @@ class DispatcherBehaviorTest {
                     method = "test/params",
                     params = params,
                 )
-            dispatcher.dispatch(request)
+            peer.dispatch(request)
 
             receivedParams shouldBe params
         }
@@ -411,6 +429,7 @@ class DispatcherBehaviorTest {
     fun `handler receives null params when not provided`() =
         runTest {
             val dispatcher = Dispatcher()
+            val peer = dispatcher.newPeer()
             var receivedParams: JsonElement? = JsonPrimitive("initial")
             var wasCalled = false
 
@@ -426,7 +445,7 @@ class DispatcherBehaviorTest {
                     method = "test/noParams",
                     // No params
                 )
-            dispatcher.dispatch(request)
+            peer.dispatch(request)
 
             wasCalled shouldBe true
             receivedParams shouldBe null

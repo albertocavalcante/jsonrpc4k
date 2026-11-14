@@ -1,9 +1,6 @@
 package io.jsonrpc4k.core
 
-import kotlinx.collections.immutable.PersistentMap
-import kotlinx.collections.immutable.persistentHashMapOf
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -56,73 +53,13 @@ public fun interface NotificationErrorHandler {
     )
 }
 
-internal class PendingRequests {
-    private data class State(
-        val closed: Boolean = false,
-        val requests: PersistentMap<RequestId, CompletableDeferred<JsonElement?>> = persistentHashMapOf(),
-    )
-
-    private val state = MutableStateFlow(State())
-    val count: Int get() = state.value.requests.size
-
-    fun register(id: RequestId): CompletableDeferred<JsonElement?> {
-        val deferred = CompletableDeferred<JsonElement?>()
-        while (true) {
-            val current = state.value
-            check(!current.closed) { "Connection is closed" }
-            check(id !in current.requests) { "Request ID is already pending: $id" }
-            if (state.compareAndSet(current, current.copy(requests = current.requests.put(id, deferred)))) return deferred
-        }
-    }
-
-    fun remove(
-        id: RequestId,
-        expected: CompletableDeferred<JsonElement?>? = null,
-    ): CompletableDeferred<JsonElement?>? {
-        while (true) {
-            val current = state.value
-            val deferred = current.requests[id] ?: return null
-            if (expected != null && deferred !== expected) return null
-            if (state.compareAndSet(current, current.copy(requests = current.requests.remove(id)))) return deferred
-        }
-    }
-
-    /** Removes and cancels the waiter [expected] for [id]; returns false when it is no longer pending. */
-    fun cancel(
-        id: RequestId,
-        expected: CompletableDeferred<JsonElement?>,
-    ): Boolean {
-        val waiter = remove(id, expected) ?: return false
-        waiter.cancel()
-        return true
-    }
-
-    fun cancelAll() = drain(close = false)
-
-    fun close() = drain(close = true)
-
-    private fun drain(close: Boolean) {
-        while (true) {
-            val current = state.value
-            if (state.compareAndSet(current, State(closed = current.closed || close))) {
-                current.requests.values.forEach { it.cancel() }
-                return
-            }
-        }
-    }
-}
-
 /**
- * Dispatches incoming JSON-RPC messages to registered handlers.
+ * The routing table of a JSON-RPC endpoint: the request and notification handlers, by method.
  *
- * Request ids are scoped to one peer, so a dispatcher serves a single connection. An inbound
- * `$/cancelRequest` cancels the running handler of the request that it names. Once that handler
- * stops, [dispatch] answers the request with a Request Cancelled error (-32800); a handler that
- * throws an exception of its own instead is answered as for that exception, and a value that it
- * returns after the cancellation is discarded. Cancellation is cooperative and reaches a handler
- * only while it runs, so it needs messages to be dispatched concurrently. It never completes an
- * outbound waiter that was registered with the same id. Each handler runs in its own child job,
- * so its response also waits for coroutines that it starts in that job.
+ * A dispatcher holds no per-peer state, so one instance may serve any number of connections. Request
+ * ids, `$/cancelRequest` and the waiters of outbound requests are scoped to one peer and live in a
+ * [PeerDispatcher], which [newPeer] creates for each connection. A cancellation from one peer
+ * therefore never reaches a request of another peer that has the same id.
  *
  * @param json The JSON configuration used for serialization/deserialization.
  * @param notificationErrorHandler Optional handler invoked when a notification handler throws.
@@ -136,8 +73,9 @@ public class Dispatcher(
     private val mutex = Mutex()
     private val requestHandlers = mutableMapOf<String, RequestHandler>()
     private val notificationHandlers = mutableMapOf<String, NotificationHandler>()
-    internal val pending = PendingRequests()
-    internal val inbound = InboundRequests()
+
+    /** Creates the dispatch state of one peer, which routes its messages to this table. */
+    public fun newPeer(): PeerDispatcher = PeerDispatcher(this)
 
     /**
      * Register a request handler for a method.
@@ -245,73 +183,13 @@ public class Dispatcher(
     }
 
     /**
-     * Dispatch an incoming message.
-     * Returns a response message if the input was a request, null otherwise. A request's handler
-     * runs until it returns, or until a `$/cancelRequest` for its id, dispatched concurrently,
-     * cancels it.
+     * Runs the handler of [request] and turns its outcome into the response. With [inbound] the
+     * handler runs as a request that `$/cancelRequest` from that peer can cancel; without it the
+     * caller tracks the handler itself.
      */
-    public suspend fun dispatch(message: Message): ResponseMessage? = dispatch(message, cancellable = true)
-
-    /**
-     * Dispatch an incoming message. With [cancellable] false a request's handler runs untracked, for a
-     * caller such as the bounded pump that handles `$/cancelRequest` itself.
-     */
-    internal suspend fun dispatch(
-        message: Message,
-        cancellable: Boolean,
-    ): ResponseMessage? =
-        when (message) {
-            is RequestMessage -> handleRequest(message, cancellable)
-            is NotificationMessage -> {
-                handleNotification(message)
-                null
-            }
-            is ResponseMessage -> {
-                handleResponse(message)
-                null
-            }
-        }
-
-    /**
-     * Dispatch the entries of an inbound batch in wire order and return the responses owed for it
-     * (JSON-RPC 2.0 section 6): one per request, and one Invalid Request error with a null id per
-     * invalid entry. Notifications and responses add nothing, so an empty result means that no reply
-     * is sent, as for a batch of only notifications. Entries run sequentially.
-     */
-    public suspend fun dispatch(batch: Payload.Batch): List<ResponseMessage> = dispatch(batch, cancellable = true)
-
-    /** Dispatch the entries of an inbound batch; [cancellable] applies to each request as in [dispatch]. */
-    internal suspend fun dispatch(
-        batch: Payload.Batch,
-        cancellable: Boolean,
-    ): List<ResponseMessage> =
-        batch.entries.mapNotNull { entry ->
-            if (entry == null) Payload.Invalid.INVALID_REQUEST.response else dispatch(entry, cancellable)
-        }
-
-    /**
-     * Register a pending request that expects a response.
-     * Returns a Deferred that will complete when the response arrives.
-     */
-    public suspend fun registerPendingRequest(id: RequestId): CompletableDeferred<JsonElement?> = pending.register(id)
-
-    /**
-     * Cancel all pending requests. Called during connection shutdown.
-     */
-    public fun cancelAllPendingRequests() {
-        pending.cancelAll()
-    }
-
-    /**
-     * Cancel a pending request.
-     */
-    public suspend fun cancelPendingRequest(id: RequestId) {
-        pending.remove(id)?.cancel()
-    }
-
-    private suspend fun handleRequest(
+    internal suspend fun handleRequest(
         request: RequestMessage,
-        cancellable: Boolean,
+        inbound: InboundRequests?,
     ): ResponseMessage {
         val handler =
             mutex.withLock {
@@ -320,7 +198,7 @@ public class Dispatcher(
 
         return try {
             val result =
-                if (cancellable) {
+                if (inbound != null) {
                     inbound.runCancellable(request.id) { handler.handle(request.params) }
                 } else {
                     handler.handle(request.params)
@@ -339,12 +217,8 @@ public class Dispatcher(
         }
     }
 
-    private suspend fun handleNotification(notification: NotificationMessage) {
-        if (notification.method == CANCEL_REQUEST_METHOD) {
-            // Only inbound handlers are cancelled, so an outbound waiter with the same id keeps waiting.
-            cancelledRequestId(notification.params)?.let(inbound::cancel)
-            return
-        }
+    /** Runs the handler of [notification]; a failure goes to the notification error handler. */
+    internal suspend fun handleNotification(notification: NotificationMessage) {
         val handler =
             mutex.withLock {
                 notificationHandlers[notification.method]
@@ -355,23 +229,6 @@ public class Dispatcher(
             throw e
         } catch (e: Exception) {
             notificationErrorHandler?.onError(notification.method, e)
-        }
-    }
-
-    private suspend fun handleResponse(response: ResponseMessage) {
-        val id = response.id ?: return
-        val deferred = pending.remove(id) ?: return
-
-        if (response.error != null) {
-            deferred.completeExceptionally(
-                JsonRpcException(
-                    response.error.code,
-                    response.error.message,
-                    response.error.data,
-                ),
-            )
-        } else {
-            deferred.complete(response.result)
         }
     }
 
