@@ -104,8 +104,16 @@ internal class BoundedDispatchPump(
     private val work = SupervisorJob(connectionJob)
     private val workScope = CoroutineScope(scope.coroutineContext + work)
     private val controlNotifications = policy.controlNotifications.toSet()
-    private val queued = Channel<Event>(policy.maxQueuedMessages, onUndeliveredElement = ::discard)
-    private val lane = Channel<Event.Notification>(policy.maxQueuedMessages, onUndeliveredElement = ::discard)
+
+    /** Releases a message that never ran; a notification batch entry has nothing to put in the array. */
+    private val discard: (Event) -> Unit =
+        { event ->
+            event.reservation?.release()
+            if (event is Event.Notification) event.slot?.complete(null)
+        }
+
+    private val queued = Channel<Event>(policy.maxQueuedMessages, onUndeliveredElement = discard)
+    private val lane = Channel<Event.Notification>(policy.maxQueuedMessages, onUndeliveredElement = discard)
     private val bytes = ApplicationBytes(limits?.maxApplicationBodyBytes)
     internal val retainedApplicationBytes: Int get() = bytes.retained
     private val queueSlots = Semaphore(policy.maxQueuedMessages)
@@ -219,12 +227,6 @@ internal class BoundedDispatchPump(
         lane.cancel()
         requests.ids.forEach(::cancelRequest)
         settled.complete(Unit)
-    }
-
-    /** Releases a message that never ran; a notification batch entry has nothing to put in the array. */
-    private fun discard(event: Event) {
-        event.reservation?.release()
-        if (event is Event.Notification) event.slot?.complete(null)
     }
 
     private fun admit(
