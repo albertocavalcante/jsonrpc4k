@@ -43,6 +43,7 @@ import platform.posix.EINTR
 import platform.posix.ENOENT
 import platform.posix.ETIMEDOUT
 import platform.posix.FD_CLOEXEC
+import platform.posix.F_GETFL
 import platform.posix.F_SETFD
 import platform.posix.F_SETFL
 import platform.posix.O_DIRECTORY
@@ -387,17 +388,21 @@ internal class PosixProcessTransport private constructor(
             memScoped {
                 val buffer = allocArray<ByteVar>(BUFFER_SIZE)
                 var pollFailed = false
+                var paced = false
                 while (true) {
                     if (pollFailed) {
-                        delay(POLL_MILLIS.toLong())
+                        // A blocking fallback read waits by itself; only non-blocking reads need the delay.
+                        if (paced) delay(POLL_MILLIS.toLong())
                     } else {
                         val readable = pollStderr(fd)
                         if (readable == null) {
                             // Retrying poll() would spin, and closing the pipe would make the child's next stderr
                             // write fail with EPIPE or kill it with SIGPIPE. Fall back to non-blocking reads paced
                             // by delay, ten per second, until EOF or until the child is gone and the pipe is quiet.
+                            // If fcntl fails, the pipe stays blocking and each read waits for data or EOF: that holds
+                            // one IO thread but loses no output and still never closes the child's stderr.
                             pollFailed = true
-                            fcntl(fd, F_SETFL, O_NONBLOCK)
+                            paced = makePipeNonBlocking(fd)
                         } else if (!readable) {
                             if (exit.isCompleted) break else continue
                         }
@@ -407,6 +412,12 @@ internal class PosixProcessTransport private constructor(
             }
             close(fd)
         }
+    }
+
+    /** Adds `O_NONBLOCK` to the status flags of [fd], keeping the others; false when `fcntl` fails. */
+    private fun makePipeNonBlocking(fd: Int): Boolean {
+        val flags = fcntl(fd, F_GETFL)
+        return flags >= 0 && fcntl(fd, F_SETFL, flags or O_NONBLOCK) >= 0
     }
 
     /** Reads once from stderr and delivers what arrived; false at EOF, on a read error, or once quiet after exit. */
