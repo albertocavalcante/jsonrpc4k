@@ -72,6 +72,9 @@ private const val SOCKET_POLL_MILLIS = 100
 // revents that let a read make progress: data, or an EOF, reset or invalid handle that recv then reports.
 private const val READ_READY = POLLRDNORM or POLLHUP or POLLERR or POLLNVAL
 
+// revents that let an accept make progress: a pending connection, or an error that accept then reports.
+internal const val ACCEPT_READY = POLLRDNORM or POLLERR or POLLNVAL
+
 // revents that let a write make progress. POLLHUP is left out: WSAPoll reports it once the peer has shut down its
 // sending side, whatever was requested, while that peer may still read and the send buffer may still be full.
 private const val WRITE_READY = POLLWRNORM or POLLERR or POLLNVAL
@@ -230,6 +233,11 @@ internal class MingwStdioTransport(
  * buffered ahead of it. Blocking `recv` and `send` would not do: Winsock's `shutdown` does not end them, and only
  * `closesocket` from another thread does.
  *
+ * Cost of the slices: a collector, or a send waiting for buffer space, occupies one [Dispatchers.IO] thread for as long
+ * as it waits and wakes up ten times per second while the peer is quiet. `Dispatchers.IO` allows 64 threads by
+ * default, so beyond that many concurrently waiting transports the slices take turns and latency grows. A `WSAPoll`
+ * failure ends [incoming] or fails [send] with [TransportException] instead of being retried.
+ *
  * [close] works from a cancelled coroutine. It sends FIN with `shutdown(SD_SEND)` at once, so the peer sees EOF
  * after the bytes already sent, and then closes the socket under the read and write locks, so a concurrent read or
  * write never reaches a handle that was closed and reused. EOF does not release the socket; [close] does.
@@ -271,7 +279,13 @@ internal class MingwSocketTransport internal constructor(
     /** Returns the next chunk, [NO_DATA] after a quiet poll slice, or null at EOF or once closed. */
     private fun readStep(buffer: CPointer<ByteVar>): ByteArray? {
         if (closing.value != 0 || eof.value != 0) return null
-        if (!pollSocket(socketHandle, POLLRDNORM, READ_READY, SOCKET_POLL_MILLIS)) return NO_DATA
+        val readable =
+            try {
+                pollSocket(socketHandle, POLLRDNORM, READ_READY, SOCKET_POLL_MILLIS)
+            } catch (e: TransportException) {
+                return failRead(e)
+            }
+        if (!readable) return NO_DATA
         val count = recv(socketHandle, buffer, bufferSize, 0)
         return when {
             // Closing ends incoming quietly, including a read that returns only after close().
@@ -286,9 +300,14 @@ internal class MingwSocketTransport internal constructor(
 
     private fun readFailure(error: Int): ByteArray? {
         if (error == WSAEWOULDBLOCK || error == WSAEINTR) return NO_DATA
+        return failRead(TransportException("Read failed: socket error $error"))
+    }
+
+    /** Ends incoming: quietly once closing, otherwise by marking EOF and throwing [failure]. */
+    private fun failRead(failure: TransportException): ByteArray? {
         if (closing.value != 0) return null
         eof.value = 1
-        throw TransportException("Read failed: socket error $error")
+        throw failure
     }
 
     override suspend fun send(data: ByteArray) {
@@ -344,7 +363,7 @@ internal class MingwSocketTransport internal constructor(
             host: String,
             port: Int,
         ): MingwSocketTransport =
-            withContext(Dispatchers.Default) {
+            openOnIo {
                 initWinsock()
 
                 memScoped {
@@ -407,24 +426,34 @@ internal class MingwSocketTransport internal constructor(
 
 /** Switches [handle] to non-blocking mode; false when `ioctlsocket` fails, with the reason in `WSAGetLastError`. */
 @OptIn(ExperimentalForeignApi::class)
-private fun setNonBlocking(handle: ULong): Boolean =
+internal fun setNonBlocking(handle: ULong): Boolean =
     memScoped {
         val enabled = alloc<UIntVar>()
         enabled.value = 1u
         ioctlsocket(handle, FIONBIO.convert(), enabled.ptr) != SOCKET_ERROR_VALUE
     }
 
+/** One `WSAPoll` call on a single entry; on failure it returns [SOCKET_ERROR_VALUE] and sets `WSAGetLastError`. */
+@OptIn(ExperimentalForeignApi::class)
+internal fun wsaPollOne(
+    entry: CPointer<pollfd>,
+    timeoutMillis: Int,
+): Int = WSAPoll(entry, 1u, timeoutMillis)
+
 /**
  * Waits at most [timeoutMillis] for [events] on [handle] and returns true when the socket reports any of [ready].
- * Otherwise, including when `WSAPoll` fails or returns early with only other bits (a lasting `POLLHUP`, say), it
- * sleeps out the rest of the slice and returns false, so a caller that retries never spins.
+ * When `WSAPoll` returns early with only other bits (a lasting `POLLHUP`, say) or is interrupted (`WSAEINTR`), it
+ * sleeps out the rest of the slice and returns false, so a caller that retries never spins. Any other `WSAPoll`
+ * failure throws [TransportException]: it does not go away on retry, and retrying it would idle forever. [poll] is
+ * the system call, replaced only by tests.
  */
 @OptIn(ExperimentalForeignApi::class)
-private fun pollSocket(
+internal fun pollSocket(
     handle: ULong,
     events: Int,
     ready: Int,
     timeoutMillis: Int,
+    poll: (CPointer<pollfd>, Int) -> Int = ::wsaPollOne,
 ): Boolean {
     val start = TimeSource.Monotonic.markNow()
     val reported =
@@ -433,7 +462,12 @@ private fun pollSocket(
             entry.fd = handle
             entry.events = events.convert()
             entry.revents = 0
-            if (WSAPoll(entry.ptr, 1u, timeoutMillis) > 0) entry.revents.toInt() else 0
+            val result = poll(entry.ptr, timeoutMillis)
+            if (result == SOCKET_ERROR_VALUE) {
+                val error = WSAGetLastError()
+                if (error != WSAEINTR) throw TransportException("Poll failed: socket error $error")
+            }
+            if (result > 0) entry.revents.toInt() else 0
         }
     if ((reported and ready) != 0) return true
     val left = timeoutMillis - start.elapsedNow().inWholeMilliseconds

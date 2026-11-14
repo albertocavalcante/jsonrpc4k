@@ -288,7 +288,13 @@ internal class PosixProcessTransport private constructor(
     /** Returns the next chunk, [NO_DATA] after a poll slice without data, or null at EOF or after close. */
     private fun readStep(buffer: CPointer<ByteVar>): ByteArray? {
         if (closing.value != 0) return null
-        if (!pollFd(stdoutFd, POLLIN.convert(), POLL_MILLIS)) return NO_DATA
+        val readable =
+            try {
+                pollFd(stdoutFd, POLLIN.convert(), POLL_MILLIS)
+            } catch (e: PollFailedException) {
+                return failRead(e)
+            }
+        if (!readable) return NO_DATA
         val count = read(stdoutFd, buffer, BUFFER_SIZE.convert())
         return when {
             count > 0 -> ByteArray(count.toInt()) { buffer[it] }
@@ -298,12 +304,16 @@ internal class PosixProcessTransport private constructor(
             }
             else -> {
                 val err = errno
-                if (err == EINTR || err == EAGAIN) return NO_DATA
-                if (closing.value != 0) return null
-                eof.value = 1
-                failTransport("Read failed: ${posixErrorMessage(err)}")
+                if (err == EINTR || err == EAGAIN) NO_DATA else failRead(TransportException("Read failed: ${posixErrorMessage(err)}"))
             }
         }
+    }
+
+    /** Ends incoming: quietly once closing, otherwise by marking EOF and throwing [failure]. */
+    private fun failRead(failure: TransportException): ByteArray? {
+        if (closing.value != 0) return null
+        eof.value = 1
+        throw failure
     }
 
     override suspend fun send(data: ByteArray): Unit =
@@ -376,7 +386,14 @@ internal class PosixProcessTransport private constructor(
             memScoped {
                 val buffer = allocArray<ByteVar>(BUFFER_SIZE)
                 while (true) {
-                    if (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
+                    // A failing poll() would fail again on every retry, so draining stops.
+                    val readable =
+                        try {
+                            pollFd(fd, POLLIN.convert(), POLL_MILLIS)
+                        } catch (ignored: PollFailedException) {
+                            break
+                        }
+                    if (!readable) {
                         if (exit.isCompleted) break else continue
                     }
                     val count = read(fd, buffer, BUFFER_SIZE.convert())
@@ -523,8 +540,12 @@ private fun readExecError(fd: Int): Int =
     memScoped {
         val deadlineSlices = EXEC_REPORT_TIMEOUT.inWholeMilliseconds / POLL_MILLIS
         var slices = 0L
-        while (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
-            if (++slices >= deadlineSlices) return@memScoped ETIMEDOUT
+        try {
+            while (!pollFd(fd, POLLIN.convert(), POLL_MILLIS)) {
+                if (++slices >= deadlineSlices) return@memScoped ETIMEDOUT
+            }
+        } catch (e: PollFailedException) {
+            return@memScoped e.errno
         }
         val box = alloc<IntVar>()
         var count: Long
@@ -555,19 +576,35 @@ private fun decodeStatus(status: Int): Int {
     return if (signal == 0) (status shr EXIT_SHIFT) and EXIT_MASK else SIGNAL_EXIT_BASE + signal
 }
 
-/** Waits up to [timeoutMillis] for [events] on [fd]; true when ready (readable, writable or hung up). */
+/** A `poll()` failure other than `EINTR`; [errno] is its reason. */
+internal class PollFailedException(
+    val errno: Int,
+) : TransportException("Poll failed: ${posixErrorMessage(errno)}")
+
+/**
+ * Waits up to [timeoutMillis] for [events] on [fd]; true when ready (readable, writable or hung up), false on timeout
+ * or when a signal interrupted the wait (`EINTR`), so the caller retries. Any other failure throws
+ * [PollFailedException]: it does not go away on retry, and retrying would spin. [poll] is the system call, replaced
+ * only by tests.
+ */
 @OptIn(ExperimentalForeignApi::class)
 internal fun pollFd(
     fd: Int,
     events: Int,
     timeoutMillis: Int,
+    poll: (CPointer<pollfd>, Int) -> Int = ::pollOne,
 ): Boolean =
     memScoped {
         val entry = alloc<pollfd>()
         entry.fd = fd
         entry.events = events.convert()
         entry.revents = 0
-        pollOne(entry.ptr, timeoutMillis) > 0
+        val ready = poll(entry.ptr, timeoutMillis)
+        if (ready < 0) {
+            val err = errno
+            if (err != EINTR) throw PollFailedException(err)
+        }
+        ready > 0
     }
 
 private fun deliver(
